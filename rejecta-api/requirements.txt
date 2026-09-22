@@ -1,0 +1,15 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+pymupdf==1.24.5
+httpx==0.27.0
+anthropic==0.28.0
+openai==1.35.0
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.3.0
+
+# HuggingFace dependencies — comment out if not using local models
+# transformers==4.42.0
+# torch==2.3.0
+# accelerate==0.31.0

@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.frowns-feature {
+  transition: d 0.4s ease;
+}
+
+.frowns-pen {
+  transform-box: fill-box;
+  transform-origin: 20% 80%;
+}
+
+.frowns-pen-idle {
+  animation: frowns-write 2.8s ease-in-out infinite;
+}
+
+@keyframes frowns-write {
+  0%,
+  100% {
+    transform: rotate(-7deg);
+  }
+  50% {
+    transform: rotate(8deg) translateY(1px);
+  }
+}
+
+.progress-fill {
+  width: 5%;
+  animation: rejecta-progress 35s linear forwards;
+}
+
+.progress-fill-done {
+  animation: none;
+  width: 100%;
+}
+
+@keyframes rejecta-progress {
+  from {
+    width: 5%;
+  }
+  to {
+    width: 95%;
+  }
+}
