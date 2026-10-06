@@ -54,6 +54,7 @@ _ = (parser, citations, journals, llm)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins(),
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?netlify\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

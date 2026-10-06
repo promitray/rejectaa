@@ -7,6 +7,12 @@ import { useRejectaStore } from '../store'
 import type { Mode } from '../types'
 
 const MAX_FILE_BYTES = 10_485_760
+const JOURNAL_SUGGESTIONS = [
+  'Nature',
+  'PLOS ONE',
+  'Nature Machine Intelligence',
+  'The Lancet',
+]
 
 function isPdf(file: File): boolean {
   return file.name.toLowerCase().endsWith('.pdf')
@@ -32,6 +38,7 @@ export default function Upload(): ReactElement {
   const [fileError, setFileError] = useState<string | null>(null)
   const [journalError, setJournalError] = useState<string | null>(null)
   const [emailError, setEmailError] = useState<string | null>(null)
+  const [sampleLoading, setSampleLoading] = useState(false)
 
   function chooseFile(next: File): void {
     if (!isPdf(next)) {
@@ -48,6 +55,25 @@ export default function Upload(): ReactElement {
     setFileError(null)
   }
 
+  async function loadSample(): Promise<void> {
+    setSampleLoading(true)
+    setFileError(null)
+    try {
+      const response = await fetch('/sample_readmission.pdf')
+      if (!response.ok) {
+        throw new Error('Could not load the sample manuscript')
+      }
+      const blob = await response.blob()
+      chooseFile(new File([blob], 'sample_readmission.pdf', { type: 'application/pdf' }))
+      setJournal('PLOS ONE')
+      setJournalError(null)
+    } catch {
+      setFileError('Could not load the sample manuscript')
+    } finally {
+      setSampleLoading(false)
+    }
+  }
+
   function handleSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault()
     if (submitting.current || loading) {
@@ -62,7 +88,9 @@ export default function Upload(): ReactElement {
           ? 'File too large — maximum 10MB'
           : null
     const nextJournalError = journal.trim() ? null : 'Journal name is required'
-    const nextEmailError = email.trim() ? null : 'Email is required'
+    const nextEmailError = email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      ? 'Enter a valid email, or leave it blank'
+      : null
 
     setFileError(nextFileError)
     setJournalError(nextJournalError)
@@ -199,6 +227,16 @@ export default function Upload(): ReactElement {
           )}
         </div>
         {fileError ? <p className="mt-2 text-sm text-red-600">{fileError}</p> : null}
+        <button
+          type="button"
+          onClick={() => {
+            void loadSample()
+          }}
+          disabled={sampleLoading}
+          className="mt-3 w-full text-center text-xs text-gray-600 underline-offset-2 hover:underline disabled:opacity-60"
+        >
+          {sampleLoading ? 'Loading sample…' : 'Use the sample manuscript instead'}
+        </button>
 
         <label className="mt-5 block text-sm font-medium text-gray-800" htmlFor="journal">
           Target journal
@@ -213,10 +251,29 @@ export default function Upload(): ReactElement {
           placeholder="e.g. Nature Machine Intelligence"
           className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-gray-900"
         />
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {JOURNAL_SUGGESTIONS.map((name) => (
+            <button
+              key={name}
+              type="button"
+              onClick={() => {
+                setJournal(name)
+                setJournalError(null)
+              }}
+              className={`rounded-full border px-2.5 py-1 text-xs ${
+                journal === name
+                  ? 'border-gray-900 bg-gray-900 text-white'
+                  : 'border-gray-300 bg-white text-gray-600 hover:border-gray-500'
+              }`}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
         {journalError ? <p className="mt-2 text-sm text-red-600">{journalError}</p> : null}
 
         <label className="mt-5 block text-sm font-medium text-gray-800" htmlFor="email">
-          Email for report
+          Email <span className="font-normal text-gray-500">(optional)</span>
         </label>
         <input
           id="email"
@@ -230,7 +287,9 @@ export default function Upload(): ReactElement {
           className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-gray-900"
         />
         {emailError ? <p className="mt-2 text-sm text-red-600">{emailError}</p> : null}
-        <p className="mt-2 text-xs text-gray-500">Only used to send your report. Never shared.</p>
+        <p className="mt-2 text-xs text-gray-500">
+          Not stored. Leave blank — the report stays on this page.
+        </p>
 
         <button
           type="submit"
@@ -242,8 +301,8 @@ export default function Upload(): ReactElement {
         </button>
       </form>
 
-      <p id="how-it-works" className="mt-4 text-center text-xs text-gray-500">
-        Citation Autopsy is free · full report €19
+      <p className="mt-4 text-center text-xs text-gray-500">
+        Research preview · full report included · no account
       </p>
     </div>
   )

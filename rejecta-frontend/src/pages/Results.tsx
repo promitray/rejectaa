@@ -94,7 +94,7 @@ export default function Results(): ReactElement {
 
   useEffect(() => {
     if (!result) {
-      navigate('/', { replace: true })
+      navigate('/app', { replace: true })
     }
   }, [result, navigate])
 
@@ -209,16 +209,23 @@ export default function Results(): ReactElement {
         {analysis.provider_used}
       </p>
 
-      <div className="mt-4 flex flex-wrap gap-2">
+      <div className="mt-4 flex flex-wrap gap-2 print:hidden">
         <button
           type="button"
           onClick={() => {
             reset()
-            navigate('/')
+            navigate('/app')
           }}
           className="rounded-lg bg-black px-4 py-2 text-sm font-medium text-white"
         >
           Analyse another paper
+        </button>
+        <button
+          type="button"
+          onClick={() => window.print()}
+          className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-800"
+        >
+          Print or save PDF
         </button>
         <a
           href={CLAUDE_URL}

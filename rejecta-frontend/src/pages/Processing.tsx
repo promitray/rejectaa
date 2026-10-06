@@ -70,7 +70,7 @@ export default function Processing(): ReactElement {
       return
     }
     if (!loading && !error) {
-      navigate('/', { replace: true })
+      navigate('/app', { replace: true })
     }
   }, [result, loading, error, navigate])
 
@@ -100,7 +100,7 @@ export default function Processing(): ReactElement {
           type="button"
           onClick={() => {
             reset()
-            navigate('/')
+            navigate('/app')
           }}
           className="mt-6 rounded-lg bg-black px-4 py-2 text-sm font-medium text-white"
         >

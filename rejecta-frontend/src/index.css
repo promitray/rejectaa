@@ -2,6 +2,26 @@
 @tailwind components;
 @tailwind utilities;
 
+html {
+  scroll-behavior: smooth;
+}
+
+@media print {
+  header,
+  footer,
+  .print\\:hidden {
+    display: none !important;
+  }
+
+  body {
+    background: white;
+  }
+
+  main {
+    padding: 0;
+  }
+}
+
 .frowns-feature {
   transition: d 0.4s ease;
 }
