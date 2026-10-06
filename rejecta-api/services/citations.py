@@ -112,6 +112,18 @@ def _heal_pdf_hyphens(text: str) -> str:
     return re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", text)
 
 
+def _clean_title(title: str) -> str:
+    """Strip venue suffixes that PDFs glue onto the title."""
+    title = re.split(
+        r"\s+[Ii]n (?:Advances|Proceedings|Proc\.|Annual)\b",
+        title,
+        maxsplit=1,
+    )[0]
+    title = re.sub(r",?\s*\(\s*NIPS\s*\)\s*,?\s*\d{4}$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r",\s*\d{4}$", "", title)
+    return title.strip(" .")
+
+
 def _guess_title(ref: str) -> str | None:
     """Pull a likely title from an author-year bibliography line."""
     cleaned = _heal_pdf_hyphens(
@@ -127,7 +139,7 @@ def _guess_title(ref: str) -> str | None:
         if part.lower().startswith("arxiv"):
             continue
         if len(part) >= MIN_TITLE_CHARS:
-            return part.rstrip(".")
+            return _clean_title(part.rstrip("."))
     return None
 
 
@@ -332,6 +344,18 @@ async def _check_doi(
         return _unverified(ref, doi)
 
 
+def _author_in_item(ref: str, item: dict[str, Any]) -> bool:
+    """True if the guessed first-author last name appears in the CrossRef authors."""
+    last = _first_author_last(ref)
+    authors = item.get("author")
+    if not last or not isinstance(authors, list):
+        return False
+    for author in authors[:4]:
+        if isinstance(author, dict) and str(author.get("family") or "").lower() == last:
+            return True
+    return False
+
+
 def _crossref_match_quality(ref: str, item: dict[str, Any]) -> bool:
     """Accept a bibliographic hit only if title or author evidence is strong."""
     result_title = _title_from_crossref(item) or ""
@@ -341,8 +365,14 @@ def _crossref_match_quality(ref: str, item: dict[str, Any]) -> bool:
         similarity = _title_similarity(guessed, result_title)
     elif result_title:
         similarity = _title_similarity(result_title, ref)
-    if similarity >= 0.88:
+    if similarity >= 0.92:
         return True
+
+    if guessed and result_title and _author_in_item(ref, item):
+        a = _normalize_title(guessed)
+        b = _normalize_title(result_title)
+        if a and b and min(len(a), len(b)) >= 18 and (b.startswith(a) or a.startswith(b)):
+            return True
 
     score = item.get("score")
     try:
@@ -351,17 +381,8 @@ def _crossref_match_quality(ref: str, item: dict[str, Any]) -> bool:
         numeric_score = 0.0
     if numeric_score < CROSSREF_MIN_SCORE:
         return False
-    if similarity >= TITLE_SIMILARITY_MIN:
+    if similarity >= TITLE_SIMILARITY_MIN and _author_in_item(ref, item):
         return True
-
-    last = _first_author_last(ref)
-    authors = item.get("author")
-    if last and isinstance(authors, list):
-        for author in authors[:2]:
-            if isinstance(author, dict):
-                family = str(author.get("family") or "").lower()
-                if family and family == last:
-                    return bool(result_title) and numeric_score >= 60
     return False
 
 
@@ -415,14 +436,12 @@ async def _search_crossref(
 
 
 async def _search_arxiv(client: httpx.AsyncClient, ref: str) -> CitationResult | None:
-    """Search the arXiv API by title and first author when the line looks like a preprint."""
-    if "arxiv" not in ref.lower():
-        return None
+    """Search the arXiv API by title and first author."""
     title = _guess_title(ref)
     if not title:
         return None
     author = _first_author_last(ref)
-    query = f'ti:"{title}"'
+    query = f'all:"{title}"'
     if author:
         query = f"{query} AND au:{author}"
     try:
@@ -452,7 +471,13 @@ async def _search_arxiv(client: httpx.AsyncClient, ref: str) -> CitationResult |
             if not title_match or not id_match:
                 continue
             found_title = re.sub(r"\s+", " ", title_match.group(1)).strip()
-            if _title_similarity(title, found_title) < TITLE_SIMILARITY_MIN:
+            a = _normalize_title(title)
+            b = _normalize_title(found_title)
+            similar = _title_similarity(title, found_title) >= TITLE_SIMILARITY_MIN
+            prefix = bool(
+                a and b and min(len(a), len(b)) >= 18 and (b.startswith(a) or a.startswith(b))
+            )
+            if not similar and not prefix:
                 continue
             return CitationResult(
                 raw=ref,
