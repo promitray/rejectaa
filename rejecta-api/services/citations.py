@@ -19,7 +19,9 @@ CROSSREF_BASE_URL = "https://api.crossref.org/works"
 CROSSREF_USER_AGENT = "Rejecta/1.0 (mailto:hello@rejecta.ai)"
 REQUEST_TIMEOUT = 8.0
 MAX_REFERENCES = 60
-LOOKUP_CONCURRENCY = 5
+LOOKUP_CONCURRENCY = 8
+CROSSREF_CONCURRENCY = 2
+CROSSREF_GAP_SECONDS = 0.25
 
 ARXIV_DOI_PREFIX = "10.48550/arxiv."
 ARXIV_ABS_URL = "https://export.arxiv.org/abs/"
@@ -105,9 +107,16 @@ def _looks_like_authors(part: str) -> bool:
     return False
 
 
+def _heal_pdf_hyphens(text: str) -> str:
+    """Join words split by a PDF line-break hyphen: 'im- age' → 'image'."""
+    return re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", text)
+
+
 def _guess_title(ref: str) -> str | None:
     """Pull a likely title from an author-year bibliography line."""
-    cleaned = re.sub(r"^\s*(?:\[\d{1,3}\]|\d{1,3}[\.\)])\s*", "", ref).strip()
+    cleaned = _heal_pdf_hyphens(
+        re.sub(r"^\s*(?:\[\d{1,3}\]|\d{1,3}[\.\)])\s*", "", ref).strip()
+    )
     parts = [part.strip() for part in re.split(r"\.\s+", cleaned) if part.strip()]
     if not parts:
         return None
@@ -189,19 +198,28 @@ def _result_from_crossref(ref: str, message: dict[str, Any]) -> CitationResult:
     )
 
 
-async def _get(
+async def _get_crossref(
     client: httpx.AsyncClient,
+    gate: asyncio.Semaphore,
     url: str,
     params: dict[str, Any] | None = None,
 ) -> httpx.Response:
-    """GET with a short retry when CrossRef rate-limits."""
-    response: httpx.Response | None = None
-    for attempt in range(3):
-        response = await client.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code != 429:
-            return response
-        await asyncio.sleep(0.6 * (attempt + 1))
-    return response
+    """Call CrossRef slowly. They 429 if we burst 40 bibliographic searches."""
+    async with gate:
+        response: httpx.Response | None = None
+        for attempt in range(4):
+            response = await client.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 429:
+                await asyncio.sleep(CROSSREF_GAP_SECONDS)
+                return response
+            retry_after = response.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else 1.5 * (attempt + 1)
+            except ValueError:
+                wait = 1.5 * (attempt + 1)
+            logger.info("CrossRef rate-limited; waiting %.1fs", wait)
+            await asyncio.sleep(wait)
+        return response
 
 
 async def _with_arxiv_title(
@@ -267,11 +285,16 @@ async def _check_arxiv_id(
         return _unverified(ref)
 
 
-async def _check_doi(client: httpx.AsyncClient, doi: str, ref: str) -> CitationResult:
+async def _check_doi(
+    client: httpx.AsyncClient,
+    gate: asyncio.Semaphore,
+    doi: str,
+    ref: str,
+) -> CitationResult:
     """Resolve a DOI via CrossRef, with an arXiv fallback for preprint DOIs."""
     try:
         url = f"{CROSSREF_BASE_URL}/{quote(doi, safe='')}"
-        response = await _get(client, url)
+        response = await _get_crossref(client, gate, url)
         if response.status_code == 200:
             data: Any = response.json()
             message: Any = data.get("message", {}) if isinstance(data, dict) else {}
@@ -342,7 +365,11 @@ def _crossref_match_quality(ref: str, item: dict[str, Any]) -> bool:
     return False
 
 
-async def _search_crossref(client: httpx.AsyncClient, ref: str) -> CitationResult | None:
+async def _search_crossref(
+    client: httpx.AsyncClient,
+    gate: asyncio.Semaphore,
+    ref: str,
+) -> CitationResult | None:
     """Search CrossRef with the bibliography line or a guessed title."""
     query = _guess_title(ref) or ref
     author = _first_author_last(ref)
@@ -351,8 +378,9 @@ async def _search_crossref(client: httpx.AsyncClient, ref: str) -> CitationResul
     else:
         bibliographic = ref[:400]
     try:
-        response = await _get(
+        response = await _get_crossref(
             client,
+            gate,
             CROSSREF_BASE_URL,
             params={
                 "query.bibliographic": bibliographic,
@@ -439,27 +467,31 @@ async def _search_arxiv(client: httpx.AsyncClient, ref: str) -> CitationResult |
         return None
 
 
-async def _check_one(client: httpx.AsyncClient, ref: str, gate: asyncio.Semaphore) -> CitationResult:
+async def _check_one(
+    client: httpx.AsyncClient,
+    ref: str,
+    work_gate: asyncio.Semaphore,
+    crossref_gate: asyncio.Semaphore,
+) -> CitationResult:
     """Verify one reference: DOI, then arXiv id, then title/author search."""
-    async with gate:
+    async with work_gate:
         doi = _extract_doi(ref)
+        if doi and _is_arxiv_doi(doi):
+            arxiv_id = _arxiv_id_from_doi(doi)
+            if arxiv_id:
+                return await _check_arxiv_id(client, arxiv_id, ref)
         if doi:
-            result = await _check_doi(client, doi, ref)
+            result = await _check_doi(client, crossref_gate, doi, ref)
             if result.status == CitationStatus.verified and not result.title:
                 return await _with_arxiv_title(client, result, ref)
             return result
 
         arxiv_id = _extract_arxiv_id(ref)
         if arxiv_id:
-            constructed = ARXIV_DOI_TEMPLATE.format(arxiv_id=arxiv_id.split("v")[0])
-            doi_result = await _check_doi(client, constructed, ref)
-            if doi_result.status == CitationStatus.verified:
-                if not doi_result.title:
-                    return await _with_arxiv_title(client, doi_result, ref, arxiv_id)
-                return doi_result
+            # CrossRef 404s almost every 10.48550/arXiv.* DOI. Go to arXiv.
             return await _check_arxiv_id(client, arxiv_id, ref)
 
-        found = await _search_crossref(client, ref)
+        found = await _search_crossref(client, crossref_gate, ref)
         if found is not None:
             return found
 
@@ -484,13 +516,16 @@ async def verify_citations(references: list[str]) -> list[CitationResult]:
     """
     refs = references[:MAX_REFERENCES]
     logger.info("Verifying %d citations against CrossRef and arXiv", len(refs))
-    gate = asyncio.Semaphore(LOOKUP_CONCURRENCY)
+    work_gate = asyncio.Semaphore(LOOKUP_CONCURRENCY)
+    crossref_gate = asyncio.Semaphore(CROSSREF_CONCURRENCY)
 
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT,
         headers={"User-Agent": CROSSREF_USER_AGENT},
     ) as client:
-        results = await asyncio.gather(*(_check_one(client, ref, gate) for ref in refs))
+        results = await asyncio.gather(
+            *(_check_one(client, ref, work_gate, crossref_gate) for ref in refs)
+        )
 
     verified = sum(1 for item in results if item.status == CitationStatus.verified)
     ghost = sum(1 for item in results if item.status == CitationStatus.ghost)
