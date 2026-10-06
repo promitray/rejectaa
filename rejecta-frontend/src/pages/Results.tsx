@@ -332,7 +332,7 @@ function CitationTable({
   items,
   total,
 }: {
-  items: Array<{ raw: string; status: CitationStatus }>
+  items: Array<{ raw: string; status: CitationStatus; title?: string | null }>
   total: number
 }): ReactElement {
   const [showAll, setShowAll] = useState(false)
@@ -350,7 +350,16 @@ function CitationTable({
             <span className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase ${STATUS_BADGE[item.status]}`}>
               {item.status}
             </span>
-            <span className="text-sm text-gray-700">{truncate(item.raw, 90)}</span>
+            <span className="text-sm text-gray-700">
+              {item.title ? (
+                <>
+                  <span className="font-medium text-gray-900">{item.title}</span>
+                  <span className="mt-0.5 block text-xs text-gray-500">{truncate(item.raw, 140)}</span>
+                </>
+              ) : (
+                truncate(item.raw, 140)
+              )}
+            </span>
           </li>
         ))}
       </ul>
