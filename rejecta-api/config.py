@@ -19,7 +19,12 @@ LOCAL_APP_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 )
-PRODUCTION_APP_ORIGIN = "https://app.rejecta.ai"
+PRODUCTION_APP_ORIGINS = (
+    "https://app.rejecta.ai",
+    "https://rejecta.scivalon.com",
+    "https://www.rejecta.scivalon.com",
+    "https://rejectaa.netlify.app",
+)
 
 
 class Settings(BaseSettings):
@@ -66,7 +71,7 @@ class Settings(BaseSettings):
             self.APP_URL,
             *self.CORS_ORIGINS.split(","),
             *LOCAL_APP_ORIGINS,
-            PRODUCTION_APP_ORIGIN,
+            *PRODUCTION_APP_ORIGINS,
         ]
         origins: list[str] = []
         for item in configured:

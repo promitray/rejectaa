@@ -53,11 +53,14 @@ app = FastAPI(
 # Ensure service modules are imported and available for wiring.
 _ = (parser, citations, journals, llm)
 
+# Public unauthenticated API. Do not send cookies; a wildcard origin is valid
+# and covers Netlify, scivalon.com, and preview URLs. allow_credentials=True
+# would block Access-Control-Allow-Origin: * and surface as "Failed to fetch".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins(),
-    allow_origin_regex=r"https://([a-z0-9-]+\.)?netlify\.app",
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_origin_regex=r"https://([a-z0-9-]+\.)*(netlify\.app|scivalon\.com|rejecta\.ai)",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
