@@ -15,13 +15,15 @@ from models import (
     AnalyseRequest,
     AnalysisPaperResponse,
     AnalysisResult,
+    CitationResult,
+    CitationStatus,
     CitationSummary,
     JournalMatch,
     PaperMeta,
     ParsedDocument,
 )
 from services import citations, journals, llm, parser
-from services.citations import build_citation_summary, verify_citations
+from services.citations import MAX_REFERENCES, build_citation_summary, verify_citations
 from services.journals import match_journal
 from services.llm import get_provider_cached
 from services.parser import MAX_FILE_SIZE_BYTES, parse_pdf
@@ -222,14 +224,26 @@ async def analyse_paper(
         logger.error("PDF parse failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="PDF parsing failed unexpectedly") from exc
 
-    try:
-        citation_results, journal_data = await asyncio.gather(
-            verify_citations(parsed.references),
-            match_journal(parsed.abstract, journal.strip()),
-        )
-    except Exception as exc:
-        logger.error("Enrichment failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Citation or journal lookup failed") from exc
+    citation_outcome, journal_outcome = await asyncio.gather(
+        verify_citations(parsed.references),
+        match_journal(parsed.abstract, journal.strip()),
+        return_exceptions=True,
+    )
+
+    if isinstance(citation_outcome, Exception):
+        logger.warning("Citation lookup failed; marking all unverified", exc_info=citation_outcome)
+        citation_results = [
+            CitationResult(raw=ref, status=CitationStatus.unverified)
+            for ref in parsed.references[:MAX_REFERENCES]
+        ]
+    else:
+        citation_results = citation_outcome
+
+    if isinstance(journal_outcome, Exception):
+        logger.warning("Journal lookup failed; continuing without a match", exc_info=journal_outcome)
+        journal_data = JournalMatch(found=False, target=journal.strip())
+    else:
+        journal_data = journal_outcome
 
     citation_summary = build_citation_summary(citation_results)
     citation_summary_str = (

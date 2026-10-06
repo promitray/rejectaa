@@ -117,3 +117,10 @@ async def match_journal(
             exc,
         )
         return JournalMatch(found=False, target=target_journal)
+    except Exception:
+        logger.warning(
+            "OpenAlex lookup failed for journal %s; continuing without a match",
+            target_journal,
+            exc_info=True,
+        )
+        return JournalMatch(found=False, target=target_journal)

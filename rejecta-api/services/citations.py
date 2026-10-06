@@ -498,32 +498,38 @@ async def _check_one(
     work_gate: asyncio.Semaphore,
     crossref_gate: asyncio.Semaphore,
 ) -> CitationResult:
-    """Verify one reference: DOI, then arXiv id, then title/author search."""
-    async with work_gate:
-        doi = _extract_doi(ref)
-        if doi and _is_arxiv_doi(doi):
-            arxiv_id = _arxiv_id_from_doi(doi)
+    """Verify one reference: DOI, then arXiv id, then title/author search.
+
+    Any lookup failure becomes unverified. Never raises to the caller.
+    """
+    try:
+        async with work_gate:
+            doi = _extract_doi(ref)
+            if doi and _is_arxiv_doi(doi):
+                arxiv_id = _arxiv_id_from_doi(doi)
+                if arxiv_id:
+                    return await _check_arxiv_id(client, arxiv_id, ref)
+            if doi:
+                result = await _check_doi(client, crossref_gate, doi, ref)
+                if result.status == CitationStatus.verified and not result.title:
+                    return await _with_arxiv_title(client, result, ref)
+                return result
+
+            arxiv_id = _extract_arxiv_id(ref)
             if arxiv_id:
                 return await _check_arxiv_id(client, arxiv_id, ref)
-        if doi:
-            result = await _check_doi(client, crossref_gate, doi, ref)
-            if result.status == CitationStatus.verified and not result.title:
-                return await _with_arxiv_title(client, result, ref)
-            return result
 
-        arxiv_id = _extract_arxiv_id(ref)
-        if arxiv_id:
-            # CrossRef 404s almost every 10.48550/arXiv.* DOI. Go to arXiv.
-            return await _check_arxiv_id(client, arxiv_id, ref)
+            found = await _search_crossref(client, crossref_gate, ref)
+            if found is not None:
+                return found
 
-        found = await _search_crossref(client, crossref_gate, ref)
-        if found is not None:
-            return found
+            found = await _search_arxiv(client, ref)
+            if found is not None:
+                return found
 
-        found = await _search_arxiv(client, ref)
-        if found is not None:
-            return found
-
+            return _unverified(ref)
+    except Exception:
+        logger.warning("Citation lookup failed; marking unverified", exc_info=True)
         return _unverified(ref)
 
 
@@ -540,17 +546,32 @@ async def verify_citations(references: list[str]) -> list[CitationResult]:
         One CitationResult per input reference, in the same order.
     """
     refs = references[:MAX_REFERENCES]
+    if not refs:
+        return []
     logger.info("Verifying %d citations against CrossRef and arXiv", len(refs))
     work_gate = asyncio.Semaphore(LOOKUP_CONCURRENCY)
     crossref_gate = asyncio.Semaphore(CROSSREF_CONCURRENCY)
 
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": CROSSREF_USER_AGENT},
-    ) as client:
-        results = await asyncio.gather(
-            *(_check_one(client, ref, work_gate, crossref_gate) for ref in refs)
-        )
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": CROSSREF_USER_AGENT},
+        ) as client:
+            raw_results = await asyncio.gather(
+                *(_check_one(client, ref, work_gate, crossref_gate) for ref in refs),
+                return_exceptions=True,
+            )
+    except Exception:
+        logger.warning("Citation batch failed; marking all unverified", exc_info=True)
+        return [_unverified(ref) for ref in refs]
+
+    results: list[CitationResult] = []
+    for ref, item in zip(refs, raw_results, strict=True):
+        if isinstance(item, CitationResult):
+            results.append(item)
+        else:
+            logger.warning("Citation lookup failed; marking unverified: %s", item)
+            results.append(_unverified(ref))
 
     verified = sum(1 for item in results if item.status == CitationStatus.verified)
     ghost = sum(1 for item in results if item.status == CitationStatus.ghost)
