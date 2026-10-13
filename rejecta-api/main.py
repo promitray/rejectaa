@@ -249,8 +249,13 @@ async def analyse_paper(
         journal_data = journal_outcome
 
     citation_summary = build_citation_summary(citation_results)
+    # Facts only. Editorial warnings stay in the API response for the UI; feeding
+    # them to the model skewed scores (e.g. 75 -> 38 on a landmark paper).
     citation_summary_str = (
-        f"{citation_summary.verified} verified, {citation_summary.ghost} ghost/missing "
+        f"{citation_summary.verified} verified, "
+        f"{citation_summary.ghost} ghost (DOI or arXiv ID does not exist in CrossRef/arXiv; "
+        f"possible fabricated reference), "
+        f"{citation_summary.unverified} unverified (lookup inconclusive) "
         f"out of {citation_summary.total} total references."
     )
 
