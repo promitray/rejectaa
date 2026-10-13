@@ -46,6 +46,7 @@ class AnthropicProvider(AbstractAnalysisProvider):
         first = await self.client.messages.create(
             model=self.model,
             max_tokens=MAX_TOKENS,
+            temperature=0,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -59,6 +60,7 @@ class AnthropicProvider(AbstractAnalysisProvider):
             retry = await self.client.messages.create(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
+                temperature=0,
                 system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_message},
