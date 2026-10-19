@@ -13,7 +13,13 @@ export interface CitationResult {
   doi: string | null
   status: CitationStatus
   title: string | null
+  authors?: string[]
   year: number | null
+  venue?: string | null
+  is_preprint?: boolean
+  source_url?: string | null
+  diagnostic_reason?: string
+  suggested_action?: string | null
 }
 
 export interface CitationSummary {
@@ -21,6 +27,11 @@ export interface CitationSummary {
   ghost: number
   unverified: number
   total: number
+  preprint_count?: number
+  peer_reviewed_count?: number
+  preprint_ratio_pct?: number
+  median_citation_age_years?: number | null
+  editorial_warnings?: string[]
   items: CitationResult[]
 }
 

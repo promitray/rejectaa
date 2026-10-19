@@ -24,6 +24,16 @@ class ParsedDocument(BaseModel):
     word_count: int = Field(ge=0)
 
 
+class PublicationType(str, Enum):
+    """Classification of publication format."""
+
+    journal = "journal"
+    conference = "conference"
+    preprint = "preprint"
+    book = "book"
+    unknown = "unknown"
+
+
 class CitationResult(BaseModel):
     """Verification output for a single citation entry."""
 
@@ -31,16 +41,29 @@ class CitationResult(BaseModel):
     doi: str | None = None
     status: CitationStatus
     title: str | None = None
+    authors: list[str] = Field(default_factory=list)
     year: int | None = None
+    venue: str | None = None
+    publication_type: str = PublicationType.unknown.value
+    is_preprint: bool = False
+    source_url: str | None = None
+    confidence_score: float = Field(ge=0.0, le=1.0, default=1.0)
+    diagnostic_reason: str = ""
+    suggested_action: str | None = None
 
 
 class CitationSummary(BaseModel):
-    """Aggregated citation verification metrics."""
+    """Aggregated citation verification metrics and bibliometric telemetry."""
 
     verified: int = Field(ge=0)
     ghost: int = Field(ge=0)
     unverified: int = Field(ge=0)
     total: int = Field(ge=0)
+    preprint_count: int = Field(default=0, ge=0)
+    peer_reviewed_count: int = Field(default=0, ge=0)
+    preprint_ratio_pct: float = Field(default=0.0, ge=0.0, le=100.0)
+    median_citation_age_years: float | None = None
+    editorial_warnings: list[str] = Field(default_factory=list)
     items: list[CitationResult]
 
 

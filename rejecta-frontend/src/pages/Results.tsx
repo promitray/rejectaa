@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Frowns from '../components/Frowns'
 import { useRejectaStore } from '../store'
-import type { CitationStatus, Mood, RejectionReason, SectionScore } from '../types'
+import type { CitationResult, CitationStatus, Mood, RejectionReason, SectionScore } from '../types'
 
 const VISIBLE_CITATIONS = 10
 const CLAUDE_URL = 'https://claude.ai'
@@ -65,8 +65,19 @@ const STATUS_BADGE: Record<CitationStatus, string> = {
   unverified: 'bg-gray-100 text-gray-600',
 }
 
+// Scores at or above this read as polish suggestions, not warnings.
+const SUGGESTION_SCORE = 75
+
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+function citationMeta(item: CitationResult): string {
+  const authors = item.authors ?? []
+  const lead = authors.length > 2 ? `${authors[0]} et al.` : authors.join(', ')
+  const venue = (item.venue ?? '').replace(/\s+/g, ' ').trim()
+  const parts = [lead, venue, item.year ? String(item.year) : '', item.is_preprint ? 'preprint' : '']
+  return parts.filter(Boolean).join(' · ') || truncate(item.raw, 140)
 }
 
 function sectionLabel(key: string): string {
@@ -133,6 +144,13 @@ export default function Results(): ReactElement {
             <Chip className="bg-red-50 text-red-700">{result.citations.ghost} ghost</Chip>
             <Chip className="bg-gray-100 text-gray-600">{result.citations.unverified} unverified</Chip>
           </div>
+          {result.citations.editorial_warnings?.length ? (
+            <ul className="mt-3 space-y-1">
+              {result.citations.editorial_warnings.map((warning) => (
+                <li key={warning} className="text-xs text-gray-500">⚠ {warning}</li>
+              ))}
+            </ul>
+          ) : null}
           <CitationTable items={result.citations.items} total={result.citations.total} />
         </Panel>
 
@@ -332,7 +350,7 @@ function CitationTable({
   items,
   total,
 }: {
-  items: Array<{ raw: string; status: CitationStatus; title?: string | null }>
+  items: CitationResult[]
   total: number
 }): ReactElement {
   const [showAll, setShowAll] = useState(false)
@@ -354,10 +372,25 @@ function CitationTable({
               {item.title ? (
                 <>
                   <span className="font-medium text-gray-900">{item.title}</span>
-                  <span className="mt-0.5 block text-xs text-gray-500">{truncate(item.raw, 140)}</span>
+                  <span className="mt-0.5 block text-xs text-gray-500">{citationMeta(item)}</span>
+                  {item.source_url ? (
+                    <a
+                      href={item.source_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-0.5 block text-xs text-sky-700 underline"
+                    >
+                      View source
+                    </a>
+                  ) : null}
                 </>
               ) : (
-                truncate(item.raw, 140)
+                <>
+                  {truncate(item.raw, 140)}
+                  {item.status !== 'verified' && item.diagnostic_reason ? (
+                    <span className="mt-0.5 block text-xs text-gray-500">{item.diagnostic_reason}</span>
+                  ) : null}
+                </>
               )}
             </span>
           </li>
@@ -386,6 +419,7 @@ function SectionRow({
   readerMode: boolean
 }): ReactElement {
   const width = Math.min(100, Math.max(0, section.score))
+  const [showFix, setShowFix] = useState(false)
 
   return (
     <div>
@@ -403,8 +437,24 @@ function SectionRow({
         </div>
       ) : (
         <div className="mt-1 space-y-1 sm:pl-[7.5rem]">
-          {section.issue ? <p className="text-sm text-gray-500">⚠ {section.issue}</p> : null}
-          {section.fix ? <p className="text-sm text-sky-700">→ {section.fix}</p> : null}
+          {section.strength ? <p className="text-sm text-green-700">✓ {section.strength}</p> : null}
+          {section.issue ? (
+            <p className="text-sm text-gray-500">
+              {section.score < SUGGESTION_SCORE ? '⚠' : '•'} {section.issue}
+            </p>
+          ) : null}
+          {section.fix ? (
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowFix((value) => !value)}
+                className="text-xs text-sky-700 underline"
+              >
+                {showFix ? 'Hide fix' : 'How to fix'}
+              </button>
+              {showFix ? <p className="mt-1 text-sm text-sky-700">→ {section.fix}</p> : null}
+            </div>
+          ) : null}
         </div>
       )}
     </div>

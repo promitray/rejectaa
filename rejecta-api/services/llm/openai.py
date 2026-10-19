@@ -50,6 +50,7 @@ class OpenAIProvider(AbstractAnalysisProvider):
         response = await self.client.chat.completions.create(
             model=self.model,
             max_tokens=MAX_TOKENS,
+            temperature=0,
             response_format={"type": JSON_OBJECT_TYPE},
             messages=[
                 {"role": ROLE_SYSTEM, "content": system_prompt},
@@ -68,6 +69,7 @@ class OpenAIProvider(AbstractAnalysisProvider):
             retry = await self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
+                temperature=0,
                 response_format={"type": JSON_OBJECT_TYPE},
                 messages=[
                     {"role": ROLE_SYSTEM, "content": system_prompt},
