@@ -42,27 +42,23 @@ wrong value types will cause a system error:
   "sections": {
     "introduction": {
       "score": <integer 0-100>,
-      "strength": "<1-2 sentences: what this section does well, specific to THIS paper>",
-      "issue": "<2-3 sentences: what exactly is wrong in THIS paper's introduction, naming the specific claim, number or method from the input, and why it matters to a reviewer>",
-      "fix": "<2-3 sentences: concrete guidance on what to change or add, where in the manuscript, and what a good result looks like>"
+      "issue": "<one sentence describing the specific problem in THIS introduction>",
+      "fix": "<one concrete action the author should take>"
     },
     "methods": {
       "score": <integer 0-100>,
-      "strength": "<1-2 sentences: what this section does well, specific to THIS paper>",
-      "issue": "<2-3 sentences: what exactly is wrong in THIS paper's methods, naming the specific claim, number or method from the input, and why it matters to a reviewer>",
-      "fix": "<2-3 sentences: concrete guidance on what to change or add, where in the manuscript, and what a good result looks like>"
+      "issue": "<one sentence describing the specific problem in THIS methods section>",
+      "fix": "<one concrete action>"
     },
     "results": {
       "score": <integer 0-100>,
-      "strength": "<1-2 sentences: what this section does well, specific to THIS paper>",
-      "issue": "<2-3 sentences: what exactly is wrong in THIS paper's results, naming the specific claim, number or method from the input, and why it matters to a reviewer>",
-      "fix": "<2-3 sentences: concrete guidance on what to change or add, where in the manuscript, and what a good result looks like>"
+      "issue": "<one sentence describing the specific problem in THIS results section>",
+      "fix": "<one concrete action>"
     },
     "discussion": {
       "score": <integer 0-100>,
-      "strength": "<1-2 sentences: what this section does well, specific to THIS paper>",
-      "issue": "<2-3 sentences: what exactly is wrong in THIS paper's discussion, naming the specific claim, number or method from the input, and why it matters to a reviewer>",
-      "fix": "<2-3 sentences: concrete guidance on what to change or add, where in the manuscript, and what a good result looks like>"
+      "issue": "<one sentence describing the specific problem in THIS discussion>",
+      "fix": "<one concrete action>"
     }
   },
   "rejection_reasons": [
@@ -129,33 +125,6 @@ IMPORTANT CONSTRAINTS:
   provided in the input.
 - Reference sections by name (Introduction, Methods, etc.)
   not by page or line number.
-- The sections you receive are EXCERPTS extracted from a PDF and may
-  be shortened or incomplete. Never penalise the paper for content
-  that is simply absent from an excerpt, and never claim a section
-  is missing or underdeveloped only because the excerpt is short.
-- Judge only what is written in the input. Do not assume facts
-  about the paper, its authors or its citations beyond the input.
-- The citation summary is a factual count of how many references
-  were found in CrossRef, arXiv and OpenAlex. A reference that is
-  not found is a lookup limit, not proof of a fake citation. Only
-  ghost/missing references indicate possible fabrication.
-- Do not reduce the score for anything you cannot point to in the
-  provided text.
-- Before raising an issue, check the input: do not ask the author to add
-  something the excerpt already contains. If a section is strong, say so
-  in strength and keep the issue to a genuine, minor suggestion.
-- verdict, mood and mood_score must agree. A desk-reject verdict
-  requires mood_score 40 or below; a verdict of acceptance or
-  review requires 56 or above.
-- Weigh the target journal's own priorities. Applied or clinical
-  journals value methodological rigour, validation and usefulness,
-  not only algorithmic novelty. Do not treat a lack of novel
-  algorithms as disqualifying there.
-- A ghost reference means a DOI or arXiv ID that does not exist.
-  Call it a possible fabricated citation, never merely "missing".
-- If a paper has no genuine issue, return an empty
-  rejection_reasons list. Never list strengths or praise as a
-  rejection reason, and do not invent minor issues to fill space.
 """.strip()
     SYSTEM_PROMPT_B: str = """
 You are Professor Aldric Frowns — a journal editor with 34 years
@@ -223,33 +192,6 @@ IMPORTANT CONSTRAINTS:
   provided in the input.
 - Reference sections by name (Introduction, Methods, etc.)
   not by page or line number.
-- The sections you receive are EXCERPTS extracted from a PDF and may
-  be shortened or incomplete. Never penalise the paper for content
-  that is simply absent from an excerpt, and never claim a section
-  is missing or underdeveloped only because the excerpt is short.
-- Judge only what is written in the input. Do not assume facts
-  about the paper, its authors or its citations beyond the input.
-- The citation summary is a factual count of how many references
-  were found in CrossRef, arXiv and OpenAlex. A reference that is
-  not found is a lookup limit, not proof of a fake citation. Only
-  ghost/missing references indicate possible fabrication.
-- Do not reduce the score for anything you cannot point to in the
-  provided text.
-- Before raising an issue, check the input: do not ask the author to add
-  something the excerpt already contains. If a section is strong, say so
-  in strength and keep the issue to a genuine, minor suggestion.
-- verdict, mood and mood_score must agree. A desk-reject verdict
-  requires mood_score 40 or below; a verdict of acceptance or
-  review requires 56 or above.
-- Weigh the target journal's own priorities. Applied or clinical
-  journals value methodological rigour, validation and usefulness,
-  not only algorithmic novelty. Do not treat a lack of novel
-  algorithms as disqualifying there.
-- A ghost reference means a DOI or arXiv ID that does not exist.
-  Call it a possible fabricated citation, never merely "missing".
-- If a paper has no genuine issue, return an empty
-  rejection_reasons list. Never list strengths or praise as a
-  rejection reason, and do not invent minor issues to fill space.
 """.strip()
 
     def get_system_prompt(self, mode: str) -> str:
