@@ -10,7 +10,7 @@ from models import AnalysisResult
 
 MODE_A = "a"
 MODE_B = "b"
-MAX_USER_MESSAGE_CHARS = 15000
+MAX_USER_MESSAGE_CHARS = 36000
 JSON_CODE_FENCE = "```json"
 GENERIC_CODE_FENCE = "```"
 
@@ -63,13 +63,13 @@ wrong value types will cause a system error:
   },
   "rejection_reasons": [
     {
-      "reason": "<specific reason referencing actual content in this paper, not generic advice>",
+      "reason": "<2 sentences: the problem, citing specific content in this paper, and why a reviewer would act on it>",
       "severity": <MUST be exactly one of: "desk_reject", "major", "minor">,
-      "fix": "<concrete action to address this specific reason>"
+      "fix": "<2 sentences of concrete, actionable guidance to resolve this reason>"
     }
   ],
-  "novelty_assessment": "<one paragraph, honest, specific to what this paper actually claims as new>",
-  "journal_fit": "<one paragraph explaining specifically why this paper does or does not fit this journal, referencing the journal's scope and the paper's actual contribution>"
+  "novelty_assessment": "<one paragraph of 3-4 sentences, honest, specific to what this paper actually claims as new>",
+  "journal_fit": "<one paragraph of 3-4 sentences explaining specifically why this paper does or does not fit this journal, referencing the journal's scope and the paper's actual contribution>"
 }
 
 rejection_reasons: You must identify ALL significant issues,
@@ -113,6 +113,8 @@ mood_score guidance:
 
 The mood field MUST match the mood_score range above.
 
+WRITING STYLE: Be explanatory, not terse. An author should understand what the problem is, why it matters and how to fix it. Stay within the input, avoid generic advice, and keep the whole JSON compact enough to complete.
+
 IMPORTANT CONSTRAINTS:
 - Do NOT reference page numbers - you do not have access to
   page layout information.
@@ -146,13 +148,13 @@ wrong value types will cause a system error:
   "sections": {
     "introduction": {
       "score": <integer 0-100>,
-      "strength": "<what this introduction does well, specifically>",
-      "weakness": "<what it fails to do, specifically>"
+      "strength": "<2 sentences, specific: what this introduction does well, specifically>",
+      "weakness": "<2 sentences, specific: what it fails to do, specifically>"
     },
     "methods": {
       "score": <integer 0-100>,
-      "strength": "<what this methods section does well, specifically>",
-      "weakness": "<what it fails to do, specifically>"
+      "strength": "<2 sentences, specific: what this methods section does well, specifically>",
+      "weakness": "<2 sentences, specific: what it fails to do, specifically>"
     },
     "results": {
       "score": <integer 0-100>,
@@ -161,22 +163,24 @@ wrong value types will cause a system error:
     },
     "discussion": {
       "score": <integer 0-100>,
-      "strength": "<what this discussion does well, specifically>",
-      "weakness": "<what it overclaims or misses, specifically>"
+      "strength": "<2 sentences, specific: what this discussion does well, specifically>",
+      "weakness": "<2 sentences, specific: what it overclaims or misses, specifically>"
     }
   },
   "rejection_reasons": [
     {
-      "reason": "<specific reason referencing actual content in this paper, not generic advice>",
+      "reason": "<2 sentences: the problem, citing specific content in this paper, and why a reviewer would act on it>",
       "severity": <MUST be exactly one of: "desk_reject", "major", "minor">,
-      "fix": "<concrete action to address this specific reason>"
+      "fix": "<2 sentences of concrete, actionable guidance to resolve this reason>"
     }
   ],
-  "novelty_assessment": "<one paragraph, honest, specific to what this paper actually claims as new>",
-  "journal_fit": "<one paragraph explaining specifically why this paper does or does not fit this journal, referencing the journal's scope and the paper's actual contribution>"
+  "novelty_assessment": "<one paragraph of 3-4 sentences, honest, specific to what this paper actually claims as new>",
+  "journal_fit": "<one paragraph of 3-4 sentences explaining specifically why this paper does or does not fit this journal, referencing the journal's scope and the paper's actual contribution>"
 }
 
 The mood field MUST be consistent with mood_score.
+
+WRITING STYLE: Be explanatory, not terse. An author should understand what the problem is, why it matters and how to fix it. Stay within the input, avoid generic advice, and keep the whole JSON compact enough to complete.
 
 IMPORTANT CONSTRAINTS:
 - Do NOT reference page numbers - you do not have access to

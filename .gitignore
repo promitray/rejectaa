@@ -36,3 +36,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Memory & Local Chat History (Do not track in git)
+memory.md
+*.memory.md
+*.tsbuildinfo
+
+
