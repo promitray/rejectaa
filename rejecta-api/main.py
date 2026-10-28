@@ -17,12 +17,22 @@ from models import (
     AnalysisResult,
     CitationResult,
     CitationStatus,
+    AbstractForgeRequest,
+    AbstractForgeResponse,
+    RebuttalAnalyzeRequest,
+    RebuttalAnalyzeResponse,
     CitationSummary,
+    HeatmapAnalyzeRequest,
     JournalMatch,
     PaperMeta,
     ParsedDocument,
+    VoiceCalibrateRequest,
+    VoiceCalibrateResponse,
 )
 from services import citations, journals, llm, parser
+from services.calibrator import VoiceCalibratorService
+from services.forge import AbstractForgeEngine, AbstractForgeResult
+from services.heatmap import HeatmapAnalysisResult, HeatmapEngine
 from services.citations import MAX_REFERENCES, build_citation_summary, verify_citations
 from services.journals import match_journal
 from services.llm import get_provider_cached
@@ -298,6 +308,71 @@ async def analyse_paper(
         ),
     )
 
+
+
+@app.post("/voice-calibrate", response_model=VoiceCalibrateResponse)
+async def voice_calibrate_endpoint(req: VoiceCalibrateRequest) -> VoiceCalibrateResponse:
+    """Calibrate academic draft to target journal register with 100% empirical invariant preservation."""
+    provider = get_provider_cached()
+    calibrator = VoiceCalibratorService(llm_service=provider)
+    result = await calibrator.calibrate(
+        text=req.text,
+        journal_name=req.journal,
+        field=req.field,
+        intensity=req.intensity,  # type: ignore[arg-type]
+    )
+    return VoiceCalibrateResponse(
+        calibrated_text=result.calibrated_text,
+        original_text=result.original_text,
+        status=result.status,
+        input_type=result.input_type,
+        invariants_verified=result.invariants_verified,
+        total_detected_invariants=result.total_detected_invariants,
+        total_restored_invariants=result.total_restored_invariants,
+        word_count_original=result.word_count_original,
+        word_count_calibrated=result.word_count_calibrated,
+        synthetic_markers_removed=result.synthetic_markers_removed,
+        intensity_applied=result.intensity_applied,
+        audit_notes=result.audit_notes,
+        block_reasons=result.block_reasons,
+        guidance_items=result.guidance_items,
+    )
+
+
+@app.post("/ai-signal-heatmap/analyze", response_model=HeatmapAnalysisResult)
+async def heatmap_analyze_endpoint(req: HeatmapAnalyzeRequest) -> HeatmapAnalysisResult:
+    """Analyze manuscript excerpt with deterministic stylometrics and exact UTF-16 character offsets."""
+    return HeatmapEngine.analyze(
+        text=req.text,
+        journal_name=req.journal,
+        field=req.field,
+    )
+
+
+@app.post("/abstract-forge/generate", response_model=AbstractForgeResult)
+async def abstract_forge_endpoint(req: AbstractForgeRequest) -> AbstractForgeResult:
+    """Synthesize 3 distinct abstract architectures (Discoverability, Clarity, High-Impact) with invariant protection."""
+    provider = get_provider_cached()
+    forge_engine = AbstractForgeEngine(llm_service=provider)
+    return await forge_engine.forge(
+        abstract_draft=req.abstract_draft,
+        methodology_context=req.methodology_context,
+        journal_name=req.journal,
+        field=req.field,
+    )
+
+@app.post("/rebuttal-writer/analyze", response_model=RebuttalAnalyzeResponse)
+async def rebuttal_writer_endpoint(req: RebuttalAnalyzeRequest) -> RebuttalAnalyzeResponse:
+    """Analyze reviewer report and generate structured point-by-point diplomatic rebuttal."""
+    from services.rebuttal import RebuttalEngine
+    provider = get_provider_cached()
+    rebuttal_engine = RebuttalEngine(llm_service=provider)
+    return await rebuttal_engine.analyze(
+        text=req.reviewer_report_text,
+        manuscript_context=req.manuscript_context,
+        journal=req.journal,
+        author_tone=req.author_tone,
+    )
 
 def _optional_email(value: str) -> str | None:
     """Accept the app's email field without storing or sending it."""
