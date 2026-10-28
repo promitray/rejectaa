@@ -284,3 +284,13 @@ IMPORTANT CONSTRAINTS:
     ) -> AnalysisResult:
         """Analyse a paper and return structured results."""
         raise NotImplementedError
+
+    @abstractmethod
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+    ) -> str:
+        """Generate text/JSON given a system prompt and user prompt."""
+        raise NotImplementedError

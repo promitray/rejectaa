@@ -18,6 +18,18 @@ export default function Layout(): ReactElement {
             <Link to="/app" className="text-sm text-gray-600 hover:text-gray-900">
               Desk
             </Link>
+            <Link to="/calibrate" className="text-sm font-medium text-stone-700 hover:text-stone-900">
+              Voice Calibrator
+            </Link>
+            <Link to="/heatmap" className="text-sm font-medium text-stone-700 hover:text-stone-900">
+              AI Signal Heatmap
+            </Link>
+            <Link to="/forge" className="text-sm font-medium text-stone-700 hover:text-stone-900">
+              Abstract Forge
+            </Link>
+            <Link to="/rebuttal" className="text-sm font-medium text-stone-900 hover:text-stone-700">
+              Rebuttal Writer
+            </Link>
           </nav>
         </div>
       </header>

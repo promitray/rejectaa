@@ -6,7 +6,6 @@ import { useRejectaStore } from '../store'
 import type { CitationResult, CitationStatus, Mood, RejectionReason, SectionScore } from '../types'
 
 const VISIBLE_CITATIONS = 10
-const CLAUDE_URL = 'https://claude.ai'
 
 const MOOD_COPY: Record<Mood, { label: string; description: string; pill: string }> = {
   furious: {
@@ -137,6 +136,64 @@ export default function Results(): ReactElement {
         </div>
       </section>
 
+      {/* Voice Calibrator Quick Action Callout */}
+      <div className="mt-4 flex items-center justify-between rounded-xl border border-stone-200 bg-stone-50 p-4">
+        <div className="flex items-center gap-3">
+          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-stone-900 text-xs text-white">
+            ✨
+          </span>
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-stone-900">
+              Voice Calibrator Available
+            </p>
+            <p className="text-xs text-stone-600">
+              Refine your draft sections into the published register of <span className="font-medium text-stone-900">{result.journal.target}</span>.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              navigate('/forge', {
+                state: {
+                  journal: result.journal.target,
+                },
+              })
+            }
+            className="shrink-0 rounded-lg border border-purple-300 bg-purple-50 px-3 py-1.5 text-xs font-semibold text-purple-900 hover:bg-purple-100 transition"
+          >
+            🔨 Abstract Forge
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              navigate('/heatmap', {
+                state: {
+                  journal: result.journal.target,
+                },
+              })
+            }
+            className="shrink-0 rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-100 transition"
+          >
+            Cadence Heatmap
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              navigate('/calibrate', {
+                state: {
+                  journal: result.journal.target,
+                },
+              })
+            }
+            className="shrink-0 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-stone-800 transition"
+          >
+            Voice Calibrator →
+          </button>
+        </div>
+      </div>
+
       <div className="mt-4">
         <Panel title="Citation autopsy" badge="free" icon="⌕">
           <div className="flex flex-wrap gap-2">
@@ -167,7 +224,13 @@ export default function Results(): ReactElement {
           ) : (
             <div className="space-y-4">
               {sectionEntries.map(([name, section]) => (
-                <SectionRow key={name} name={name} section={section} readerMode={readerMode} />
+                <SectionRow
+                  key={name}
+                  name={name}
+                  section={section}
+                  readerMode={readerMode}
+                  targetJournal={result.journal.target}
+                />
               ))}
             </div>
           )}
@@ -179,7 +242,11 @@ export default function Results(): ReactElement {
           ) : (
             <div className="space-y-2">
               {analysis.rejection_reasons.map((item, index) => (
-                <ReasonCard key={`${item.severity}-${index}`} item={item} />
+                <ReasonCard
+                  key={`${item.severity}-${index}`}
+                  item={item}
+                  targetJournal={result.journal.target}
+                />
               ))}
             </div>
           )}
@@ -245,22 +312,32 @@ export default function Results(): ReactElement {
         >
           Print or save PDF
         </button>
-        <a
-          href={CLAUDE_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-800"
+        <button
+          type="button"
+          onClick={() =>
+            navigate('/calibrate', {
+              state: {
+                journal: result.journal.target,
+              },
+            })
+          }
+          className="rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 hover:bg-stone-50 transition"
         >
-          How do I fix this? ↗
-        </a>
-        <a
-          href={CLAUDE_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-800"
+          ✨ How do I fix this? (Voice Calibrator)
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            navigate('/heatmap', {
+              state: {
+                journal: result.journal.target,
+              },
+            })
+          }
+          className="rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 hover:bg-stone-50 transition"
         >
-          Find better journals? ↗
-        </a>
+          📊 Inspect Cadence (Heatmap)
+        </button>
       </div>
     </div>
   )
@@ -413,14 +490,36 @@ function SectionRow({
   name,
   section,
   readerMode,
+  targetJournal,
 }: {
   name: string
   section: SectionScore
   readerMode: boolean
+  targetJournal: string
 }): ReactElement {
+  const navigate = useNavigate()
   const width = Math.min(100, Math.max(0, section.score))
   const [showFix, setShowFix] = useState(false)
 
+  const handleCalibrateSection = (): void => {
+    const promptSample = `[${sectionLabel(name)} Section]\nIssue to address: ${section.issue ?? 'Improve scientific register'}\nTarget remediation: ${section.fix ?? 'Align with journal standard'}`
+    navigate('/calibrate', {
+      state: {
+        text: promptSample,
+        journal: targetJournal,
+      },
+    })
+  }
+
+  const handleHeatmapSection = (): void => {
+    const promptSample = `[${sectionLabel(name)} Section]\nIssue to address: ${section.issue ?? 'Analyze sentence rhythm and transition density'}\nRemediation focus: ${section.fix ?? 'Vary sentence length and clarify active agency'}`
+    navigate('/heatmap', {
+      state: {
+        text: promptSample,
+        journal: targetJournal,
+      },
+    })
+  }
   return (
     <div>
       <div className="flex items-center gap-3">
@@ -444,15 +543,44 @@ function SectionRow({
             </p>
           ) : null}
           {section.fix ? (
-            <div>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
               <button
                 type="button"
                 onClick={() => setShowFix((value) => !value)}
-                className="text-xs text-sky-700 underline"
+                className="text-xs text-stone-500 hover:text-stone-800 underline mr-1"
               >
                 {showFix ? 'Hide fix' : 'How to fix'}
               </button>
-              {showFix ? <p className="mt-1 text-sm text-sky-700">→ {section.fix}</p> : null}
+              {name.toLowerCase() === 'abstract' && (
+                <button
+                  onClick={() =>
+                    navigate('/forge', {
+                      state: {
+                        text: `[Abstract Section]\nIssue to address: ${section.issue ?? 'Synthesize 3 targeted architectures'}\nRemediation focus: ${section.fix ?? 'Discoverability, Clarity, and High-Impact Narrative'}`,
+                        journal: targetJournal,
+                      },
+                    })
+                  }
+                  className="inline-flex items-center gap-1 rounded border border-purple-300 bg-purple-50 px-2 py-0.5 text-[11px] font-semibold text-purple-900 hover:bg-purple-100 transition"
+                >
+                  <span>🔨 Forge 3 Abstracts</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleHeatmapSection}
+                className="inline-flex items-center gap-1 rounded border border-stone-300 bg-white px-2 py-0.5 text-[11px] font-medium text-stone-700 hover:bg-stone-50 transition"
+              >
+                <span>📊 Heatmap</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleCalibrateSection}
+                className="inline-flex items-center gap-1 rounded bg-stone-900 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-stone-800 transition"
+              >
+                <span>✨ Calibrate {sectionLabel(name)}</span>
+              </button>
+              {showFix ? <p className="w-full mt-1 text-sm text-sky-700">→ {section.fix}</p> : null}
             </div>
           ) : null}
         </div>
@@ -461,13 +589,56 @@ function SectionRow({
   )
 }
 
-function ReasonCard({ item }: { item: RejectionReason }): ReactElement {
+function ReasonCard({
+  item,
+  targetJournal,
+}: {
+  item: RejectionReason
+  targetJournal: string
+}): ReactElement {
+  const navigate = useNavigate()
   const style = SEVERITY_STYLE[item.severity]
+
+  const handleFixReason = (): void => {
+    const promptText = `[Addressing Rejection Risk: ${item.reason}]\nRequired Remediation: ${item.fix}\nTask: Rephrase and strengthen manuscript evidence according to this directive.`
+    navigate('/calibrate', {
+      state: {
+        text: promptText,
+        journal: targetJournal,
+      },
+    })
+  }
+
   return (
-    <article className={`rounded-lg border border-gray-200 border-l-4 px-3 py-2 ${style.border}`}>
-      <p className={`text-[10px] font-medium uppercase tracking-wide ${style.label}`}>{style.name}</p>
-      <p className="mt-1 text-sm text-gray-800">{item.reason}</p>
-      <p className="mt-1 text-sm text-sky-700">{item.fix}</p>
+    <article className={`rounded-lg border border-gray-200 border-l-4 p-3.5 ${style.border}`}>
+      <div className="flex items-center justify-between">
+        <p className={`text-[10px] font-bold uppercase tracking-wide ${style.label}`}>{style.name}</p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              navigate('/rebuttal', {
+                state: {
+                  rejection_reason: `${item.reason}\nSuggested remediation: ${item.fix}`,
+                  journal: targetJournal,
+                },
+              })
+            }
+            className="inline-flex items-center gap-1 rounded border border-stone-300 bg-white px-2 py-0.5 text-[10.5px] font-medium text-stone-700 hover:bg-stone-50 transition"
+          >
+            <span>📝 Draft Rebuttal Strategy</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleFixReason}
+            className="inline-flex items-center gap-1 rounded bg-stone-900 px-2 py-0.5 text-[10.5px] font-semibold text-white hover:bg-stone-800 transition"
+          >
+            <span>⚡ Fix with Calibrator</span>
+          </button>
+        </div>
+      </div>
+      <p className="mt-1.5 text-sm text-gray-800 font-medium">{item.reason}</p>
+      <p className="mt-1 text-sm text-sky-700">→ {item.fix}</p>
     </article>
   )
 }
