@@ -1,7 +1,7 @@
 """Pydantic models shared across API endpoints and services."""
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -207,3 +207,82 @@ class AnalyseRequest(BaseModel):
     citation_summary: str
     journal_data: dict[str, Any] = Field(default_factory=dict)
     mode: str = "a"
+
+
+class VoiceCalibrateRequest(BaseModel):
+    """Request body for voice calibration."""
+
+    text: str = Field(..., min_length=15, max_length=20000, description="Academic text to calibrate.")
+    journal: str = Field(..., min_length=2, max_length=200, description="Target journal name.")
+    field: str = Field(default="Computer Science", description="Scientific domain or field.")
+    intensity: str = Field(default="rewrite", description="Calibration intensity: polish, rewrite, restructure.")
+
+
+class VoiceCalibrateResponse(BaseModel):
+    """Response body for voice calibration."""
+
+    calibrated_text: str | None = None
+    original_text: str
+    status: str = Field(default="verified", description="'verified', 'blocked', 'guidance', or 'no_invariants'")
+    input_type: str = Field(default="manuscript_draft", description="'manuscript_draft' or 'reviewer_critique'")
+    invariants_verified: bool
+    total_detected_invariants: int = 0
+    total_restored_invariants: int = 0
+    word_count_original: int
+    word_count_calibrated: int
+    synthetic_markers_removed: int
+    intensity_applied: str
+    audit_notes: list[str] = Field(default_factory=list)
+    block_reasons: list[str] = Field(default_factory=list)
+    guidance_items: list[str] = Field(default_factory=list)
+
+
+class HeatmapAnalyzeRequest(BaseModel):
+    """Request body for AI signal heatmap stylometric analysis."""
+
+    text: str = Field(..., min_length=20, max_length=50000, description="Manuscript excerpt to analyze.")
+    journal: str = Field(default="Nature", description="Target journal name.")
+    field: str = Field(default="Computer Science", description="Discipline or domain.")
+
+
+class AbstractForgeRequest(BaseModel):
+    """Request body for synthesizing 3 architectural abstract variants."""
+
+    abstract_draft: str = Field(..., min_length=20, max_length=15000, description="Current abstract or draft summary.")
+    methodology_context: str | None = Field(default=None, description="Optional parsed methodology and findings context.")
+    journal: str = Field(default="Nature Machine Intelligence", description="Target journal venue.")
+    field: str = Field(default="Computer Science & Machine Learning", description="Discipline or research domain.")
+
+
+class AbstractForgeResponse(BaseModel):
+    """Response body for Abstract Forge containing 3 distinct architectures."""
+
+    source_word_count: int
+    target_journal: str
+    fact_inventory: dict[str, Any] = Field(default_factory=dict)
+    variants: list[Any] = Field(description="List of synthesized AbstractVariantDetail objects")
+    comparative_summary: str
+    invariants_preserved_count: int
+
+
+class RebuttalAnalyzeRequest(BaseModel):
+    """Request body for peer review rebuttal analysis."""
+
+    reviewer_report_text: str = Field(..., min_length=20, max_length=25000, description="Raw reviewer comments or editorial critique text.")
+    manuscript_context: str | None = Field(default=None, description="Optional key findings, methods, data the author can cite.")
+    journal: str = Field(default="Nature Machine Intelligence", description="Target journal name.")
+    author_tone: Literal["collaborative", "diplomatic_firm", "formal_rigorous"] = Field(
+        default="collaborative", description="Preferred diplomatic stance tone."
+    )
+
+
+class RebuttalAnalyzeResponse(BaseModel):
+    """Response body for peer review rebuttal analysis."""
+
+    total_comments_identified: int
+    reviewer_blocks: list[Any] = Field(description="Per-reviewer summaries and breakdowns")
+    category_breakdown: dict[str, int] = Field(description="Count of comments by diplomatic posture")
+    overall_negotiation_strategy: str
+    comments: list[Any] = Field(description="Discrete RebuttalCommentItem objects")
+    manuscript_revision_checklist: list[str] = Field(default_factory=list)
+    export_document_md: str

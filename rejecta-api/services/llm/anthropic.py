@@ -11,7 +11,7 @@ from models import AnalysisResult
 from services.llm.base import AbstractAnalysisProvider, MODE_A
 
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 2000
+MAX_TOKENS = 2500
 FIX_JSON_MESSAGE = "Your prior response was invalid JSON. Return only corrected valid JSON."
 SERVER_ERROR_MESSAGE = "Failed to parse model output after retry"
 
@@ -23,6 +23,24 @@ class AnthropicProvider(AbstractAnalysisProvider):
         """Create an async Anthropic client and bind model name."""
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
         self.model = model
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+    ) -> str:
+        """General-purpose structured JSON generation using Anthropic."""
+        response = await self.client.messages.create(
+            model=self.model,
+            max_tokens=MAX_TOKENS,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return "".join(
+            block.text for block in response.content if getattr(block, "text", None)
+        )
 
     async def analyse(
         self,

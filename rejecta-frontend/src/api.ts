@@ -1,5 +1,15 @@
-import type { AnalysisPaperResponse, Mode } from './types'
-
+import type {
+  AbstractForgeRequest,
+  AbstractForgeResponse,
+  AnalysisPaperResponse,
+  HeatmapAnalyzeRequest,
+  HeatmapAnalyzeResponse,
+  Mode,
+  RebuttalAnalyzeRequest,
+  RebuttalAnalyzeResponse,
+  VoiceCalibrateRequest,
+  VoiceCalibrateResponse,
+} from './types'
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
 function errorMessage(body: unknown, status: number): string {
@@ -51,4 +61,80 @@ export async function submitPaper(
   }
 
   return res.json() as Promise<AnalysisPaperResponse>
+}
+
+export async function calibrateVoice(
+  req: VoiceCalibrateRequest,
+): Promise<VoiceCalibrateResponse> {
+  const res = await fetch(`${BASE}/voice-calibrate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(req),
+  })
+
+  if (!res.ok) {
+    const err: unknown = await res.json().catch(() => ({}))
+    throw new Error(errorMessage(err, res.status))
+  }
+
+  return res.json() as Promise<VoiceCalibrateResponse>
+}
+
+export async function analyzeHeatmap(
+  req: HeatmapAnalyzeRequest,
+): Promise<HeatmapAnalyzeResponse> {
+  const res = await fetch(`${BASE}/ai-signal-heatmap/analyze`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(req),
+  })
+
+  if (!res.ok) {
+    const err: unknown = await res.json().catch(() => ({}))
+    throw new Error(errorMessage(err, res.status))
+  }
+
+  return res.json() as Promise<HeatmapAnalyzeResponse>
+}
+
+export async function forgeAbstract(
+  req: AbstractForgeRequest,
+): Promise<AbstractForgeResponse> {
+  const res = await fetch(`${BASE}/abstract-forge/generate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(req),
+  })
+
+  if (!res.ok) {
+    const err: unknown = await res.json().catch(() => ({}))
+    throw new Error(errorMessage(err, res.status))
+  }
+
+  return res.json() as Promise<AbstractForgeResponse>
+}
+
+export async function analyzeRebuttal(
+  req: RebuttalAnalyzeRequest,
+): Promise<RebuttalAnalyzeResponse> {
+  const res = await fetch(`${BASE}/rebuttal-writer/analyze`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(req),
+  })
+
+  if (!res.ok) {
+    const err: unknown = await res.json().catch(() => ({}))
+    throw new Error(errorMessage(err, res.status))
+  }
+
+  return res.json() as Promise<RebuttalAnalyzeResponse>
 }

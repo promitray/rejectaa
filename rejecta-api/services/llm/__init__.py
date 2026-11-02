@@ -8,10 +8,7 @@ from config import (
     LLM_PROVIDER_OPENAI,
     settings,
 )
-from services.llm.anthropic import AnthropicProvider
 from services.llm.base import AbstractAnalysisProvider
-from services.llm.huggingface import HuggingFaceProvider
-from services.llm.openai import OpenAIProvider
 
 ANTHROPIC_API_KEY_MISSING = "ANTHROPIC_API_KEY not set"
 OPENAI_API_KEY_MISSING = "OPENAI_API_KEY not set"
@@ -23,23 +20,25 @@ def get_provider() -> AbstractAnalysisProvider:
     if settings.LLM_PROVIDER == LLM_PROVIDER_ANTHROPIC:
         if not settings.ANTHROPIC_API_KEY:
             raise ValueError(ANTHROPIC_API_KEY_MISSING)
+        from services.llm.anthropic import AnthropicProvider
         return AnthropicProvider(api_key=settings.ANTHROPIC_API_KEY)
 
     if settings.LLM_PROVIDER == LLM_PROVIDER_OPENAI:
         if not settings.OPENAI_API_KEY:
             raise ValueError(OPENAI_API_KEY_MISSING)
+        from services.llm.openai import OpenAIProvider
         return OpenAIProvider(
             api_key=settings.OPENAI_API_KEY,
             model=settings.OPENAI_MODEL,
         )
 
     if settings.LLM_PROVIDER == LLM_PROVIDER_HUGGINGFACE:
+        from services.llm.huggingface import HuggingFaceProvider
         return HuggingFaceProvider(
             model_name=settings.HF_MODEL_NAME,
             api_token=settings.HF_API_TOKEN,
             use_local=settings.HF_USE_LOCAL,
         )
-
     raise ValueError(UNKNOWN_PROVIDER_MESSAGE.format(provider=settings.LLM_PROVIDER))
 
 

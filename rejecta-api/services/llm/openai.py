@@ -10,7 +10,7 @@ from models import AnalysisResult
 from services.llm.base import AbstractAnalysisProvider, MODE_A
 
 OPENAI_DEFAULT_MODEL = "gpt-4o"
-MAX_TOKENS = 2000
+MAX_TOKENS = 2500
 JSON_OBJECT_TYPE = "json_object"
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"
@@ -28,6 +28,25 @@ class OpenAIProvider(AbstractAnalysisProvider):
         """Create an async OpenAI client and bind model name."""
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+    ) -> str:
+        """General-purpose structured JSON generation."""
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=MAX_TOKENS,
+            temperature=temperature,
+            response_format={"type": JSON_OBJECT_TYPE},
+            messages=[
+                {"role": ROLE_SYSTEM, "content": system_prompt},
+                {"role": ROLE_USER, "content": user_prompt},
+            ],
+        )
+        return response.choices[0].message.content or "{}"
 
     async def analyse(
         self,
