@@ -3,6 +3,7 @@ import type { ReactElement } from 'react'
 import { useLocation } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import { calibrateVoice } from '../api'
+import { ToolWait } from '../components/Loaders'
 import type { VoiceCalibrateResponse } from '../types'
 import FormattedMathText from '../components/FormattedMathText'
 
@@ -201,6 +202,13 @@ export default function Calibrate(): ReactElement {
           </div>
 
           <div className="relative w-full h-80 p-4 font-sans text-sm border border-stone-300 rounded-lg bg-white overflow-y-auto leading-relaxed text-stone-800 shadow-sm">
+            <ToolWait
+              loading={loading}
+              hasResult={!!result}
+              title="Calibrating"
+              className="h-full"
+              steps={['Reading your draft', 'Protecting equations and numbers', "Matching the journal's register", 'Verifying every protected item']}
+            >
             {result ? (
               result.status === 'blocked' ? (
                 <div className="h-full flex flex-col justify-center items-center text-center p-4 bg-rose-50/50 rounded border border-rose-200">
@@ -231,6 +239,7 @@ export default function Calibrate(): ReactElement {
                 Calibrated output will appear here with preserved mathematical bounds and journal register.
               </div>
             )}
+            </ToolWait>
           </div>
 
           <div className="mt-4 flex gap-3">

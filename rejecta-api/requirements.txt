@@ -9,6 +9,18 @@ python-dotenv==1.0.1
 pydantic==2.7.1
 pydantic-settings==2.3.0
 
+# Database (Supabase Postgres): runtime driver + migrations
+asyncpg==0.29.0
+SQLAlchemy[asyncio]==2.0.31
+alembic==1.13.2
+
+# Auth: JWT (EdDSA), Argon2id password hashing, email validation
+PyJWT[crypto]==2.8.0
+cryptography==42.0.8
+argon2-cffi==23.1.0
+email-validator==2.3.0
+pyotp==2.9.0
+
 # HuggingFace dependencies — comment out if not using local models
 # transformers==4.42.0
 # torch==2.3.0

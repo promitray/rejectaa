@@ -1,3 +1,4 @@
+import { apiFetch, notifyUsageChanged } from './auth/client'
 import type {
   AbstractForgeRequest,
   AbstractForgeResponse,
@@ -10,32 +11,20 @@ import type {
   VoiceCalibrateRequest,
   VoiceCalibrateResponse,
 } from './types'
-const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
-function errorMessage(body: unknown, status: number): string {
-  if (typeof body !== 'object' || body === null || !('detail' in body)) {
-    return `Request failed: ${status}`
+export { ApiError } from './auth/client'
+
+/** Tool calls need a signed-in user and use the plan's quota. */
+async function tool<T>(path: string, init: RequestInit): Promise<T> {
+  try {
+    return await apiFetch<T>(path, { method: 'POST', ...init })
+  } finally {
+    notifyUsageChanged()
   }
+}
 
-  const detail = (body as { detail: unknown }).detail
-  if (typeof detail === 'string' && detail.length > 0) {
-    return detail
-  }
-
-  if (Array.isArray(detail)) {
-    const messages = detail.flatMap((item) => {
-      if (typeof item === 'object' && item !== null && 'msg' in item) {
-        const msg = (item as { msg: unknown }).msg
-        return typeof msg === 'string' ? [msg] : []
-      }
-      return []
-    })
-    if (messages.length > 0) {
-      return messages.join('; ')
-    }
-  }
-
-  return `Request failed: ${status}`
+function json(req: unknown): RequestInit {
+  return { body: JSON.stringify(req), headers: { 'Content-Type': 'application/json' } }
 }
 
 export async function submitPaper(
@@ -49,92 +38,21 @@ export async function submitPaper(
   form.append('journal', journal)
   form.append('mode', mode)
   form.append('email', email)
-
-  const res = await fetch(`${BASE}/analyse-paper`, {
-    method: 'POST',
-    body: form,
-  })
-
-  if (!res.ok) {
-    const err: unknown = await res.json().catch(() => ({}))
-    throw new Error(errorMessage(err, res.status))
-  }
-
-  return res.json() as Promise<AnalysisPaperResponse>
+  return tool<AnalysisPaperResponse>('/analyse-paper', { body: form })
 }
 
-export async function calibrateVoice(
-  req: VoiceCalibrateRequest,
-): Promise<VoiceCalibrateResponse> {
-  const res = await fetch(`${BASE}/voice-calibrate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(req),
-  })
-
-  if (!res.ok) {
-    const err: unknown = await res.json().catch(() => ({}))
-    throw new Error(errorMessage(err, res.status))
-  }
-
-  return res.json() as Promise<VoiceCalibrateResponse>
+export function calibrateVoice(req: VoiceCalibrateRequest): Promise<VoiceCalibrateResponse> {
+  return tool<VoiceCalibrateResponse>('/voice-calibrate', json(req))
 }
 
-export async function analyzeHeatmap(
-  req: HeatmapAnalyzeRequest,
-): Promise<HeatmapAnalyzeResponse> {
-  const res = await fetch(`${BASE}/ai-signal-heatmap/analyze`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(req),
-  })
-
-  if (!res.ok) {
-    const err: unknown = await res.json().catch(() => ({}))
-    throw new Error(errorMessage(err, res.status))
-  }
-
-  return res.json() as Promise<HeatmapAnalyzeResponse>
+export function analyzeHeatmap(req: HeatmapAnalyzeRequest): Promise<HeatmapAnalyzeResponse> {
+  return tool<HeatmapAnalyzeResponse>('/ai-signal-heatmap/analyze', json(req))
 }
 
-export async function forgeAbstract(
-  req: AbstractForgeRequest,
-): Promise<AbstractForgeResponse> {
-  const res = await fetch(`${BASE}/abstract-forge/generate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(req),
-  })
-
-  if (!res.ok) {
-    const err: unknown = await res.json().catch(() => ({}))
-    throw new Error(errorMessage(err, res.status))
-  }
-
-  return res.json() as Promise<AbstractForgeResponse>
+export function forgeAbstract(req: AbstractForgeRequest): Promise<AbstractForgeResponse> {
+  return tool<AbstractForgeResponse>('/abstract-forge/generate', json(req))
 }
 
-export async function analyzeRebuttal(
-  req: RebuttalAnalyzeRequest,
-): Promise<RebuttalAnalyzeResponse> {
-  const res = await fetch(`${BASE}/rebuttal-writer/analyze`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(req),
-  })
-
-  if (!res.ok) {
-    const err: unknown = await res.json().catch(() => ({}))
-    throw new Error(errorMessage(err, res.status))
-  }
-
-  return res.json() as Promise<RebuttalAnalyzeResponse>
+export function analyzeRebuttal(req: RebuttalAnalyzeRequest): Promise<RebuttalAnalyzeResponse> {
+  return tool<RebuttalAnalyzeResponse>('/rebuttal-writer/analyze', json(req))
 }

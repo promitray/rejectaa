@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import type { ReactElement } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { analyzeHeatmap } from '../api'
+import { ToolWait } from '../components/Loaders'
 import type { HeatmapAnalyzeResponse, ParagraphHeatDetail, SentenceHeatDetail } from '../types'
 
 export default function Heatmap(): ReactElement {
@@ -42,10 +43,6 @@ export default function Heatmap(): ReactElement {
     }
   }
 
-  useEffect(() => {
-    // Run initial analysis automatically on mount
-    handleAnalyze()
-  }, [])
 
   const handleSendToCalibrator = (paragraphText: string): void => {
     navigate('/calibrate', {
@@ -217,6 +214,14 @@ export default function Heatmap(): ReactElement {
           </div>
 
           <div className="p-6 bg-white border border-stone-300 rounded-lg min-h-[420px] shadow-sm space-y-6">
+            <ToolWait
+              loading={loading}
+              hasResult={!!result}
+              title="Running heatmap"
+              className="space-y-6"
+              note=""
+              steps={['Reading your sentences', 'Measuring rhythm and openers', 'Scoring each paragraph']}
+            >
             {result ? (
               result.paragraphs.map((para) => {
                 const paraBg =
@@ -291,6 +296,7 @@ export default function Heatmap(): ReactElement {
                 Enter your draft above and run Heatmap Analysis.
               </div>
             )}
+            </ToolWait>
           </div>
         </div>
 

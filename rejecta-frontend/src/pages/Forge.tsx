@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import type { ReactElement } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { forgeAbstract } from '../api'
+import { ToolWait } from '../components/Loaders'
 import type { AbstractForgeResponse, AbstractVariantDetail } from '../types'
 import FormattedMathText from '../components/FormattedMathText'
 
@@ -52,9 +53,6 @@ export default function Forge(): ReactElement {
     }
   }
 
-  useEffect(() => {
-    handleForge()
-  }, [])
 
   const handleCopy = async (textToCopy: string, index: number): Promise<void> => {
     await navigator.clipboard.writeText(textToCopy)
@@ -184,6 +182,12 @@ export default function Forge(): ReactElement {
         </div>
       )}
 
+      <ToolWait
+        loading={loading}
+        hasResult={!!result}
+        title="Forging abstracts"
+        steps={['Reading your abstract', 'Writing the discoverability version', 'Writing the clarity version', 'Writing the high-impact version', 'Checking facts against your draft']}
+      >
       {/* Comparative Summary Strip */}
       {result && (
         <div className="mb-8 p-4 rounded-lg bg-stone-900 text-stone-100 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
@@ -359,6 +363,7 @@ export default function Forge(): ReactElement {
           })}
         </div>
       )}
+      </ToolWait>
     </div>
   )
 }
