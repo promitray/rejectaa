@@ -38,7 +38,7 @@ Open `http://localhost:5173`. The only API call it makes is `POST /analyse-paper
 | Journal matcher | Working | OpenAlex source search plus up to 5 recent papers. Fake names return `found=false`. |
 | LLM analysis | Working | OpenAI, Anthropic, and Hugging Face adapters. Modes `a` (author) and `b` (reader) use different section schemas. |
 | Full pipeline | Working | `POST /analyse-paper` is the only endpoint a frontend should call. |
-| Frontend | Working | Vite + React app in `rejecta-frontend/`. Upload, processing, and results pages. No auth or payments. |
+| Frontend | Working | Vite + React app in `rejecta-frontend/`. Upload, processing, and results pages. Accounts, plans and an admin console are on branch `feat/auth-system` (see `docs/AUTH_IMPLEMENTATION.md`). No payments. |
 
 ### Endpoints
 
@@ -90,7 +90,7 @@ The sample PDF is a short fixture (128 words, 3 references). Those references ca
 
 ## What is not built
 
-- No marketing site, auth, or login. `rejecta.ai` should be a separate landing page. Try now goes to `app.rejecta.ai`. Do not add a login button until accounts exist.
+- No marketing site. `rejecta.ai` should be a separate landing page. Accounts, login, plans, quotas, admin console and partner API exist on branch `feat/auth-system` and are not deployed yet; see `docs/AUTH_IMPLEMENTATION.md` §12 for the deploy checklist.
 - No saved reports, payments, or file storage. The email field is accepted by the API and not sent or stored. The UI does not persist results across a refresh.
 - No background job queue. A long paper can sit on the request until the LLM returns. A 45s+ call is possible; Railway-style request timeouts are not handled yet (ARQ + Redis was the planned follow-up).
 - Journal matching is name search only. The abstract is accepted but not used for semantic fit.

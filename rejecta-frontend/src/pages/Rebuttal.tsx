@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import type { ReactElement } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { analyzeRebuttal } from '../api'
+import { ToolWait } from '../components/Loaders'
 import type {
   RebuttalAnalyzeResponse,
   RebuttalCommentItem,
@@ -234,6 +235,13 @@ export default function Rebuttal(): ReactElement {
 
         {/* Right Panel: Interactive Workbench & Results */}
         <div className="lg:col-span-7 space-y-6">
+          <ToolWait
+            loading={loading}
+            hasResult={!!result}
+            title="Writing the rebuttal"
+            className="space-y-6"
+            steps={['Reading the reviewer report', 'Separating each comment', 'Deciding how to respond', 'Drafting the replies', 'Assembling the letter']}
+          >
           {!result && !loading && (
             <div className="border border-dashed border-stone-300 rounded-xl p-12 text-center text-stone-500 bg-stone-50">
               <div className="text-3xl mb-3">📑</div>
@@ -501,6 +509,7 @@ export default function Rebuttal(): ReactElement {
               </div>
             </>
           )}
+          </ToolWait>
         </div>
       </div>
     </div>

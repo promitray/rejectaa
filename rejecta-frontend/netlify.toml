@@ -5,7 +5,37 @@
 [build.environment]
   NODE_VERSION = "20"
 
+# Auth routes are proxied to the API so the refresh-token cookie is
+# first-party to this site (the API lives on another domain). Must come
+# before the SPA fallback. "signed" adds an X-Nf-Sign JWS (secret in the
+# Netlify env var NETLIFY_PROXY_SECRET; set the same value on Railway) so
+# the API can trust the client IP Netlify forwards for rate limiting.
+[[redirects]]
+  from = "/api/auth/*"
+  to = "https://rejecta-production.up.railway.app/auth/:splat"
+  status = 200
+  force = true
+  signed = "NETLIFY_PROXY_SECRET"
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    # Scripts only from this site. The API is called directly for tools.
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://rejecta-production.up.railway.app; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+
+# Password reset links carry a one-time token in the URL: never leak it.
+[[headers]]
+  for = "/reset-password"
+  [headers.values]
+    Referrer-Policy = "no-referrer"
+    Cache-Control = "no-store"

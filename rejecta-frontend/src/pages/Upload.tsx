@@ -302,7 +302,7 @@ export default function Upload(): ReactElement {
       </form>
 
       <p className="mt-4 text-center text-xs text-gray-500">
-        Research preview · full report included · no account
+        Research preview · full report included · uses one paper analysis from your plan
       </p>
     </div>
   )
