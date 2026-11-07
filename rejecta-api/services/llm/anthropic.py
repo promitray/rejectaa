@@ -11,7 +11,7 @@ from models import AnalysisResult
 from services.llm.base import AbstractAnalysisProvider, MODE_A
 
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 2500
+MAX_TOKENS = 4000
 FIX_JSON_MESSAGE = "Your prior response was invalid JSON. Return only corrected valid JSON."
 SERVER_ERROR_MESSAGE = "Failed to parse model output after retry"
 

@@ -22,6 +22,7 @@ from db.pool import check_database, close_pool, init_pool
 from routers import admin_insights, admin_partners, admin_plans, admin_users, oauth
 from routers import auth as auth_routes
 from routers import auth_mfa as auth_mfa_routes
+from routers import authors as authors_routes
 from routers import me as me_routes
 from routers import wellknown as wellknown_routes
 from models import (
@@ -43,13 +44,15 @@ from models import (
     VoiceCalibrateResponse,
 )
 from services import citations, journals, llm, parser
+from services import paper_profile
+from services.analysis_guard import AnalysisContext, paper_context
 from services.calibrator import VoiceCalibratorService
 from services.forge import AbstractForgeEngine, AbstractForgeResult
 from services.heatmap import HeatmapAnalysisResult, HeatmapEngine
 from services.citations import MAX_REFERENCES, build_citation_summary, verify_citations
 from services.journals import match_journal
 from services.llm import get_provider_cached
-from services.parser import MAX_FILE_SIZE_BYTES, parse_pdf
+from services.parser import MAX_FILE_SIZE_BYTES, parse_document, upload_name_error
 
 APP_TITLE = "Rejecta API"
 APP_VERSION = "0.1.0"
@@ -106,6 +109,7 @@ app.add_exception_handler(ApiError, api_error_handler)
 app.include_router(auth_routes.router)
 app.include_router(auth_mfa_routes.router)
 app.include_router(me_routes.router)
+app.include_router(authors_routes.router)
 app.include_router(wellknown_routes.router)
 app.include_router(admin_users.router)
 app.include_router(admin_plans.router)
@@ -201,10 +205,11 @@ async def analyse(payload: AnalyseRequest, subject: Subject = Depends(get_subjec
 
 @app.post("/parse", response_model=ParsedDocument, dependencies=[Depends(public_rate_limit)])
 async def parse_endpoint(file: UploadFile = File(...)) -> ParsedDocument:
-    """Parse an uploaded PDF and return structured content."""
+    """Parse an uploaded PDF or Word (.docx) paper and return structured content."""
     filename = file.filename or ""
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    name_error = upload_name_error(filename)
+    if name_error:
+        raise HTTPException(status_code=400, detail=name_error)
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE_BYTES:
@@ -214,11 +219,12 @@ async def parse_endpoint(file: UploadFile = File(...)) -> ParsedDocument:
         )
 
     try:
-        return parse_pdf(content)
+        return parse_document(content, filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail="PDF parsing failed unexpectedly") from exc
+        logger.error("Document parsing failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Document parsing failed unexpectedly") from exc
 
 
 class CitationsRequest(BaseModel):
@@ -262,9 +268,10 @@ async def analyse_paper(
     journal: str = Form(...),
     mode: str = Form(default="a"),
     email: str = Form(default=""),
+    article_type: str = Form(default="auto"),
     subject: Subject = Depends(get_subject),
 ) -> AnalysisPaperResponse:
-    """Full pipeline: PDF → parse → citations + journal → Claude.
+    """Full pipeline: PDF or Word (.docx) → parse → citations + journal → LLM.
 
     The only endpoint the frontend calls. Chains all four
     services internally. Citations and journal match run
@@ -278,14 +285,18 @@ async def analyse_paper(
         email: Optional report address from the app form.
                Accepted so the app and API share one contract.
                Not stored or sent yet.
+        article_type: "auto" (read it from the file), or one of research_article,
+               communication, perspective, review, mini_review. A choice here wins
+               over a label printed in the file.
 
     Returns:
         AnalysisPaperResponse with analysis, citations,
         journal match, and document metadata.
     """
     filename = file.filename or ""
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="PDF files only")
+    name_error = upload_name_error(filename)
+    if name_error:
+        raise HTTPException(status_code=400, detail=name_error)
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE_BYTES:
@@ -299,16 +310,25 @@ async def analyse_paper(
 
     report_email = _optional_email(email)
 
+    chosen_type: str | None = None
+    if article_type.strip().lower() not in ("", "auto"):
+        chosen_type = paper_profile.coerce_article_type(article_type)
+        if chosen_type is None:
+            raise HTTPException(
+                status_code=400,
+                detail="article_type must be auto, research_article, communication, perspective, review or mini_review",
+            )
+
     # Quota is reserved only after cheap validation, and refunded if any step fails.
     async with consume(subject, features.ANALYSE_PAPER):
         start = time.perf_counter()
         try:
-            parsed = parse_pdf(content)
+            parsed = parse_document(content, filename, chosen_type)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error("PDF parse failed: %s", exc, exc_info=True)
-            raise HTTPException(status_code=500, detail="PDF parsing failed unexpectedly") from exc
+            logger.error("Document parse failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail="Document parsing failed unexpectedly") from exc
 
         citation_outcome, journal_outcome = await asyncio.gather(
             verify_citations(parsed.references),
@@ -334,24 +354,46 @@ async def analyse_paper(
         citation_summary = build_citation_summary(citation_results)
         # Facts only. Editorial warnings stay in the API response for the UI; feeding
         # them to the model skewed scores (e.g. 75 -> 38 on a landmark paper).
+        not_found = citation_summary.unverified - citation_summary.check_incomplete
         citation_summary_str = (
             f"{citation_summary.verified} verified, "
             f"{citation_summary.ghost} ghost (DOI or arXiv ID does not exist in CrossRef/arXiv; "
             f"possible fabricated reference), "
-            f"{citation_summary.unverified} unverified (lookup inconclusive) "
+            f"{not_found} unverified (checked, no matching record found), "
+            f"{citation_summary.check_incomplete} not checked (a lookup service was busy, so nothing can be "
+            f"concluded about them) "
             f"out of {citation_summary.total} total references."
         )
 
         provider = get_provider_cached()
+        journal_dump = journal_data.model_dump()
+        context = AnalysisContext(
+            source_text=parsed.full_text,
+            article_type=parsed.article_type or paper_profile.UNKNOWN,
+            type_source=parsed.article_type_source,
+            structure_mode="detected" if parsed.structure == "detected" else "derived",
+            section_texts={k: v for k, v in parsed.sections.items() if k in parsed.section_roles},
+            section_roles=parsed.section_roles,
+            abstract=parsed.abstract,
+            body=parsed.body,
+            refers_to_si=parsed.refers_to_si,
+            citations_total=citation_summary.total,
+            citations_verified=citation_summary.verified,
+            citations_ghost=citation_summary.ghost,
+            citations_unchecked=citation_summary.check_incomplete,
+            extra_text=f"{citation_summary_str} {journal_dump}",
+            numbers_text=f"{parsed.abstract} {parsed.body}",
+        )
         try:
-            analysis = await provider.analyse(
-                abstract=parsed.abstract,
-                sections=parsed.sections,
-                target_journal=journal.strip(),
-                citation_summary=citation_summary_str,
-                journal_data=journal_data.model_dump(),
-                mode=mode,
-            )
+            with paper_context(context):
+                analysis = await provider.analyse(
+                    abstract=parsed.abstract,
+                    sections=parsed.sections,
+                    target_journal=journal.strip(),
+                    citation_summary=citation_summary_str,
+                    journal_data=journal_dump,
+                    mode=mode,
+                )
         except Exception as exc:
             logger.error("LLM analysis failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail="Analysis failed — please try again") from exc
@@ -374,10 +416,16 @@ async def analyse_paper(
             journal=journal_data,
             meta=PaperMeta(
                 word_count=parsed.word_count,
-                sections_found=list(parsed.sections.keys()),
+                sections_found=(
+                    list(analysis.sections.keys())
+                    if context.structure_mode == "derived"
+                    else list(parsed.sections.keys())
+                ),
                 references_found=len(parsed.references),
                 mode=mode,
                 processing_ms=elapsed,
+                article_type=analysis.paper_format,
+                structure_mode=context.structure_mode,
             ),
         )
 

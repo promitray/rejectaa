@@ -14,7 +14,18 @@ from urllib.parse import quote
 
 import httpx
 
+from config import settings
 from models import CitationResult, CitationStatus, CitationSummary, PublicationType
+from services.citation_http import BUSY, ERROR, NOT_FOUND, OK, Fetch, Trace, TTLCache, limiter
+from services.citation_refs import (
+    ParsedReference,
+    candidate_from_crossref,
+    candidate_from_europepmc,
+    candidate_from_openalex,
+    clean_reference,
+    compare,
+    parse_reference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +37,17 @@ OPENALEX_USER_AGENT = "Rejecta/1.0 (mailto:hello@rejecta.ai)"
 REQUEST_TIMEOUT = 8.0
 MAX_REFERENCES = 60
 LOOKUP_CONCURRENCY = 8
-CROSSREF_CONCURRENCY = 2
-CROSSREF_GAP_SECONDS = 0.25
+CROSSREF_MAILTO = "hello@rejecta.ai"
+CROSSREF_SELECT = (
+    "DOI,title,published,issued,published-print,published-online,author,score,type,"
+    "container-title,short-container-title,publisher,volume,page"
+)
+EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+# One paper must not hold the request open forever; whatever is unfinished is reported as "not checked".
+TOTAL_BUDGET_SECONDS = 45.0
+VERIFIED_TTL_SECONDS = 24 * 3600.0
+NOT_FOUND_TTL_SECONDS = 3600.0
+_cache = TTLCache()
 
 ARXIV_DOI_PREFIX = "10.48550/arxiv."
 ARXIV_ABS_URL = "https://export.arxiv.org/abs/"
@@ -274,8 +294,13 @@ def _unverified(
     doi: str | None = None,
     diagnostic: str | None = None,
     action: str | None = None,
+    incomplete: bool = False,
 ) -> CitationResult:
-    """Return an unverified result with diagnostic guidance."""
+    """Return an unverified result with diagnostic guidance.
+
+    `incomplete=True` means the reference was NOT actually checked (a service was busy or
+    unreachable), which is different from "checked and not found".
+    """
     diag = diagnostic or (
         f"Provided DOI '{doi}' did not resolve on CrossRef or arXiv."
         if doi
@@ -300,6 +325,7 @@ def _unverified(
         confidence_score=0.0,
         diagnostic_reason=diag,
         suggested_action=act,
+        check_incomplete=incomplete,
     )
 
 
@@ -349,20 +375,21 @@ def _is_crossref_preprint(doi: str | None, message: dict[str, Any]) -> bool:
 
 def _year_from_crossref(message: dict[str, Any]) -> int | None:
     """Read the publication year from a CrossRef work message."""
-    published = message.get("published")
-    if not isinstance(published, dict):
-        return None
-    date_parts = published.get("date-parts")
-    if (
-        isinstance(date_parts, list)
-        and date_parts
-        and isinstance(date_parts[0], list)
-        and date_parts[0]
-    ):
-        try:
-            return int(date_parts[0][0])
-        except (TypeError, ValueError):
-            return None
+    for key in ("issued", "published", "published-print", "published-online"):
+        block = message.get(key)
+        if not isinstance(block, dict):
+            continue
+        date_parts = block.get("date-parts")
+        if (
+            isinstance(date_parts, list)
+            and date_parts
+            and isinstance(date_parts[0], list)
+            and date_parts[0]
+        ):
+            try:
+                return int(date_parts[0][0])
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -380,6 +407,7 @@ def _result_from_crossref(
     ref: str,
     message: dict[str, Any],
     confidence: float = 1.0,
+    diagnostic: str | None = None,
 ) -> CitationResult:
     """Build an enriched verified result from a CrossRef work payload."""
     doi = message.get("DOI")
@@ -413,32 +441,23 @@ def _result_from_crossref(
         is_preprint=is_preprint,
         source_url=source_url,
         confidence_score=round(confidence, 2),
-        diagnostic_reason=f"Verified via CrossRef official record (DOI: {doi_str or 'matched'}).",
+        diagnostic_reason=diagnostic or f"Verified via CrossRef official record (DOI: {doi_str or 'matched'}).",
     )
 
 
-async def _get_crossref(
+async def _crossref_fetch(
     client: httpx.AsyncClient,
-    gate: asyncio.Semaphore,
     url: str,
     params: dict[str, Any] | None = None,
-) -> httpx.Response:
-    """Call CrossRef slowly. They 429 if we burst 40 bibliographic searches."""
-    async with gate:
-        response: httpx.Response | None = None
-        for attempt in range(4):
-            response = await client.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if response.status_code != 429:
-                await asyncio.sleep(CROSSREF_GAP_SECONDS)
-                return response
-            retry_after = response.headers.get("Retry-After")
-            try:
-                wait = float(retry_after) if retry_after else 1.5 * (attempt + 1)
-            except ValueError:
-                wait = 1.5 * (attempt + 1)
-            logger.info("CrossRef rate-limited; waiting %.1fs", wait)
-            await asyncio.sleep(wait)
-        return response
+) -> Fetch:
+    """Call CrossRef through the shared limiter: paced, Retry-After aware, never raises."""
+    merged = dict(params or {})
+    merged.setdefault("mailto", CROSSREF_MAILTO)  # puts us in CrossRef's faster "polite" pool
+    return await limiter("CrossRef").get(client, url, params=merged, timeout=REQUEST_TIMEOUT)
+
+
+def _could_not_check(source: str, fetch: Fetch) -> str:
+    return f"Could not complete the check: {fetch.detail or source + ' did not answer'}. This does not mean the reference is wrong."
 
 
 def _year_from_arxiv_id(arxiv_id: str) -> int | None:
@@ -489,91 +508,78 @@ async def _check_arxiv_id(
     ref: str,
 ) -> CitationResult:
     """Confirm an arXiv id against the official abstract landing page."""
-    try:
-        response = await client.get(f"{ARXIV_ABS_URL}{arxiv_id}", timeout=REQUEST_TIMEOUT)
-        clean_id = arxiv_id.split("v")[0]
-        if response.status_code == 200:
-            title: str | None = None
-            meta_title = re.search(
-                r'<meta\s+name="citation_title"\s+content="([^"]+)"',
-                response.text,
-                re.IGNORECASE,
-            )
-            if meta_title:
-                title = re.sub(r"\s+", " ", meta_title.group(1)).strip() or None
-            else:
-                title_match = re.search(
-                    r"<title>(.*?)</title>",
-                    response.text,
-                    re.IGNORECASE | re.DOTALL,
-                )
-                if title_match:
-                    title = re.sub(
-                        r"^(\[[^\]]+\]|arxiv\.org)\s*[-:]?\s*",
-                        "",
-                        re.sub(r"\s+", " ", title_match.group(1)),
-                        flags=re.IGNORECASE,
-                    ).strip() or None
-
-            author_tags = re.findall(
-                r'<meta\s+name="citation_author"\s+content="([^"]+)"',
-                response.text,
-                re.IGNORECASE,
-            )
-            authors = [re.sub(r"\s+", " ", a).strip() for a in author_tags if a.strip()][:6]
-
-            year = _year_from_arxiv_id(clean_id)
-            meta_date = re.search(
-                r'<meta\s+name="citation_date"\s+content="(\d{4})',
-                response.text,
-                re.IGNORECASE,
-            )
-            if meta_date:
-                try:
-                    year = int(meta_date.group(1))
-                except ValueError:
-                    pass
-
-            return CitationResult(
-                raw=ref,
-                doi=ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
-                status=CitationStatus.verified,
-                title=title,
-                authors=authors,
-                year=year,
-                venue="arXiv",
-                publication_type=PublicationType.preprint.value,
-                is_preprint=True,
-                source_url=f"https://arxiv.org/abs/{arxiv_id}",
-                confidence_score=1.0,
-                diagnostic_reason=f"Verified via arXiv official repository (arXiv:{clean_id}).",
-                suggested_action=None,
-            )
-        if response.status_code == 404:
-            return CitationResult(
-                raw=ref,
-                doi=ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
-                status=CitationStatus.ghost,
-                title=None,
-                authors=[],
-                year=None,
-                venue="arXiv",
-                publication_type=PublicationType.preprint.value,
-                is_preprint=True,
-                source_url=f"https://arxiv.org/abs/{arxiv_id}",
-                confidence_score=0.0,
-                diagnostic_reason=f"arXiv ID '{arxiv_id}' was not found on arXiv (HTTP 404). Dead identifier or hallucinated preprint.",
-                suggested_action="Verify arXiv ID digits or locate published peer-reviewed conference/journal version.",
-            )
-        logger.debug("arXiv returned %s for %s", response.status_code, arxiv_id)
-        return _unverified(
-            ref,
-            ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
-            diagnostic=f"arXiv server returned status {response.status_code} for ID '{arxiv_id}'.",
+    fetch = await limiter("arXiv").get(client, f"{ARXIV_ABS_URL}{arxiv_id}", timeout=REQUEST_TIMEOUT)
+    clean_id = arxiv_id.split("v")[0]
+    if fetch.kind == OK and fetch.response is not None:
+        page = fetch.response.text
+        title: str | None = None
+        meta_title = re.search(
+            r'<meta\s+name="citation_title"\s+content="([^"]+)"',
+            page,
+            re.IGNORECASE,
         )
-    except (httpx.TimeoutException, httpx.RequestError) as exc:
-        logger.warning("arXiv lookup failed for %s: %s", arxiv_id, exc)
-        return _unverified(ref, diagnostic=f"Connection failure contacting arXiv: {exc}")
+        if meta_title:
+            title = re.sub(r"\s+", " ", meta_title.group(1)).strip() or None
+        else:
+            title_match = re.search(r"<title>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = re.sub(
+                    r"^(\[[^\]]+\]|arxiv\.org)\s*[-:]?\s*",
+                    "",
+                    re.sub(r"\s+", " ", title_match.group(1)),
+                    flags=re.IGNORECASE,
+                ).strip() or None
+
+        author_tags = re.findall(r'<meta\s+name="citation_author"\s+content="([^"]+)"', page, re.IGNORECASE)
+        authors = [re.sub(r"\s+", " ", a).strip() for a in author_tags if a.strip()][:6]
+
+        year = _year_from_arxiv_id(clean_id)
+        meta_date = re.search(r'<meta\s+name="citation_date"\s+content="(\d{4})', page, re.IGNORECASE)
+        if meta_date:
+            try:
+                year = int(meta_date.group(1))
+            except ValueError:
+                pass
+
+        return CitationResult(
+            raw=ref,
+            doi=ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
+            status=CitationStatus.verified,
+            title=title,
+            authors=authors,
+            year=year,
+            venue="arXiv",
+            publication_type=PublicationType.preprint.value,
+            is_preprint=True,
+            source_url=f"https://arxiv.org/abs/{arxiv_id}",
+            confidence_score=1.0,
+            diagnostic_reason=f"Verified via arXiv official repository (arXiv:{clean_id}).",
+            suggested_action=None,
+        )
+    if fetch.kind == NOT_FOUND:
+        return CitationResult(
+            raw=ref,
+            doi=ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
+            status=CitationStatus.ghost,
+            title=None,
+            authors=[],
+            year=None,
+            venue="arXiv",
+            publication_type=PublicationType.preprint.value,
+            is_preprint=True,
+            source_url=f"https://arxiv.org/abs/{arxiv_id}",
+            confidence_score=0.0,
+            diagnostic_reason=f"arXiv ID '{arxiv_id}' was not found on arXiv (HTTP 404). Dead identifier or hallucinated preprint.",
+            suggested_action="Verify arXiv ID digits or locate published peer-reviewed conference/journal version.",
+        )
+    logger.debug("arXiv lookup for %s did not finish: %s", arxiv_id, fetch.detail)
+    return _unverified(
+        ref,
+        ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
+        diagnostic=_could_not_check("arXiv", fetch),
+        action="Run the analysis again in a minute.",
+        incomplete=True,
+    )
 
 
 async def _check_datacite(
@@ -583,21 +589,20 @@ async def _check_datacite(
 ) -> tuple[int | None, CitationResult | None]:
     """Look a DOI up in DataCite (Zenodo, figshare, many repositories).
 
-    Returns (status_code, result). result is None unless the DOI exists.
+    Returns (status_code, result). result is None unless the DOI exists. status_code is 404
+    only when DataCite really answered "no such DOI"; None means it could not be asked.
     """
-    try:
-        response = await client.get(
-            f"{DATACITE_DOI_URL}/{quote(doi, safe='/')}", timeout=REQUEST_TIMEOUT
-        )
-    except (httpx.TimeoutException, httpx.RequestError) as exc:
-        logger.warning("DataCite lookup failed for %s: %s", doi, exc)
+    fetch = await limiter("DataCite").get(
+        client, f"{DATACITE_DOI_URL}/{quote(doi, safe='/')}", timeout=REQUEST_TIMEOUT
+    )
+    if fetch.kind == NOT_FOUND:
+        return 404, None
+    if fetch.kind != OK or fetch.response is None:
         return None, None
-    if response.status_code != 200:
-        return response.status_code, None
     try:
-        attrs = response.json()["data"]["attributes"]
+        attrs = fetch.response.json()["data"]["attributes"]
     except (ValueError, KeyError, TypeError):
-        return response.status_code, None
+        return 200, None
     titles = attrs.get("titles") or []
     title = titles[0].get("title") if titles and isinstance(titles[0], dict) else None
     creators = [
@@ -626,16 +631,18 @@ async def _check_datacite(
 
 async def _check_doi(
     client: httpx.AsyncClient,
-    gate: asyncio.Semaphore,
     doi: str,
     ref: str,
 ) -> CitationResult:
-    """Resolve a DOI via CrossRef, with an arXiv fallback for preprint DOIs."""
+    """Resolve a DOI via CrossRef (then DataCite, then arXiv for preprint DOIs).
+
+    "Ghost" is returned only when the services genuinely answered "no such DOI". If a service
+    was busy or unreachable, the result is unverified with check_incomplete=True instead.
+    """
     try:
-        url = f"{CROSSREF_BASE_URL}/{quote(doi, safe='')}"
-        response = await _get_crossref(client, gate, url)
-        if response.status_code == 200:
-            data: Any = response.json()
+        fetch = await _crossref_fetch(client, f"{CROSSREF_BASE_URL}/{quote(doi, safe='')}")
+        if fetch.kind == OK and fetch.response is not None:
+            data: Any = fetch.response.json()
             message: Any = data.get("message", {}) if isinstance(data, dict) else {}
             if isinstance(message, dict):
                 return _result_from_crossref(ref, message)
@@ -653,7 +660,7 @@ async def _check_doi(
                 confidence_score=1.0,
                 diagnostic_reason=f"Verified via CrossRef official record (DOI: {doi}).",
             )
-        if response.status_code == 404:
+        if fetch.kind == NOT_FOUND:
             if _is_arxiv_doi(doi):
                 arxiv_id = _arxiv_id_from_doi(doi)
                 if arxiv_id:
@@ -666,9 +673,11 @@ async def _check_doi(
                     ref,
                     doi,
                     diagnostic=(
-                        f"DOI '{doi}' is not in CrossRef and DataCite could not be reached "
-                        f"(status {datacite_status}); cannot confirm it is fabricated."
+                        f"DOI '{doi}' is not in CrossRef and DataCite could not be reached; "
+                        "cannot confirm it is fabricated."
                     ),
+                    action="Run the analysis again in a minute.",
+                    incomplete=True,
                 )
             return CitationResult(
                 raw=ref,
@@ -685,21 +694,19 @@ async def _check_doi(
                 diagnostic_reason=f"DOI '{doi}' does not exist in CrossRef or DataCite (HTTP 404). Dead DOI or fabricated citation.",
                 suggested_action="Verify DOI syntax or replace with valid DOI from publisher landing page.",
             )
-        logger.warning("CrossRef returned %s for DOI %s", response.status_code, doi)
+        logger.warning("DOI %s could not be checked: %s", doi, fetch.detail)
         return _unverified(
             ref,
             doi,
-            diagnostic=f"CrossRef returned status {response.status_code} for DOI '{doi}'.",
+            diagnostic=_could_not_check("CrossRef", fetch),
+            action="Run the analysis again in a minute.",
+            incomplete=True,
         )
-    except httpx.TimeoutException:
-        logger.debug("CrossRef timeout for DOI %s", doi)
-        return _unverified(ref, doi, diagnostic=f"CrossRef request timed out resolving DOI '{doi}'.")
-    except httpx.RequestError as exc:
-        logger.warning("CrossRef request error for %s: %s", doi, exc)
-        return _unverified(ref, doi, diagnostic=f"Network error contacting CrossRef for DOI '{doi}': {exc}")
     except Exception:
         logger.error("Unexpected error checking DOI %s", doi, exc_info=True)
-        return _unverified(ref, doi, diagnostic=f"Unexpected error resolving DOI '{doi}'.")
+        return _unverified(
+            ref, doi, diagnostic=f"Unexpected error resolving DOI '{doi}'.", incomplete=True
+        )
 
 
 def _author_in_item(ref: str, item: dict[str, Any]) -> bool:
@@ -744,308 +751,477 @@ def _crossref_match_quality(ref: str, item: dict[str, Any]) -> bool:
     return False
 
 
+def _crossref_items(fetch: Fetch) -> list[dict[str, Any]]:
+    try:
+        data: Any = fetch.response.json() if fetch.response is not None else {}
+    except ValueError:
+        return []
+    message = data.get("message", {}) if isinstance(data, dict) else {}
+    items = message.get("items") if isinstance(message, dict) else None
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _fingerprint_phrase(report: Any) -> str:
+    fields = [
+        name
+        for name, ok in (
+            ("first author", report.author),
+            ("year", report.year),
+            ("volume", report.volume),
+            ("first page", report.page),
+            ("title", report.title_match),
+        )
+        if ok
+    ]
+    return ", ".join(fields)
+
+
+def _offer_closest(trace: Trace, source: str, report: Any, title: str | None, year: int | None) -> None:
+    """Remember a near miss so the unverified message can say what differed."""
+    score = report.matched_fields + (1 if report.title_similarity >= 0.6 else 0)
+    # A record that only shares a year or a page number is not "close"; it needs the author or the title.
+    related = report.author or report.author_close or report.title_similarity >= 0.6
+    if score < 2 or not title or not related:
+        return
+    differs = ", ".join(report.differs_in()) or "its details"
+    trace.offer_closest(
+        score,
+        f"Closest {source} record: '{title[:90]}' ({year or 'year unknown'}), but it differs from the cited reference in {differs}.",
+    )
+
+
 async def _search_crossref(
     client: httpx.AsyncClient,
-    gate: asyncio.Semaphore,
     ref: str,
+    parsed: ParsedReference,
+    trace: Trace,
 ) -> CitationResult | None:
-    """Search CrossRef with the bibliography line or a guessed title."""
-    query = _guess_title(ref) or ref
-    author = _first_author_last(ref)
-    if author and query != ref:
-        bibliographic = f"{query} {author}"
-    else:
-        bibliographic = ref[:400]
-    try:
-        response = await _get_crossref(
-            client,
-            gate,
-            CROSSREF_BASE_URL,
-            params={
-                "query.bibliographic": bibliographic,
-                "rows": 3,
-                "select": "DOI,title,published,author,score,type,container-title,publisher",
-            },
+    """Search CrossRef with the whole reference and accept only a fingerprint match.
+
+    The whole cited line is the query, because CrossRef's bibliographic search is built for
+    exactly that and it works for references that have no title (chemistry style). A hit is
+    accepted when author, year and volume/first page agree, never on relevance score alone.
+    """
+    cleaned = clean_reference(ref)
+    attempts: list[dict[str, Any]] = [{"query.bibliographic": cleaned[:400], "rows": 8}]
+    if parsed.title and parsed.author_display:
+        attempts.append({"query.bibliographic": f"{parsed.title} {parsed.author_display}", "rows": 8})
+    if parsed.has_fingerprint and parsed.author_display:
+        # Common surnames ("Zhang") with a shortened author list ("et al.") can rank far down.
+        # Narrowed by author and year, a deeper page is still cheap, and only runs if the above failed.
+        attempts.append(
+            {"query.bibliographic": cleaned[:400], "query.author": parsed.author_display, "rows": 30}
         )
-        if response.status_code != 200:
-            logger.debug("CrossRef search returned %s", response.status_code)
-            return None
-        data: Any = response.json()
-        message = data.get("message", {}) if isinstance(data, dict) else {}
-        items = message.get("items") if isinstance(message, dict) else None
-        if not isinstance(items, list):
-            return None
-        ranked: list[tuple[float, dict[str, Any]]] = []
-        guessed = _guess_title(ref) or ""
-        for item in items:
-            if not isinstance(item, dict):
+
+    for attempt in attempts:
+        params: dict[str, Any] = {**attempt, "select": CROSSREF_SELECT}
+        if parsed.year:
+            # a cited year is rarely off by more than one; this removes thousands of look-alikes
+            params["filter"] = f"from-pub-date:{parsed.year - 1},until-pub-date:{parsed.year + 1}"
+        fetch = await _crossref_fetch(client, CROSSREF_BASE_URL, params)
+        trace.note("CrossRef", fetch)
+        if fetch.kind in (BUSY, ERROR):
+            return None  # another query would hit the same wall
+        if not fetch.ok:
+            continue
+
+        best: tuple[tuple[float, int, float], dict[str, Any], Any] | None = None
+        for item in _crossref_items(fetch):
+            candidate = candidate_from_crossref(item)
+            report = compare(parsed, candidate)
+            confidence = report.confidence
+            if not report.verified and parsed.title and _crossref_match_quality(ref, item):
+                confidence = 0.85  # the older title/score rule, kept for title-bearing references
+            elif not report.verified:
+                _offer_closest(trace, "CrossRef", report, candidate.title, candidate.years[0] if candidate.years else None)
                 continue
-            title = _title_from_crossref(item) or ""
-            similarity = _title_similarity(guessed, title) if guessed and title else 0.0
-            ranked.append((similarity, item))
-        ranked.sort(key=lambda pair: pair[0], reverse=True)
-        for _, item in ranked:
-            if _crossref_match_quality(ref, item):
-                return _result_from_crossref(ref, item)
-        return None
-    except (httpx.TimeoutException, httpx.RequestError, ValueError) as exc:
-        logger.warning("CrossRef search failed: %s", exc)
-        return None
+            rank = (confidence, report.matched_fields, float(item.get("score") or 0.0))
+            if best is None or rank > best[0]:
+                best = (rank, item, report)
+
+        if best is not None:
+            _, item, report = best
+            matched = _fingerprint_phrase(report)
+            reason = (
+                f"Verified via CrossRef: {matched} match the cited reference (DOI: {item.get('DOI')})."
+                if matched
+                else None
+            )
+            return _result_from_crossref(ref, item, best[0][0], diagnostic=reason)
+    return None
 
 
-async def _search_arxiv(client: httpx.AsyncClient, ref: str) -> CitationResult | None:
-    """Search the arXiv API by title and first author."""
-    title = _guess_title(ref)
+def _europepmc_query(parsed: ParsedReference) -> str | None:
+    if parsed.title:
+        title = re.sub(r'["\\]', " ", parsed.title)[:200].strip()
+        return f'TITLE:"{title}"' if title else None
+    if parsed.author_display and parsed.year and (parsed.volume or parsed.first_page):
+        parts = [f'AUTH:"{parsed.author_display}"', f"PUB_YEAR:{parsed.year}"]
+        if parsed.volume:
+            parts.append(f"VOLUME:{parsed.volume}")
+        else:
+            parts.append(f'PAGE_INFO:"{parsed.first_page}"')
+        return " AND ".join(parts)
+    return None
+
+
+async def _search_europepmc(
+    client: httpx.AsyncClient,
+    ref: str,
+    parsed: ParsedReference,
+    trace: Trace,
+) -> CitationResult | None:
+    """Europe PMC: PubMed, PMC and preprint servers (bioRxiv, medRxiv, ChemRxiv, ...). Free, no key."""
+    query = _europepmc_query(parsed)
+    if not query:
+        return None
+    fetch = await limiter("Europe PMC").get(
+        client,
+        EUROPEPMC_SEARCH_URL,
+        params={"query": query, "format": "json", "pageSize": 5, "resultType": "lite"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    trace.note("Europe PMC", fetch)
+    if not fetch.ok or fetch.response is None:
+        return None
+    try:
+        records = (fetch.response.json().get("resultList") or {}).get("result") or []
+    except ValueError:
+        return None
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        candidate = candidate_from_europepmc(record)
+        report = compare(parsed, candidate)
+        if not report.verified:
+            _offer_closest(trace, "Europe PMC", report, candidate.title, candidate.years[0] if candidate.years else None)
+            continue
+        doi = str(record.get("doi") or "").strip() or None
+        source = str(record.get("source") or "")
+        is_preprint = source == "PPR"
+        details = record.get("bookOrReportDetails")
+        venue = record.get("journalTitle") or (details.get("publisher") if isinstance(details, dict) else None)
+        record_id = record.get("id")
+        if doi:
+            source_url = f"https://doi.org/{doi}"
+        elif source and record_id:
+            source_url = f"https://europepmc.org/article/{source}/{record_id}"
+        else:
+            source_url = None
+        authors = [a.strip() for a in str(record.get("authorString") or "").rstrip(".").split(",") if a.strip()][:6]
+        year = candidate.years[0] if candidate.years else None
+        return CitationResult(
+            raw=ref,
+            doi=doi,
+            status=CitationStatus.verified,
+            title=candidate.title,
+            authors=authors,
+            year=year,
+            venue=str(venue) if venue else None,
+            publication_type=PublicationType.preprint.value if is_preprint else PublicationType.journal.value,
+            is_preprint=is_preprint,
+            source_url=source_url,
+            confidence_score=report.confidence,
+            diagnostic_reason=f"Verified via Europe PMC: {_fingerprint_phrase(report)} match the cited reference.",
+        )
+    return None
+
+
+def _arxiv_is_relevant(ref: str, parsed: ParsedReference) -> bool:
+    """arXiv only for references that can live there; journal-style references (volume + page) cannot."""
+    if _cited_as_preprint(ref):
+        return True
+    return not (parsed.volume and parsed.first_page)
+
+
+async def _search_arxiv(
+    client: httpx.AsyncClient,
+    ref: str,
+    parsed: ParsedReference,
+    trace: Trace,
+) -> CitationResult | None:
+    """Search the arXiv API by title and first author (needs a real title)."""
+    title = parsed.title
     if not title:
         return None
-    author = _first_author_last(ref)
     query = f'all:"{title}"'
-    if author:
-        query = f"{query} AND au:{author}"
-    try:
-        response = await client.get(
-            ARXIV_SEARCH_URL,
-            params={"search_query": query, "start": 0, "max_results": 3},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code != 200:
-            return None
-        entries = re.findall(
-            r"<entry>(.*?)</entry>",
-            response.text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        for entry in entries:
-            title_match = re.search(
-                r"<title>(.*?)</title>",
-                entry,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            id_match = re.search(
-                r"arxiv.org/abs/([0-9]+\.[0-9]+(?:v\d+)?|[a-z\-]+/[0-9]+)",
-                entry,
-                flags=re.IGNORECASE,
-            )
-            if not title_match or not id_match:
-                continue
-            found_title = re.sub(r"\s+", " ", title_match.group(1)).strip()
-            a = _normalize_title(title)
-            b = _normalize_title(found_title)
-            similar = _title_similarity(title, found_title) >= TITLE_SIMILARITY_MIN
-            prefix = bool(
-                a and b and min(len(a), len(b)) >= 18 and (b.startswith(a) or a.startswith(b))
-            )
-            if not similar and not prefix:
-                continue
-
-            raw_id = id_match.group(1)
-            clean_id = raw_id.split("v")[0]
-            year = _year_from_arxiv_id(clean_id)
-
-            author_matches = re.findall(
-                r"<name>(.*?)</name>",
-                entry,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            authors = [re.sub(r"\s+", " ", a).strip() for a in author_matches if a.strip()][:6]
-
-            return CitationResult(
-                raw=ref,
-                doi=ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
-                status=CitationStatus.verified,
-                title=found_title,
-                authors=authors,
-                year=year,
-                venue="arXiv",
-                publication_type=PublicationType.preprint.value,
-                is_preprint=True,
-                source_url=f"https://arxiv.org/abs/{clean_id}",
-                confidence_score=0.92,
-                diagnostic_reason=f"Verified via arXiv title/author bibliographic query (arXiv:{clean_id}).",
-                suggested_action=None,
-            )
+    if parsed.author_display:
+        query = f"{query} AND au:{parsed.author_display}"
+    fetch = await limiter("arXiv").get(
+        client,
+        ARXIV_SEARCH_URL,
+        params={"search_query": query, "start": 0, "max_results": 3},
+        timeout=REQUEST_TIMEOUT,
+    )
+    trace.note("arXiv", fetch)
+    if not fetch.ok or fetch.response is None:
         return None
-    except (httpx.TimeoutException, httpx.RequestError) as exc:
-        logger.warning("arXiv search failed: %s", exc)
-        return None
+
+    entries = re.findall(r"<entry>(.*?)</entry>", fetch.response.text, flags=re.DOTALL | re.IGNORECASE)
+    for entry in entries:
+        title_match = re.search(r"<title>(.*?)</title>", entry, flags=re.DOTALL | re.IGNORECASE)
+        id_match = re.search(
+            r"arxiv.org/abs/([0-9]+\.[0-9]+(?:v\d+)?|[a-z\-]+/[0-9]+)", entry, flags=re.IGNORECASE
+        )
+        if not title_match or not id_match:
+            continue
+        found_title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+        a = _normalize_title(title)
+        b = _normalize_title(found_title)
+        similar = _title_similarity(title, found_title) >= TITLE_SIMILARITY_MIN
+        prefix = bool(a and b and min(len(a), len(b)) >= 18 and (b.startswith(a) or a.startswith(b)))
+        if not similar and not prefix:
+            continue
+
+        clean_id = id_match.group(1).split("v")[0]
+        author_matches = re.findall(r"<name>(.*?)</name>", entry, flags=re.DOTALL | re.IGNORECASE)
+        authors = [re.sub(r"\s+", " ", name).strip() for name in author_matches if name.strip()][:6]
+        return CitationResult(
+            raw=ref,
+            doi=ARXIV_DOI_TEMPLATE.format(arxiv_id=clean_id),
+            status=CitationStatus.verified,
+            title=found_title,
+            authors=authors,
+            year=_year_from_arxiv_id(clean_id),
+            venue="arXiv",
+            publication_type=PublicationType.preprint.value,
+            is_preprint=True,
+            source_url=f"https://arxiv.org/abs/{clean_id}",
+            confidence_score=0.92,
+            diagnostic_reason=f"Verified via arXiv title/author bibliographic query (arXiv:{clean_id}).",
+            suggested_action=None,
+        )
+    return None
+
+
+def _result_from_openalex(ref: str, work: dict[str, Any], title: str, confidence: float) -> CitationResult:
+    doi_raw = work.get("doi")
+    doi_str = None
+    if isinstance(doi_raw, str) and doi_raw.strip():
+        doi_str = doi_raw.replace("https://doi.org/", "").strip() or None
+
+    primary_loc = work.get("primary_location") or {}
+    source_obj = (primary_loc.get("source") or {}) if isinstance(primary_loc, dict) else {}
+    venue_name = source_obj.get("display_name") if isinstance(source_obj, dict) else None
+    if not venue_name and isinstance(work.get("host_venue"), dict):
+        venue_name = work["host_venue"].get("display_name")
+
+    work_type_raw = str(work.get("type", "")).lower()
+    source_type_raw = str(source_obj.get("type", "")).lower() if isinstance(source_obj, dict) else ""
+    is_preprint = (
+        work_type_raw == "preprint"
+        or any(name in (venue_name or "").lower() for name in ("arxiv", "chemrxiv", "biorxiv", "medrxiv"))
+        or (doi_str is not None and _is_arxiv_doi(doi_str))
+    )
+    if is_preprint:
+        pub_type = PublicationType.preprint.value
+    elif "journal" in source_type_raw or "article" in work_type_raw:
+        pub_type = PublicationType.journal.value
+    elif "conference" in source_type_raw or "proceedings" in work_type_raw:
+        pub_type = PublicationType.conference.value
+    elif "book" in source_type_raw or "book" in work_type_raw:
+        pub_type = PublicationType.book.value
+    else:
+        pub_type = PublicationType.unknown.value
+
+    author_names = [
+        str(((a or {}).get("author") or {}).get("display_name")).strip()
+        for a in (work.get("authorships") or [])[:6]
+        if isinstance(a, dict) and ((a.get("author") or {}).get("display_name"))
+    ]
+    landing_url = (
+        doi_raw
+        or (primary_loc.get("landing_page_url") if isinstance(primary_loc, dict) else None)
+        or work.get("id")
+    )
+    return CitationResult(
+        raw=ref,
+        doi=doi_str,
+        status=CitationStatus.verified,
+        title=title,
+        authors=author_names,
+        year=work.get("publication_year"),
+        venue=venue_name,
+        publication_type=pub_type,
+        is_preprint=is_preprint,
+        source_url=landing_url,
+        confidence_score=confidence,
+        diagnostic_reason=f"Verified via OpenAlex catalog ({venue_name or 'academic index'}).",
+        suggested_action=None,
+    )
 
 
 async def _search_openalex(
     client: httpx.AsyncClient,
     ref: str,
+    parsed: ParsedReference,
+    trace: Trace,
 ) -> CitationResult | None:
-    """Search OpenAlex works API by title as secondary fallback for non-DOI entries."""
-    query = _guess_title(ref) or ref
-    first_author = _first_author_last(ref)
+    """OpenAlex works search. Uses the API key when configured; anonymous search is throttled hard."""
+    query = parsed.title or clean_reference(ref)
+    api_key = settings.OPENALEX_API_KEY.strip()
+    params: dict[str, Any] = {"search": query[:250], "per-page": 5}
+    if api_key:
+        params["api_key"] = api_key
+    fetch = await limiter("OpenAlex", anonymous=not api_key).get(
+        client,
+        OPENALEX_WORKS_URL,
+        params=params,
+        headers={"User-Agent": OPENALEX_USER_AGENT},
+        timeout=REQUEST_TIMEOUT,
+    )
+    trace.note("OpenAlex", fetch)
+    if not fetch.ok or fetch.response is None:
+        return None
     try:
-        response = await client.get(
-            OPENALEX_WORKS_URL,
-            params={"search": query[:250], "per-page": 3},
-            headers={"User-Agent": OPENALEX_USER_AGENT},
-            timeout=REQUEST_TIMEOUT,
+        results = fetch.response.json().get("results")
+    except ValueError:
+        return None
+    if not isinstance(results, list):
+        return None
+
+    for work in results:
+        if not isinstance(work, dict):
+            continue
+        work_title = str(work.get("title") or work.get("display_name") or "")
+        if not work_title:
+            continue
+        candidate = candidate_from_openalex(work)
+        report = compare(parsed, candidate)
+        # fingerprint, or the older rule: strong title match, or fair title match plus author
+        if report.verified:
+            return _result_from_openalex(ref, work, work_title, max(report.confidence, 0.9))
+        if report.title_similarity >= TITLE_SIMILARITY_MIN and report.author:
+            return _result_from_openalex(ref, work, work_title, 0.85)
+        _offer_closest(trace, "OpenAlex", report, work_title, candidate.years[0] if candidate.years else None)
+    return None
+
+
+def _unresolved(ref: str, doi: str | None, trace: Trace) -> CitationResult:
+    """The final answer when nothing verified the reference: 'could not check' or 'not found'."""
+    if trace.incomplete:
+        return _unverified(
+            ref,
+            doi=doi,
+            diagnostic=(
+                f"Could not complete the check: {trace.explain()}. "
+                "This does not mean the reference is wrong."
+            ),
+            action="Run the analysis again in a minute.",
+            incomplete=True,
         )
-        if response.status_code != 200:
-            logger.debug("OpenAlex search returned %s", response.status_code)
-            return None
-        data: Any = response.json()
-        results = data.get("results") if isinstance(data, dict) else None
-        if not isinstance(results, list):
-            return None
-
-        guessed = _guess_title(ref) or query
-        for work in results:
-            if not isinstance(work, dict):
-                continue
-            work_title = str(work.get("title") or work.get("display_name") or "")
-            if not work_title:
-                continue
-
-            similarity = _title_similarity(guessed, work_title)
-
-            authorships = work.get("authorships") or []
-            author_names: list[str] = []
-            author_match = False
-            if isinstance(authorships, list):
-                for auth in authorships[:6]:
-                    if isinstance(auth, dict):
-                        author_obj = auth.get("author") or {}
-                        name = author_obj.get("display_name")
-                        if name:
-                            author_names.append(str(name).strip())
-                            if first_author and first_author in str(name).lower():
-                                author_match = True
-
-            if similarity >= 0.90 or (similarity >= TITLE_SIMILARITY_MIN and author_match):
-                doi_raw = work.get("doi")
-                doi_str = None
-                if isinstance(doi_raw, str) and doi_raw.strip():
-                    doi_str = doi_raw.replace("https://doi.org/", "").strip() or None
-
-                primary_loc = work.get("primary_location") or {}
-                source_obj = primary_loc.get("source") or {} if isinstance(primary_loc, dict) else {}
-                venue_name = source_obj.get("display_name") if isinstance(source_obj, dict) else None
-                if not venue_name and isinstance(work.get("host_venue"), dict):
-                    venue_name = work["host_venue"].get("display_name")
-
-                work_type_raw = str(work.get("type", "")).lower()
-                source_type_raw = (
-                    str(source_obj.get("type", "")).lower()
-                    if isinstance(source_obj, dict)
-                    else ""
-                )
-                is_preprint = (
-                    work_type_raw == "preprint"
-                    or "arxiv" in (venue_name or "").lower()
-                    or (doi_str is not None and _is_arxiv_doi(doi_str))
-                )
-
-                if is_preprint:
-                    pub_type = PublicationType.preprint.value
-                elif "journal" in source_type_raw or "article" in work_type_raw:
-                    pub_type = PublicationType.journal.value
-                elif "conference" in source_type_raw or "proceedings" in work_type_raw:
-                    pub_type = PublicationType.conference.value
-                elif "book" in source_type_raw or "book" in work_type_raw:
-                    pub_type = PublicationType.book.value
-                else:
-                    pub_type = PublicationType.unknown.value
-
-                landing_url = (
-                    doi_raw
-                    or (primary_loc.get("landing_page_url") if isinstance(primary_loc, dict) else None)
-                    or work.get("id")
-                )
-
-                return CitationResult(
-                    raw=ref,
-                    doi=doi_str,
-                    status=CitationStatus.verified,
-                    title=work_title,
-                    authors=author_names,
-                    year=work.get("publication_year"),
-                    venue=venue_name,
-                    publication_type=pub_type,
-                    is_preprint=is_preprint,
-                    source_url=landing_url,
-                    confidence_score=0.95,
-                    diagnostic_reason=f"Verified via OpenAlex catalog ({venue_name or 'academic index'}).",
-                    suggested_action=None,
-                )
-        return None
-    except (httpx.TimeoutException, httpx.RequestError, ValueError) as exc:
-        logger.warning("OpenAlex search failed: %s", exc)
-        return None
+    consulted = ", ".join(dict.fromkeys(source for source, _, _ in trace.outcomes)) or "the reference catalogs"
+    return _unverified(
+        ref,
+        doi=doi,
+        diagnostic=trace.closest
+        or f"Checked {consulted}: no record matches the cited author, year, volume and first page.",
+        action="Add the DOI, or check the author names, year, volume and first page.",
+    )
 
 
 async def _check_one_raw(
     client: httpx.AsyncClient,
     ref: str,
     work_gate: asyncio.Semaphore,
-    crossref_gate: asyncio.Semaphore,
 ) -> CitationResult:
-    """Verify one reference: DOI, arXiv id, CrossRef search, arXiv search, OpenAlex search.
+    """Verify one reference: DOI, arXiv id, then CrossRef, Europe PMC, OpenAlex and arXiv searches.
 
-    Any lookup failure becomes unverified. Never raises to the caller.
+    Any lookup failure becomes unverified (never an exception), and a failure to ASK is kept
+    apart from an answer of "not found" through `check_incomplete`.
     """
+    trace = Trace()
+    doi: str | None = None
     try:
         async with work_gate:
+            parsed = parse_reference(ref)
             doi = _extract_doi(ref)
             if doi and _is_arxiv_doi(doi):
                 arxiv_id = _arxiv_id_from_doi(doi)
                 if arxiv_id:
                     return await _check_arxiv_id(client, arxiv_id, ref)
             if doi:
-                result = await _check_doi(client, crossref_gate, doi, ref)
+                result = await _check_doi(client, doi, ref)
                 if result.status == CitationStatus.verified:
                     if not result.title:
                         return await _with_arxiv_title(client, result, ref)
                     return result
                 if result.status == CitationStatus.ghost:
                     return result
+                if result.check_incomplete:
+                    trace.note("CrossRef", BUSY, "the DOI lookup did not complete")
 
             arxiv_id = _extract_arxiv_id(ref)
             if arxiv_id:
                 return await _check_arxiv_id(client, arxiv_id, ref)
 
-            found = await _search_crossref(client, crossref_gate, ref)
-            if found is not None:
-                return found
+            for search in (_search_crossref, _search_europepmc, _search_openalex):
+                found = await search(client, ref, parsed, trace)
+                if found is not None:
+                    return found
+            if _arxiv_is_relevant(ref, parsed):
+                found = await _search_arxiv(client, ref, parsed, trace)
+                if found is not None:
+                    return found
 
-            found = await _search_arxiv(client, ref)
-            if found is not None:
-                return found
-
-            found = await _search_openalex(client, ref)
-            if found is not None:
-                return found
-
-            return _unverified(ref, doi=doi)
+            return _unresolved(ref, doi, trace)
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.warning("Citation lookup failed; marking unverified", exc_info=True)
-        return _unverified(ref)
+        return _unverified(
+            ref,
+            doi=doi,
+            diagnostic="Could not complete the check: an internal error stopped it. This does not mean the reference is wrong.",
+            action="Run the analysis again in a minute.",
+            incomplete=True,
+        )
 
 
 async def _check_one(
     client: httpx.AsyncClient,
     ref: str,
     work_gate: asyncio.Semaphore,
-    crossref_gate: asyncio.Semaphore,
 ) -> CitationResult:
     """Verify one reference, then tidy text and cross-check title-only matches."""
-    result = await _check_one_raw(client, ref, work_gate, crossref_gate)
+    result = await _check_one_raw(client, ref, work_gate)
     if _extract_doi(ref) is None and _extract_arxiv_id(ref) is None:
         result = _apply_consistency(ref, result)
     return _tidy(result)
 
 
-async def verify_citations(references: list[str]) -> list[CitationResult]:
-    """Verify reference strings against CrossRef, arXiv, and OpenAlex.
+def _cache_key(ref: str) -> str:
+    return clean_reference(ref).casefold()
 
-    DOI lines still go to CrossRef first. Lines without a DOI try an
-    arXiv id, CrossRef search, arXiv search, then OpenAlex search. Caps at MAX_REFERENCES.
+
+def _remember(key: str, result: CitationResult) -> None:
+    """Cache final answers. A result that could not be checked is never cached."""
+    if result.check_incomplete:
+        return
+    ttl = VERIFIED_TTL_SECONDS if result.status == CitationStatus.verified else NOT_FOUND_TTL_SECONDS
+    _cache.set(key, result, ttl)
+
+
+def clear_citation_cache() -> None:
+    """Forget cached lookups (used by tests and by the live check script)."""
+    _cache.clear()
+
+
+async def verify_citations(
+    references: list[str],
+    client: httpx.AsyncClient | None = None,
+) -> list[CitationResult]:
+    """Verify reference strings against CrossRef, Europe PMC, OpenAlex and arXiv.
+
+    DOI lines go to CrossRef first. Other lines are searched with their whole text and accepted
+    only when author, year and volume/first page agree. Identical references are looked up once,
+    answers are cached, every service is rate-limited as a whole (not per reference), and a
+    reference that could not be checked is marked check_incomplete instead of "not found".
 
     Args:
         references: Raw bibliography strings from the parser.
+        client: Optional HTTP client (tests pass one with a mock transport).
 
     Returns:
         One CitationResult per input reference, in the same order.
@@ -1053,41 +1229,76 @@ async def verify_citations(references: list[str]) -> list[CitationResult]:
     refs = references[:MAX_REFERENCES]
     if not refs:
         return []
-    logger.info("Verifying %d citations against CrossRef, arXiv, and OpenAlex", len(refs))
-    work_gate = asyncio.Semaphore(LOOKUP_CONCURRENCY)
-    crossref_gate = asyncio.Semaphore(CROSSREF_CONCURRENCY)
+    logger.info("Verifying %d citations against CrossRef, Europe PMC, OpenAlex and arXiv", len(refs))
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": CROSSREF_USER_AGENT},
-        ) as client:
-            raw_results = await asyncio.gather(
-                *(_check_one(client, ref, work_gate, crossref_gate) for ref in refs),
-                return_exceptions=True,
-            )
-    except Exception:
-        logger.warning("Citation batch failed; marking all unverified", exc_info=True)
-        return [_unverified(ref) for ref in refs]
-
-    results: list[CitationResult] = []
-    for ref, item in zip(refs, raw_results, strict=True):
-        if isinstance(item, CitationResult):
-            results.append(item)
+    keys = [_cache_key(ref) for ref in refs]
+    results: list[CitationResult | None] = [None] * len(refs)
+    pending: dict[str, list[int]] = {}
+    for index, (ref, key) in enumerate(zip(refs, keys, strict=True)):
+        cached = _cache.get(key)
+        if cached is not None:
+            results[index] = cached.model_copy(update={"raw": ref})
         else:
-            logger.warning("Citation lookup failed; marking unverified: %s", item)
-            results.append(_unverified(ref))
+            pending.setdefault(key, []).append(index)
 
-    verified = sum(1 for item in results if item.status == CitationStatus.verified)
-    ghost = sum(1 for item in results if item.status == CitationStatus.ghost)
-    unverified = sum(1 for item in results if item.status == CitationStatus.unverified)
+    if pending:
+        work_gate = asyncio.Semaphore(LOOKUP_CONCURRENCY)
+        owns_client = client is None
+        http = client or httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT, headers={"User-Agent": CROSSREF_USER_AGENT}
+        )
+        try:
+            tasks = {
+                key: asyncio.create_task(_check_one(http, refs[indexes[0]], work_gate))
+                for key, indexes in pending.items()
+            }
+            done, unfinished = await asyncio.wait(tasks.values(), timeout=TOTAL_BUDGET_SECONDS)
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
+        finally:
+            if owns_client:
+                await http.aclose()
+
+        for key, indexes in pending.items():
+            task = tasks[key]
+            first_ref = refs[indexes[0]]
+            if task in unfinished:
+                logger.warning("Citation lookup ran out of time; marking not checked: %.60s", first_ref)
+                outcome = _unverified(
+                    first_ref,
+                    diagnostic="Could not complete the check: lookups took too long for this paper. This does not mean the reference is wrong.",
+                    action="Run the analysis again in a minute.",
+                    incomplete=True,
+                )
+            elif task.cancelled() or task.exception() is not None:
+                logger.warning("Citation lookup failed; marking not checked: %s", task.exception())
+                outcome = _unverified(
+                    first_ref,
+                    diagnostic="Could not complete the check: an internal error stopped it. This does not mean the reference is wrong.",
+                    action="Run the analysis again in a minute.",
+                    incomplete=True,
+                )
+            else:
+                outcome = task.result()
+            _remember(key, outcome)
+            for index in indexes:
+                results[index] = outcome.model_copy(update={"raw": refs[index]})
+
+    final = [item for item in results if item is not None]
+    verified = sum(1 for item in final if item.status == CitationStatus.verified)
+    ghost = sum(1 for item in final if item.status == CitationStatus.ghost)
+    unverified = sum(1 for item in final if item.status == CitationStatus.unverified)
+    incomplete = sum(1 for item in final if item.check_incomplete)
     logger.info(
-        "Citation check complete: %d verified, %d ghost, %d unverified",
+        "Citation check complete: %d verified, %d ghost, %d unverified (%d could not be checked)",
         verified,
         ghost,
         unverified,
+        incomplete,
     )
-    return results
+    return final
 
 
 def build_citation_summary(results: list[CitationResult]) -> CitationSummary:
@@ -1095,6 +1306,7 @@ def build_citation_summary(results: list[CitationResult]) -> CitationSummary:
     verified = sum(1 for item in results if item.status == CitationStatus.verified)
     ghost = sum(1 for item in results if item.status == CitationStatus.ghost)
     unverified = sum(1 for item in results if item.status == CitationStatus.unverified)
+    incomplete = sum(1 for item in results if item.check_incomplete)
     total = len(results)
 
     # A matched arXiv record is not a preprint citation if the author cited the
@@ -1136,16 +1348,24 @@ def build_citation_summary(results: list[CitationResult]) -> CitationSummary:
             f"REFERENCE AGE: median reference is {median_age} years older than the newest one cited. "
             "Consider whether recent work in your area is represented."
         )
-    if unverified > 0:
+    not_found = unverified - incomplete
+    if not_found > 0:
         warnings.append(
-            f"UNVERIFIED REFERENCES: {unverified} reference(s) could not be resolved against CrossRef, arXiv, or OpenAlex. "
-            "Ensure titles and volume metadata are accurate."
+            f"UNVERIFIED REFERENCES: {not_found} reference(s) were checked but no matching record was found in "
+            "CrossRef, Europe PMC, OpenAlex or arXiv. Ensure author names, year, volume and first page are accurate, "
+            "or add DOIs."
+        )
+    if incomplete > 0:
+        warnings.append(
+            f"NOT CHECKED: {incomplete} reference(s) could not be checked because a lookup service was busy or "
+            "unreachable. This does not mean they are wrong. Run the analysis again."
         )
 
     return CitationSummary(
         verified=verified,
         ghost=ghost,
         unverified=unverified,
+        check_incomplete=incomplete,
         total=total,
         preprint_count=preprint_count,
         peer_reviewed_count=peer_reviewed_count,

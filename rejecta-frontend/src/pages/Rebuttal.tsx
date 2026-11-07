@@ -9,6 +9,30 @@ import type {
   ReviewerBlock,
 } from '../types'
 
+// Turn a backend flag ("kind: detail" or "kind (sub): detail") into a readable line.
+const FLAG_LABELS: Record<string, { label: string; serious: boolean }> = {
+  author_decision_needed: { label: 'Your decision is needed before sending', serious: true },
+  unsupported_claim: { label: 'Removed a sentence with a claim your evidence does not support', serious: false },
+  claim_rewritten: { label: 'Rewrote a sentence without a claim your evidence does not support', serious: false },
+  inconsistent: { label: 'Contradiction in the letter', serious: true },
+  unverified_statement: { label: 'Not found in your evidence, check before sending', serious: true },
+  unverified_number: { label: 'Check this number', serious: true },
+  aggressive_language: { label: 'Aggressive wording', serious: true },
+  submissive_overconcession: { label: 'Over-concedes', serious: false },
+  repetitive_opening: { label: 'Same opening as another response', serious: false },
+  boilerplate_phrase: { label: 'Stock phrase', serious: false },
+  abrupt_opening: { label: 'Opens with disagreement', serious: false },
+  underdeveloped_response: { label: 'Very short response', serious: false },
+}
+
+function describeFlag(flag: string): { label: string; detail: string; serious: boolean } {
+  const match = flag.match(/^([a-z_]+)(?:\s*\([^)]*\))?\s*:\s*([\s\S]*)$/)
+  const kind = match ? match[1] : flag
+  const detail = match ? match[2] : ''
+  const known = FLAG_LABELS[kind]
+  return known ? { ...known, detail } : { label: kind.replace(/_/g, ' '), detail, serious: false }
+}
+
 export default function Rebuttal(): ReactElement {
   const location = useLocation()
   const navigate = useNavigate()
@@ -22,7 +46,7 @@ export default function Rebuttal(): ReactElement {
     state?.reviewer_text ?? (state?.rejection_reason ? `Editor / Reviewer Critique:\n${state.rejection_reason}` : '')
   )
   const [manuscriptContext, setManuscriptContext] = useState<string>('')
-  const [journal, setJournal] = useState<string>(state?.journal ?? 'Nature Machine Intelligence')
+  const [journal, setJournal] = useState<string>(state?.journal ?? '')
   const [authorTone, setAuthorTone] = useState<'collaborative' | 'diplomatic_firm' | 'formal_rigorous'>('collaborative')
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -90,7 +114,6 @@ export default function Rebuttal(): ReactElement {
       state: {
         text: commentText,
         journal: journal,
-        field: 'Computer Science & Machine Learning',
       },
     })
   }
@@ -158,7 +181,7 @@ export default function Rebuttal(): ReactElement {
             <textarea
               value={reviewerText}
               onChange={(e) => setReviewerText(e.target.value)}
-              placeholder="Paste raw reviewer feedback here (e.g. 'Reviewer 1: 1. The baseline comparison is missing... 2. Clarify sample size. Reviewer 2: 1. This claim is incorrect...')"
+              placeholder="Paste raw reviewer feedback here (e.g. 'Reviewer 1: 1. The novelty is not clearly established... 2. Characterization data are missing. Reviewer 2: 1. This claim is not supported...')"
               className="w-full min-h-[220px] p-3 text-xs font-mono text-stone-900 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-stone-900 leading-relaxed resize-y"
             />
           </div>
@@ -170,7 +193,7 @@ export default function Rebuttal(): ReactElement {
             <textarea
               value={manuscriptContext}
               onChange={(e) => setManuscriptContext(e.target.value)}
-              placeholder="Add key empirical numbers, metrics, or methods the author can cite in response (e.g. 'Model achieved 92.4% accuracy with 1.21 mJ energy per inference across 6 benchmark datasets. Code is open-sourced at GitHub.')"
+              placeholder="Add the results, data, or methods you can cite in response. The draft will only state facts found here, so leave nothing out that supports your case (e.g. 'Reaction yield 87% at 60 °C, n = 3; cohort of 412 patients, median follow-up 18 months; interviews with 24 participants...')"
               className="w-full min-h-[100px] p-3 text-xs text-stone-800 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-stone-900 leading-relaxed resize-y"
             />
           </div>
@@ -178,11 +201,12 @@ export default function Rebuttal(): ReactElement {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider text-stone-700 mb-1.5">
-                Target Journal
+                Target Journal (Optional)
               </label>
               <input
                 type="text"
                 value={journal}
+                placeholder="e.g. Chemical Communications"
                 onChange={(e) => setJournal(e.target.value)}
                 className="w-full p-2 text-xs text-stone-900 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-stone-900"
               />
@@ -355,6 +379,28 @@ export default function Rebuttal(): ReactElement {
                           </span>
                         </div>
                       </div>
+
+                      {/* Quality flags: what the checks removed or want the author to look at */}
+                      {comment.tone_audit.flags.length > 0 && (
+                        <ul className="space-y-1">
+                          {comment.tone_audit.flags.map((flag, idx) => {
+                            const { label, detail, serious } = describeFlag(flag)
+                            return (
+                              <li
+                                key={idx}
+                                className={`text-[11px] px-2 py-1 rounded border leading-snug ${
+                                  serious
+                                    ? 'bg-red-50 text-red-800 border-red-200'
+                                    : 'bg-amber-50 text-amber-800 border-amber-200'
+                                }`}
+                              >
+                                <span className="font-semibold">{label}</span>
+                                {detail ? `: ${detail}` : ''}
+                              </li>
+                            )
+                          })}
+                        </ul>
+                      )}
 
                       {/* Reviewer Quote */}
                       <div>

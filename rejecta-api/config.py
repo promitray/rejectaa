@@ -32,6 +32,8 @@ class Settings(BaseSettings):
 
     ANTHROPIC_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    # Free key from openalex.org. Without it OpenAlex throttles anonymous search heavily.
+    OPENALEX_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o"
     HF_MODEL_NAME: str = "mistralai/Mistral-7B-Instruct-v0.3"
     HF_API_TOKEN: str = ""

@@ -20,12 +20,17 @@ export interface CitationResult {
   source_url?: string | null
   diagnostic_reason?: string
   suggested_action?: string | null
+  /** True when a lookup service was busy, so this reference was not actually checked. */
+  check_incomplete?: boolean
 }
 
 export interface CitationSummary {
   verified: number
   ghost: number
+  /** All unverified references, including those that could not be checked. */
   unverified: number
+  /** Subset of `unverified` that could not be checked (service busy), not "not found". */
+  check_incomplete?: number
   total: number
   preprint_count?: number
   peer_reviewed_count?: number
@@ -35,18 +40,40 @@ export interface CitationSummary {
   items: CitationResult[]
 }
 
+export type ArticleType = 'research_article' | 'communication' | 'perspective' | 'review' | 'mini_review'
+
 export interface SectionScore {
   score: number
   issue?: string
   fix?: string
   strength?: string
   weakness?: string
+  /** "detected": a heading in the file. "derived": found from the content, starting at `anchor`. */
+  source?: 'detected' | 'derived' | null
+  anchor?: string | null
+}
+
+export interface CriterionScore {
+  score: number
+  reason: string
+  weight: number
+  /** True when the score was computed from the reference check, not by the model. */
+  computed: boolean
 }
 
 export interface RejectionReason {
   reason: string
   severity: 'desk_reject' | 'major' | 'minor'
   fix: string
+  /** The four parts of a reason. `reason` repeats the problem and `fix` the solution. */
+  problem?: string
+  /** Words from the manuscript this reason is about (checked against the file). */
+  evidence?: string
+  /** Section and nearby figure of the evidence, found by code. */
+  location?: string
+  impact_area?: 'novelty' | 'scientific_validity' | 'publication_potential' | ''
+  impact?: string
+  solution?: string
 }
 
 export interface AnalysisResult {
@@ -59,6 +86,14 @@ export interface AnalysisResult {
   novelty_assessment: string
   journal_fit: string
   provider_used: string
+  /** Article type the analysis used. */
+  paper_format?: ArticleType | 'unknown' | null
+  /** The fixed criteria the overall score is the weighted mean of. */
+  criteria?: Record<string, CriterionScore>
+  /** What the uploaded file did not let us judge (for example Supporting Information). */
+  not_assessed?: string[]
+  /** Claims in the report that were removed or flagged because the manuscript does not support them. */
+  grounding_notes?: string[]
 }
 
 export interface JournalMatch {
@@ -79,6 +114,9 @@ export interface AnalysisPaperResponse {
     references_found: number
     mode: string
     processing_ms: number
+    article_type?: ArticleType | 'unknown' | null
+    /** "detected" headings, or sections "derived" from the content when the file has no headings. */
+    structure_mode?: 'detected' | 'derived' | null
   }
 }
 

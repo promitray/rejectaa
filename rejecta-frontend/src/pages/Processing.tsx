@@ -12,7 +12,7 @@ interface Step {
 }
 
 const STEPS: Step[] = [
-  { at: 0, label: 'Parsing document', subtitle: 'Reading the PDF structure' },
+  { at: 0, label: 'Parsing document', subtitle: 'Reading the document structure' },
   { at: 3, label: 'Extracting sections and references', subtitle: 'Finding the abstract, sections, and bibliography' },
   { at: 6, label: 'Verifying citations against CrossRef', subtitle: 'Checking each reference for a real paper' },
   { at: 12, label: 'Looking up journal scope on OpenAlex', subtitle: 'Matching the journal and recent papers' },

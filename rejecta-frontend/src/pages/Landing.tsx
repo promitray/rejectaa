@@ -23,7 +23,7 @@ const STEPS = [
   {
     n: '01',
     title: 'Upload the manuscript',
-    body: 'PDF only. Name the target journal. No account. The file is parsed in memory and is not stored.',
+    body: 'PDF or Word (.docx). Name the target journal. No account. The file is parsed in memory and is not stored.',
   },
   {
     n: '02',
@@ -54,11 +54,11 @@ const FAQ = [
   },
   {
     q: 'Is the manuscript kept?',
-    a: 'No. The PDF is read for this request only. There is no file store and no report archive yet.',
+    a: 'No. The file is read for this request only. There is no file store and no report archive yet.',
   },
   {
     q: 'What files work?',
-    a: 'Academic PDFs up to 10 MB. Unusual layouts can miss a heading or a reference. That is a parser limit, not a silent failure.',
+    a: 'Academic PDFs or Word (.docx) files up to 10 MB. Unusual layouts can miss a heading or a reference. That is a parser limit, not a silent failure. Old .doc files need to be saved as .docx first.',
   },
   {
     q: 'Is this a peer review?',
@@ -125,7 +125,7 @@ export default function Landing(): ReactElement {
               </a>
             </div>
             <p className="mt-4 text-xs text-gray-500">
-              No account · PDF only · manuscript is not stored
+              No account · PDF or Word · manuscript is not stored
             </p>
           </div>
           <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-6 py-10">
@@ -149,7 +149,7 @@ export default function Landing(): ReactElement {
         <section id="how-it-works" className="mx-auto max-w-5xl px-4 py-16">
           <h2 className="font-serif text-3xl tracking-tight">How it works</h2>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-gray-600">
-            One request. The API parses the PDF, checks references, looks up the journal, then asks
+            One request. The API parses the file, checks references, looks up the journal, then asks
             the model for a critique. You stay on the page until the letter is ready.
           </p>
           <ol className="mt-10 grid gap-6 sm:grid-cols-3">
@@ -185,7 +185,7 @@ export default function Landing(): ReactElement {
               <p className="text-xs font-medium uppercase tracking-wider text-gray-500">For</p>
               <p className="mt-2 text-sm leading-6 text-gray-700">
                 Authors about to submit. Supervisors reading a draft. Anyone who has been desk
-                rejected for a reason that was sitting in the PDF the whole time.
+                rejected for a reason that was sitting in the manuscript the whole time.
               </p>
               <p className="mt-6 text-xs font-medium uppercase tracking-wider text-gray-500">Not for</p>
               <p className="mt-2 text-sm leading-6 text-gray-700">

@@ -67,6 +67,32 @@ const STATUS_BADGE: Record<CitationStatus, string> = {
 // Scores at or above this read as polish suggestions, not warnings.
 const SUGGESTION_SCORE = 75
 
+const ARTICLE_TYPE_LABEL: Record<string, string> = {
+  research_article: 'Full paper',
+  communication: 'Communication',
+  perspective: 'Perspective',
+  review: 'Review article',
+  mini_review: 'Mini-review',
+}
+
+const IMPACT_AREA_LABEL: Record<string, string> = {
+  novelty: 'Novelty',
+  scientific_validity: 'Scientific validity',
+  publication_potential: 'Publication potential',
+}
+
+const CRITERION_LABEL: Record<string, string> = {
+  novelty: 'Novelty',
+  rigor: 'Rigor',
+  evidence_support: 'Evidence',
+  clarity: 'Clarity',
+  journal_fit: 'Journal fit',
+  coverage_balance: 'Coverage & balance',
+  critical_synthesis: 'Critical synthesis',
+  outlook: 'Outlook',
+  citation_integrity: 'Citation integrity',
+}
+
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
 }
@@ -116,6 +142,11 @@ export default function Results(): ReactElement {
   const mood = MOOD_COPY[analysis.mood]
   const readerMode = result.meta.mode === 'b'
   const sectionEntries = Object.entries(analysis.sections)
+  const typeLabel = analysis.paper_format ? ARTICLE_TYPE_LABEL[analysis.paper_format] : undefined
+  const criteriaEntries = Object.entries(analysis.criteria ?? {})
+  const notAssessed = analysis.not_assessed ?? []
+  const groundingNotes = analysis.grounding_notes ?? []
+  const derivedSections = result.meta.structure_mode === 'derived'
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-8">
@@ -129,6 +160,7 @@ export default function Results(): ReactElement {
                 {mood.label}
               </span>
               <span className="text-sm text-gray-700">{mood.description}</span>
+              {typeLabel ? <Chip className="bg-stone-100 text-stone-700">{typeLabel}</Chip> : null}
             </div>
             <p className="mt-2 text-sm italic text-gray-500">{analysis.verdict}</p>
           </div>
@@ -195,11 +227,68 @@ export default function Results(): ReactElement {
       </div>
 
       <div className="mt-4">
+        {criteriaEntries.length > 0 || notAssessed.length > 0 || groundingNotes.length > 0 ? (
+          <Panel title="Score breakdown" badge="pro" icon="≡">
+            {criteriaEntries.length > 0 ? (
+              <div className="space-y-3">
+                {criteriaEntries.map(([key, item]) => (
+                  <div key={key}>
+                    <div className="flex items-center gap-3">
+                      <p className="w-36 shrink-0 text-sm font-medium">{CRITERION_LABEL[key] ?? key.replaceAll('_', ' ')}</p>
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-gray-100">
+                        <div
+                          className={`h-full ${barClass(item.score)}`}
+                          style={{ width: `${Math.min(100, Math.max(0, item.score))}%` }}
+                        />
+                      </div>
+                      <span className="w-8 text-right text-sm text-gray-700">{item.score}</span>
+                    </div>
+                    {item.reason ? (
+                      <p className="mt-1 text-xs text-gray-500 sm:pl-[9.75rem]">
+                        {item.computed ? 'Computed from the reference check. ' : ''}
+                        {item.reason}
+                      </p>
+                    ) : null}
+                  </div>
+                ))}
+                <p className="text-xs text-gray-400">
+                  The overall score is the weighted mean of these criteria, so it stays comparable between papers.
+                </p>
+              </div>
+            ) : null}
+            {notAssessed.length > 0 ? (
+              <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-amber-800">Not assessed</p>
+                <ul className="mt-1 space-y-1">
+                  {notAssessed.map((note) => (
+                    <li key={note} className="text-xs text-amber-900">{note}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {groundingNotes.length > 0 ? (
+              <div className="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Checked against your manuscript</p>
+                <ul className="mt-1 space-y-1">
+                  {groundingNotes.map((note) => (
+                    <li key={note} className="text-xs text-gray-600">{note}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </Panel>
+        ) : null}
+
         <Panel title="Citation autopsy" badge="free" icon="⌕">
           <div className="flex flex-wrap gap-2">
             <Chip className="bg-green-50 text-green-700">{result.citations.verified} verified</Chip>
             <Chip className="bg-red-50 text-red-700">{result.citations.ghost} ghost</Chip>
-            <Chip className="bg-gray-100 text-gray-600">{result.citations.unverified} unverified</Chip>
+            <Chip className="bg-gray-100 text-gray-600">
+              {result.citations.unverified - (result.citations.check_incomplete ?? 0)} unverified
+            </Chip>
+            {result.citations.check_incomplete ? (
+              <Chip className="bg-amber-50 text-amber-700">{result.citations.check_incomplete} not checked</Chip>
+            ) : null}
           </div>
           {result.citations.editorial_warnings?.length ? (
             <ul className="mt-3 space-y-1">
@@ -223,6 +312,11 @@ export default function Results(): ReactElement {
             <p className="text-sm text-gray-500">Section data not available</p>
           ) : (
             <div className="space-y-4">
+              {derivedSections ? (
+                <p className="text-xs text-gray-500">
+                  This file has no standard section headings, so the sections below were identified from the content.
+                </p>
+              ) : null}
               {sectionEntries.map(([name, section]) => (
                 <SectionRow
                   key={name}
@@ -238,7 +332,11 @@ export default function Results(): ReactElement {
 
         <Panel title="Rejection reasons" badge="pro" icon="!">
           {analysis.rejection_reasons.length === 0 ? (
-            <p className="text-sm text-gray-500">No major rejection risks identified</p>
+            <p className="text-sm text-gray-500">
+              {groundingNotes.some((note) => note.includes('rejection reason'))
+                ? 'The reasons the model proposed could not be tied to any text in your manuscript, so none are shown.'
+                : 'No major rejection risks identified'}
+            </p>
           ) : (
             <div className="space-y-2">
               {analysis.rejection_reasons.map((item, index) => (
@@ -290,7 +388,8 @@ export default function Results(): ReactElement {
 
       <p className="mt-4 text-xs text-gray-500">
         {result.meta.word_count.toLocaleString()} words · {result.meta.references_found} references ·{' '}
-        {result.meta.sections_found.length} sections detected · {(result.meta.processing_ms / 1000).toFixed(1)}s ·{' '}
+        {result.meta.sections_found.length} sections {derivedSections ? 'identified' : 'detected'} ·{' '}
+        {(result.meta.processing_ms / 1000).toFixed(1)}s ·{' '}
         {analysis.provider_used}
       </p>
 
@@ -442,8 +541,12 @@ function CitationTable({
       <ul className="divide-y divide-gray-100">
         {visible.map((item, index) => (
           <li key={`${item.status}-${index}`} className="flex items-start gap-3 py-2">
-            <span className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase ${STATUS_BADGE[item.status]}`}>
-              {item.status}
+            <span
+              className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase ${
+                item.check_incomplete ? 'bg-amber-50 text-amber-700' : STATUS_BADGE[item.status]
+              }`}
+            >
+              {item.check_incomplete ? 'not checked' : item.status}
             </span>
             <span className="text-sm text-gray-700">
               {item.title ? (
@@ -523,7 +626,7 @@ function SectionRow({
   return (
     <div>
       <div className="flex items-center gap-3">
-        <p className="w-28 shrink-0 text-sm font-medium capitalize">{sectionLabel(name)}</p>
+        <p className="w-28 shrink-0 break-words text-sm font-medium capitalize">{sectionLabel(name)}</p>
         <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-gray-100">
           <div className={`h-full ${barClass(section.score)}`} style={{ width: `${width}%` }} />
         </div>
@@ -619,7 +722,7 @@ function ReasonCard({
             onClick={() =>
               navigate('/rebuttal', {
                 state: {
-                  rejection_reason: `${item.reason}\nSuggested remediation: ${item.fix}`,
+                  rejection_reason: `${item.problem || item.reason}${item.impact ? `\nImpact: ${item.impact}` : ''}\nSuggested remediation: ${item.solution || item.fix}`,
                   journal: targetJournal,
                 },
               })
@@ -637,8 +740,28 @@ function ReasonCard({
           </button>
         </div>
       </div>
-      <p className="mt-1.5 text-sm text-gray-800 font-medium">{item.reason}</p>
-      <p className="mt-1 text-sm text-sky-700">→ {item.fix}</p>
+      <p className="mt-1.5 text-[10px] font-bold uppercase tracking-wide text-gray-500">Problem</p>
+      <p className="text-sm font-medium text-gray-800">{item.problem || item.reason}</p>
+      {item.evidence ? (
+        <>
+          <p className="mt-2 text-[10px] font-bold uppercase tracking-wide text-gray-500">
+            Evidence{item.location ? ` · ${item.location}` : ''}
+          </p>
+          <blockquote className="border-l-2 border-gray-300 pl-2.5 text-xs italic text-gray-600">
+            “{item.evidence}”
+          </blockquote>
+        </>
+      ) : null}
+      {item.impact ? (
+        <>
+          <p className="mt-2 text-[10px] font-bold uppercase tracking-wide text-gray-500">
+            Impact{item.impact_area ? ` · ${IMPACT_AREA_LABEL[item.impact_area] ?? item.impact_area}` : ''}
+          </p>
+          <p className="text-sm text-gray-700">{item.impact}</p>
+        </>
+      ) : null}
+      <p className="mt-2 text-[10px] font-bold uppercase tracking-wide text-gray-500">Solution</p>
+      <p className="text-sm text-sky-700">→ {item.solution || item.fix}</p>
     </article>
   )
 }

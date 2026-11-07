@@ -18,7 +18,17 @@ from services.llm.base import AbstractAnalysisProvider
 class MockRebuttalLLM(AbstractAnalysisProvider):
     """Deterministic mock provider for Rebuttal Writer pipeline tests."""
 
+    # Set to a JSON string to answer the batch-classification call; None leaves it unparseable
+    # so the engine falls back to the regex classifier (the original behaviour under test).
+    batch_response: str | None = None
+    fail_batch: bool = False
+
     async def generate(self, system_prompt: str, user_prompt: str, temperature: float = 0.15) -> str:
+        if "You classify peer-review comments" in system_prompt:
+            if self.fail_batch:
+                raise RuntimeError("classifier provider down")
+            if self.batch_response is not None:
+                return self.batch_response
         # Check system prompt posture to return relevant response
         if "AGREE AND AMEND" in system_prompt:
             return json.dumps({

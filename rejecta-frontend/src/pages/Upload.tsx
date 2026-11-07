@@ -1,10 +1,16 @@
 import type { FormEvent, ReactElement } from 'react'
-import { useRef, useState } from 'react'
+import { lazy, Suspense, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { submitPaper } from '../api'
+import { normaliseOrcid } from '../authors/ids'
+import { useAuthorProfiles } from '../authors/useAuthorProfiles'
+import AuthorsEditor from '../components/AuthorsEditor'
 import Frowns from '../components/Frowns'
 import { useRejectaStore } from '../store'
-import type { Mode } from '../types'
+import type { ArticleType, Mode } from '../types'
+
+// Charts pull in Recharts, so they load only once an author has been entered.
+const AuthorInsights = lazy(() => import('../components/AuthorInsights'))
 
 const MAX_FILE_BYTES = 10_485_760
 const JOURNAL_SUGGESTIONS = [
@@ -14,8 +20,17 @@ const JOURNAL_SUGGESTIONS = [
   'The Lancet',
 ]
 
-function isPdf(file: File): boolean {
-  return file.name.toLowerCase().endsWith('.pdf')
+const ACCEPTED_EXTENSIONS = ['.pdf', '.docx']
+const FORMAT_ERROR = 'Upload a PDF or a Word (.docx) file'
+const LEGACY_DOC_ERROR = 'Old .doc files are not supported. In Word use Save As .docx and upload that'
+
+function isAccepted(file: File): boolean {
+  const name = file.name.toLowerCase()
+  return ACCEPTED_EXTENSIONS.some((extension) => name.endsWith(extension))
+}
+
+function formatError(file: File): string {
+  return file.name.toLowerCase().endsWith('.doc') ? LEGACY_DOC_ERROR : FORMAT_ERROR
 }
 
 export default function Upload(): ReactElement {
@@ -27,12 +42,30 @@ export default function Upload(): ReactElement {
   const setError = useRejectaStore((state) => state.setError)
   const setResult = useRejectaStore((state) => state.setResult)
   const reset = useRejectaStore((state) => state.reset)
+  const authors = useRejectaStore((state) => state.authors)
+  const setAuthors = useRejectaStore((state) => state.setAuthors)
+
+  const { states: authorStates, busy: authorsBusy, lookup: lookupAuthors } = useAuthorProfiles()
+  const [authorsError, setAuthorsError] = useState<string | null>(null)
+  // The record appears after "Analyse authors" has been pressed at least once.
+  const showInsights = Object.keys(authorStates).length > 0
+
+  function analyseAuthors(): void {
+    const valid = authors.flatMap((author) => normaliseOrcid(author.orcid) ?? [])
+    if (valid.length === 0) {
+      setAuthorsError('Enter at least one valid ORCID to analyse.')
+      return
+    }
+    setAuthorsError(null)
+    lookupAuthors(valid)
+  }
 
   const inputRef = useRef<HTMLInputElement>(null)
   const submitting = useRef(false)
 
   const [file, setFile] = useState<File | null>(null)
   const [journal, setJournal] = useState('')
+  const [articleType, setArticleType] = useState<ArticleType | 'auto'>('auto')
   const [email, setEmail] = useState('')
   const [dragging, setDragging] = useState(false)
   const [fileError, setFileError] = useState<string | null>(null)
@@ -41,9 +74,9 @@ export default function Upload(): ReactElement {
   const [sampleLoading, setSampleLoading] = useState(false)
 
   function chooseFile(next: File): void {
-    if (!isPdf(next)) {
+    if (!isAccepted(next)) {
       setFile(null)
-      setFileError('PDF files only')
+      setFileError(formatError(next))
       return
     }
     if (next.size > MAX_FILE_BYTES) {
@@ -81,9 +114,9 @@ export default function Upload(): ReactElement {
     }
 
     const nextFileError = !file
-      ? 'Upload a PDF to continue'
-      : !isPdf(file)
-        ? 'PDF files only'
+      ? 'Upload a PDF or Word file to continue'
+      : !isAccepted(file)
+        ? formatError(file)
         : file.size > MAX_FILE_BYTES
           ? 'File too large — maximum 10MB'
           : null
@@ -110,7 +143,7 @@ export default function Upload(): ReactElement {
     setError(null)
     setLoading(true)
 
-    const request = submitPaper(selected, journal.trim(), selectedMode, email.trim())
+    const request = submitPaper(selected, journal.trim(), selectedMode, email.trim(), articleType)
     navigate('/processing')
 
     request
@@ -149,9 +182,10 @@ export default function Upload(): ReactElement {
         </p>
       </div>
 
+      <div className="mx-auto mt-8 grid max-w-md gap-6 lg:max-w-5xl lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:items-start">
       <form
         onSubmit={handleSubmit}
-        className="mx-auto mt-8 max-w-md rounded-xl border border-gray-200 bg-white p-6 shadow-sm"
+        className="w-full rounded-xl border border-gray-200 bg-white p-6 shadow-sm"
       >
         <div className="grid grid-cols-2 gap-2">
           <button
@@ -202,7 +236,7 @@ export default function Upload(): ReactElement {
           <input
             ref={inputRef}
             type="file"
-            accept=".pdf"
+            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             className="hidden"
             onChange={(event) => {
               const chosen = event.target.files?.[0]
@@ -221,8 +255,8 @@ export default function Upload(): ReactElement {
           ) : (
             <div className="flex flex-col items-center gap-2">
               <UploadIcon />
-              <p className="text-sm text-gray-800">Drop your PDF here or click to upload</p>
-              <p className="text-xs text-gray-500">PDF only · max 10 MB</p>
+              <p className="text-sm text-gray-800">Drop your paper here or click to upload</p>
+              <p className="text-xs text-gray-500">PDF or Word (.docx) · max 10 MB</p>
             </div>
           )}
         </div>
@@ -272,6 +306,26 @@ export default function Upload(): ReactElement {
         </div>
         {journalError ? <p className="mt-2 text-sm text-red-600">{journalError}</p> : null}
 
+        <label className="mt-5 block text-sm font-medium text-gray-800" htmlFor="article-type">
+          Article type <span className="font-normal text-gray-500">(optional)</span>
+        </label>
+        <select
+          id="article-type"
+          value={articleType}
+          onChange={(event) => setArticleType(event.target.value as ArticleType | 'auto')}
+          className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-gray-900"
+        >
+          <option value="auto">Detect automatically</option>
+          <option value="research_article">Full paper / research article</option>
+          <option value="communication">Communication / letter</option>
+          <option value="perspective">Perspective</option>
+          <option value="review">Review article</option>
+          <option value="mini_review">Mini-review</option>
+        </select>
+        <p className="mt-1 text-xs text-gray-500">
+          The type decides which sections are expected, so a short communication is not marked down for sections it does not have.
+        </p>
+
         <label className="mt-5 block text-sm font-medium text-gray-800" htmlFor="email">
           Email <span className="font-normal text-gray-500">(optional)</span>
         </label>
@@ -300,6 +354,30 @@ export default function Upload(): ReactElement {
           Analyse my paper →
         </button>
       </form>
+
+      <div className="min-w-0 space-y-6">
+        <AuthorsEditor
+          authors={authors}
+          onChange={setAuthors}
+          states={authorStates}
+          onRetry={(orcid) => lookupAuthors([orcid])}
+          onAnalyse={analyseAuthors}
+          busy={authorsBusy}
+          error={authorsError}
+        />
+        {showInsights ? (
+          <Suspense
+            fallback={
+              <div className="rounded-xl border border-gray-200 bg-white p-5 text-sm text-gray-500 shadow-sm">
+                Loading author record…
+              </div>
+            }
+          >
+            <AuthorInsights authors={authors} states={authorStates} />
+          </Suspense>
+        ) : null}
+      </div>
+      </div>
 
       <p className="mt-4 text-center text-xs text-gray-500">
         Research preview · full report included · uses one paper analysis from your plan

@@ -10,7 +10,7 @@ from models import AnalysisResult
 from services.llm.base import AbstractAnalysisProvider, MODE_A
 
 OPENAI_DEFAULT_MODEL = "gpt-4o"
-MAX_TOKENS = 2500
+MAX_TOKENS = 4000
 JSON_OBJECT_TYPE = "json_object"
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"

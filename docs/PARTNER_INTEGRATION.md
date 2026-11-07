@@ -46,7 +46,7 @@ Send the token as `Authorization: Bearer <token>`.
 
 | Tool | Method and path | Scope |
 |---|---|---|
-| Full paper analysis | `POST /analyse-paper` (multipart: `file` (PDF ≤ 10 MB), `journal`, `mode` = `a`\|`b`) | `analyse_paper` |
+| Full paper analysis | `POST /analyse-paper` (multipart: `file` (PDF or Word .docx, ≤ 10 MB), `journal`, `mode` = `a`\|`b`) | `analyse_paper` |
 | Analysis from extracted text | `POST /analyse` (JSON) | `analyse_paper` |
 | Voice Calibrator | `POST /voice-calibrate` (JSON) | `voice_calibrate` |
 | Abstract Forge | `POST /abstract-forge/generate` (JSON) | `abstract_forge` |
