@@ -2,14 +2,32 @@ import { useState, useEffect } from 'react'
 import type { ReactElement } from 'react'
 import { useLocation } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
-import { calibrateVoice } from '../api'
+import { applyProposal, calibrateDocumentSection, calibrateVoice, downloadDocument, rejectProposal, undoDocument } from '../api'
 import { ToolWait } from '../components/Loaders'
-import type { VoiceCalibrateResponse } from '../types'
+import { useRejectaStore } from '../store'
+import type { ApplyResult, DocumentProposal, VoiceCalibrateResponse } from '../types'
 import FormattedMathText from '../components/FormattedMathText'
+
+// The API accepts a focus note of up to 700 characters.
+const MAX_FOCUS_CHARS = 700
 
 export default function Calibrate(): ReactElement {
   const location = useLocation()
-  const state = location.state as { text?: string; journal?: string; field?: string } | null
+  const state = location.state as {
+    text?: string
+    journal?: string
+    field?: string
+    /** Set when the text is a section of the analysed paper: the review's issue and fix for it. */
+    focus?: { section: string; issue: string; fix: string }
+    /** What the server left out of or cut from the section text. */
+    notes?: string[]
+    /** Set when the paper has a working copy: the server calibrates its own text and can write it back. */
+    document?: { documentId: string; sectionId: string }
+  } | null
+  const paperCopy = state?.document
+  const focusNote = state?.focus
+    ? `${state.focus.section}. Issue: ${state.focus.issue} Fix: ${state.focus.fix}`.slice(0, MAX_FOCUS_CHARS)
+    : undefined
 
   const [text, setText] = useState<string>(state?.text ?? '')
   const [journal, setJournal] = useState<string>(state?.journal ?? 'Nature Machine Intelligence')
@@ -19,6 +37,13 @@ export default function Calibrate(): ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<VoiceCalibrateResponse | null>(null)
   const [copied, setCopied] = useState<boolean>(false)
+  // working copy of the paper
+  const setDocument = useRejectaStore((s) => s.setDocument)
+  const [proposal, setProposal] = useState<DocumentProposal | null>(null)
+  const [applied, setApplied] = useState<ApplyResult | null>(null)
+  const [fromParagraph, setFromParagraph] = useState<number>(0)
+  const [paperBusy, setPaperBusy] = useState<boolean>(false)
+  const [paperMessage, setPaperMessage] = useState<string | null>(null)
 
   useEffect(() => {
     if (state?.text) {
@@ -33,6 +58,31 @@ export default function Calibrate(): ReactElement {
   }, [state])
 
   const handleCalibrate = async (): Promise<void> => {
+    if (paperCopy) {
+      // The server reads the section from its copy of the paper; nothing is sent from this page but the settings.
+      setError(null)
+      setLoading(true)
+      setProposal(null)
+      setApplied(null)
+      setPaperMessage(null)
+      try {
+        const res = await calibrateDocumentSection(paperCopy.documentId, paperCopy.sectionId, {
+          journal,
+          field,
+          intensity,
+          ...(focusNote ? { focus: focusNote } : {}),
+          from_paragraph: fromParagraph,
+        })
+        setProposal(res)
+        setResult(res.calibration)
+        setText(res.original_text)
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : 'Calibration failed')
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
     if (!text.trim() || text.trim().length < 20) {
       setError('Please provide an excerpt of at least 20 characters.')
       return
@@ -45,6 +95,7 @@ export default function Calibrate(): ReactElement {
         journal,
         field,
         intensity,
+        ...(focusNote ? { focus: focusNote } : {}),
       })
       setResult(res)
     } catch (err: unknown) {
@@ -52,6 +103,55 @@ export default function Calibrate(): ReactElement {
     } finally {
       setLoading(false)
     }
+  }
+
+  const paperAction = async (action: () => Promise<void>): Promise<void> => {
+    setPaperBusy(true)
+    setPaperMessage(null)
+    try {
+      await action()
+    } catch (err: unknown) {
+      setPaperMessage(err instanceof Error ? err.message : 'Something went wrong')
+    } finally {
+      setPaperBusy(false)
+    }
+  }
+
+  const handleApply = (): Promise<void> =>
+    paperAction(async () => {
+      if (!paperCopy || !proposal?.proposal_id) return
+      const res = await applyProposal(paperCopy.documentId, proposal.proposal_id)
+      setApplied(res)
+      setDocument(res.document)
+    })
+
+  const handleDiscard = (): Promise<void> =>
+    paperAction(async () => {
+      if (!paperCopy || !proposal?.proposal_id) return
+      await rejectProposal(paperCopy.documentId, proposal.proposal_id)
+      setProposal(null)
+      setResult(null)
+      setPaperMessage('Discarded. Your paper was not changed.')
+    })
+
+  const handleUndo = (): Promise<void> =>
+    paperAction(async () => {
+      if (!paperCopy) return
+      const info = await undoDocument(paperCopy.documentId)
+      setDocument(info)
+      setApplied(null)
+      setProposal(null)
+      setResult(null)
+      setPaperMessage(`Undone. Your paper is back at version ${info.version}.`)
+    })
+
+  const handleNextPart = (): void => {
+    const next = applied?.next_from ?? proposal?.next_from
+    if (next == null) return
+    setFromParagraph(next)
+    setProposal(null)
+    setApplied(null)
+    setResult(null)
   }
 
   const handleCopy = async (): Promise<void> => {
@@ -138,6 +238,21 @@ export default function Calibrate(): ReactElement {
         </div>
       )}
 
+      {/* Section from the report: what the review found and what the server did to the text */}
+      {state?.focus ? (
+        <div className="mb-6 rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-700">
+          <p className="font-semibold uppercase tracking-wider text-stone-900">Calibrating: {state.focus.section}</p>
+          {state.focus.issue ? <p className="mt-1">Issue: {state.focus.issue}</p> : null}
+          {state.focus.fix ? <p className="mt-1">Fix: {state.focus.fix}</p> : null}
+          <p className="mt-1 text-stone-500">
+            Content the section needs but does not have is marked [AUTHOR TO ADD: ...] instead of being invented.
+          </p>
+          {(state.notes ?? []).map((note) => (
+            <p key={note} className="mt-1 text-amber-800">{note}</p>
+          ))}
+        </div>
+      ) : null}
+
       {/* Split Workbench */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Left: Input Text */}
@@ -150,8 +265,15 @@ export default function Calibrate(): ReactElement {
               {text.trim() ? `${text.trim().split(/\s+/).length} words` : '0 words'}
             </span>
           </div>
+          {paperCopy ? (
+            <p className="mb-2 text-xs text-stone-500">
+              Text from your paper. The server reads it from its copy, so changes here are not used.
+              {fromParagraph > 0 ? ` Starting at paragraph ${fromParagraph + 1} of this section.` : ''}
+            </p>
+          ) : null}
           <textarea
             value={text}
+            readOnly={!!paperCopy}
             onChange={(e) => setText(e.target.value)}
             placeholder="Paste your abstract, introduction, or discussion draft here... E.g. We delve into modern neural networks. Our model achieved an AUROC = 0.942 with p < 0.001 across n = 1,420 patients (Vaswani et al., 2017)."
             className="w-full h-80 p-4 font-sans text-sm text-stone-800 border border-stone-300 rounded-lg bg-white resize-y focus:outline-none focus:ring-2 focus:ring-stone-900 leading-relaxed shadow-sm placeholder:text-stone-400 placeholder:font-mono placeholder:text-xs"
@@ -262,6 +384,89 @@ export default function Calibrate(): ReactElement {
                 : 'Copy Calibrated Text'}
             </button>
           </div>
+
+          {paperCopy && (proposal || applied || paperMessage) ? (
+            <div className="mt-4 rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-700">
+              {proposal?.warnings.map((warning) => (
+                <p key={warning} className="mb-1 text-amber-800">⚠ {warning}</p>
+              ))}
+              {proposal?.notes.map((note) => (
+                <p key={note} className="mb-1 text-stone-500">{note}</p>
+              ))}
+              {applied ? (
+                <>
+                  <p className="font-semibold text-emerald-800">
+                    Updated in your paper: version {applied.document.version} ({applied.applied_paragraphs} paragraph(s)).
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={paperBusy}
+                      onClick={() =>
+                        paperAction(() =>
+                          downloadDocument(
+                            applied.document.id,
+                            `${applied.document.filename.replace(/\.[^.]+$/, '') || 'manuscript'}-rejecta-v${applied.document.version}.docx`,
+                          ),
+                        )
+                      }
+                      className="rounded bg-stone-900 px-3 py-1.5 font-medium text-white disabled:opacity-50"
+                    >
+                      Download paper (.docx)
+                    </button>
+                    <button
+                      type="button"
+                      disabled={paperBusy}
+                      onClick={handleUndo}
+                      className="rounded border border-stone-300 px-3 py-1.5 font-medium text-stone-800 disabled:opacity-50"
+                    >
+                      Undo
+                    </button>
+                    {applied.next_from != null ? (
+                      <button
+                        type="button"
+                        onClick={handleNextPart}
+                        className="rounded border border-stone-300 px-3 py-1.5 font-medium text-stone-800"
+                      >
+                        Calibrate next part
+                      </button>
+                    ) : null}
+                  </div>
+                </>
+              ) : proposal?.proposal_id ? (
+                <div className="mt-1 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={paperBusy}
+                    onClick={handleApply}
+                    className="rounded bg-emerald-700 px-3 py-1.5 font-semibold text-white disabled:opacity-50"
+                  >
+                    Update in paper
+                  </button>
+                  <button
+                    type="button"
+                    disabled={paperBusy}
+                    onClick={handleDiscard}
+                    className="rounded border border-stone-300 px-3 py-1.5 font-medium text-stone-800 disabled:opacity-50"
+                  >
+                    Discard
+                  </button>
+                  {proposal.next_from != null ? (
+                    <button
+                      type="button"
+                      onClick={handleNextPart}
+                      className="rounded border border-stone-300 px-3 py-1.5 font-medium text-stone-800"
+                    >
+                      Skip to next part
+                    </button>
+                  ) : null}
+                </div>
+              ) : proposal ? (
+                <p className="text-rose-800">This result cannot be applied: it failed verification, so your paper stays as it is.</p>
+              ) : null}
+              {paperMessage ? <p className="mt-2 text-stone-700">{paperMessage}</p> : null}
+            </div>
+          ) : null}
         </div>
       </div>
 

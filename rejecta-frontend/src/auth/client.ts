@@ -252,6 +252,7 @@ export async function authPostWithToken<T>(path: string, body?: unknown): Promis
 
 export interface FetchOptions {
   auth?: boolean // send the access token (default true)
+  blob?: boolean // return the body as a Blob (file downloads) instead of parsed JSON
 }
 
 /** Fetch an API path with the access token, refreshing it when needed. */
@@ -287,6 +288,9 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}, options:
   }
   if (!res.ok) {
     throw await toError(res)
+  }
+  if (options.blob) {
+    return (await res.blob()) as T
   }
   return (res.status === 204 ? undefined : await res.json()) as T
 }

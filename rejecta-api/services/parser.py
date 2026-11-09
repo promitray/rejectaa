@@ -356,11 +356,73 @@ def _reflow_lines(lines: list[str]) -> list[str]:
     return out
 
 
-def _body_text(lines: list[str]) -> str:
-    """The body as one block of text, without bare page numbers."""
+PARAGRAPH_BREAK = chr(10) * 2
+_SENTENCE_END = re.compile(r"[.!?][)\]\"']?\d{0,3}$")
+_PARAGRAPH_SHORT_RATIO = 0.7  # the last line of a paragraph is clearly shorter than a typical full line
+BACK_MATTER_TITLES = frozenset({
+    "acknowledgements", "acknowledgments", "acknowledgement", "appendix", "supplementary material",
+    "supporting information", "supplementary information", "supplementary data",
+    "electronic supplementary information", "electronic supplementary information (esi)",
+    "conflicts of interest", "conflict of interest", "competing interests", "declaration of competing interest",
+    "author contributions", "data availability", "data availability statement", "funding",
+    "credit authorship contribution statement", "author information", "associated content",
+})
+
+
+def _paragraph_text(lines: list[str], per_line: bool = False) -> str:
+    """Lines as readable text: paragraphs separated by a blank line, words by single spaces.
+
+    In a Word file every line already is a paragraph. In a PDF a paragraph ends where a line finishes a
+    sentence and is clearly shorter than a full line (justified text), or next to a heading.
+    """
     kept = [line.strip() for line in lines if line.strip() and not _NUMBER_ONLY.match(line.strip())]
-    text = re.sub(r"\s+", " ", " ".join(kept)).strip()
-    return re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "-", text)  # "neuro- nal" broken at a line end
+    if not kept:
+        return ""
+    if per_line:
+        paragraphs = kept
+    else:
+        lengths = sorted(len(line) for line in kept if len(line) >= 30)
+        typical = lengths[len(lengths) // 2] if lengths else 0
+        paragraphs = []
+        current = [kept[0]]
+        for previous, line in zip(kept, kept[1:]):
+            next_to_heading = _heading_title(line) is not None or _heading_title(previous) is not None
+            ends_short = bool(
+                typical and _SENTENCE_END.search(previous) and len(previous) < _PARAGRAPH_SHORT_RATIO * typical
+            )
+            if next_to_heading or (ends_short and line[:1].isupper()):
+                paragraphs.append(" ".join(current))
+                current = [line]
+            else:
+                current.append(line)
+        paragraphs.append(" ".join(current))
+    cleaned = [re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "-", re.sub(r"\s+", " ", para)).strip() for para in paragraphs]
+    return PARAGRAPH_BREAK.join(para for para in cleaned if para)
+
+
+def _cut_back_matter(lines: list[str]) -> list[str]:
+    """Drop acknowledgements, conflicts of interest, supporting information... at the end of the body.
+
+    Only a heading in the second half counts, so a stray early line is never mistaken for the end.
+    """
+    for index, line in enumerate(lines):
+        if index >= len(lines) // 2 and _heading_title(line) in BACK_MATTER_TITLES:
+            return lines[:index]
+    return lines
+
+
+# Journal furniture on the first page: whole lines that start like this are not part of the paper's text.
+_FURNITURE_LINE = re.compile(
+    r"^\s*(?:Cite this:|Received\s+\d|Accepted\s+\d|DOI:\s*10\.|rsc\.li/|View Article Online|View Journal"
+    r"|Published on \d|This journal is ©)",
+    re.IGNORECASE,
+)
+
+
+def _body_text(lines: list[str], per_line: bool = False) -> str:
+    """The body as readable text (paragraphs kept), without journal furniture or back matter."""
+    kept = [line for line in _cut_back_matter(lines) if not _FURNITURE_LINE.match(line)]
+    return _paragraph_text(kept, per_line)
 
 
 def _build_document(
@@ -385,8 +447,8 @@ def _build_document(
     type_source = "user" if user_type else ("label" if label_type else "none")
 
     abstract = _extract_abstract(body_lines, style_abstract)
-    sections, roles, covered_chars = _extract_sections_detailed(body_lines, article_type)
-    body = _body_text(body_lines)
+    sections, roles, covered_chars = _extract_sections_detailed(body_lines, article_type, per_line=not reflow)
+    body = _body_text(body_lines, per_line=not reflow)
     structure, coverage = paper_profile.assess_structure(roles, covered_chars, len(body), article_type)
     references = _extract_references(ref_lines, one_per_line=one_reference_per_line)
     word_count = len(full_text.split())
@@ -577,7 +639,7 @@ def _topic_heading(line: str, wanted_number: int) -> str | None:
 
 
 def _extract_sections_detailed(
-    lines: list[str], article_type: str | None = None
+    lines: list[str], article_type: str | None = None, per_line: bool = False
 ) -> tuple[dict[str, str], dict[str, str], int]:
     """Sections under real headings: (sections, role of each, characters they cover).
 
@@ -615,7 +677,7 @@ def _extract_sections_detailed(
             line for line in lines[start + 1 : end]
             if not _NUMBER_ONLY.match(line.strip())
         ]
-        text = re.sub(r"\s+", " ", " ".join(chunk)).strip()
+        text = _paragraph_text(chunk, per_line)
         if len(text) <= MIN_SECTION_CONTENT_LENGTH:
             continue
         if role == paper_profile.ROLE_THEMATIC and key not in parts:

@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     # Swagger UI and /openapi.json. Set false in production.
     DOCS_ENABLED: bool = True
+    # Voice Calibrator: a second model call compares the rewrite with the original and reports dropped or
+    # strengthened claims (and sends them back once for a fix). Turn off to save one or two calls per run.
+    CALIBRATOR_MEANING_CHECK: bool = True
+    # Abstract Forge: one extra model call compares the three versions with the draft for meaning.
+    FORGE_MEANING_CHECK: bool = True
 
     # Database (Supabase Postgres, schema "app").
     # DATABASE_URL: runtime connection as the least-privilege role rejecta_api.

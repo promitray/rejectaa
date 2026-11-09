@@ -51,6 +51,17 @@ export interface SectionScore {
   /** "detected": a heading in the file. "derived": found from the content, starting at `anchor`. */
   source?: 'detected' | 'derived' | null
   anchor?: string | null
+  /** The text of the paper this section covers (cut by the server from where it starts to where the next starts). */
+  content?: string | null
+  content_truncated?: boolean
+  word_count?: number | null
+  /** Where the section starts and ends, as a percentage of the paper's body text. */
+  start_pct?: number | null
+  end_pct?: number | null
+  /** The section text prepared by the server for Calibrate and Heatmap (captions left out, length limited). */
+  tool_text?: string | null
+  /** What the server left out of or cut from `tool_text`. */
+  tool_notes?: string[]
 }
 
 export interface CriterionScore {
@@ -88,6 +99,8 @@ export interface AnalysisResult {
   provider_used: string
   /** Article type the analysis used. */
   paper_format?: ArticleType | 'unknown' | null
+  /** The paper's scientific field, passed on to the Calibrate and Heatmap tools. */
+  field?: string | null
   /** The fixed criteria the overall score is the weighted mean of. */
   criteria?: Record<string, CriterionScore>
   /** What the uploaded file did not let us judge (for example Supporting Information). */
@@ -104,10 +117,57 @@ export interface JournalMatch {
   recent_papers: Array<{ title: string; year: number | null }>
 }
 
+export interface DocumentSection {
+  id: string
+  name: string
+  /** False when the section could not be found in the working copy. */
+  mapped: boolean
+  paragraphs: number
+}
+
+/** An editable Word copy of the uploaded paper, kept on the server for 24 hours. */
+export interface DocumentInfo {
+  id: string
+  filename: string
+  source_format: 'pdf' | 'docx'
+  version: number
+  can_undo: boolean
+  expires_at: string
+  sections: DocumentSection[]
+  notes: string[]
+}
+
+/** Calibrated text for a section, not yet in the paper. */
+export interface DocumentProposal {
+  /** null when the calibration was blocked: nothing to apply. */
+  proposal_id: string | null
+  section_id: string
+  base_version: number
+  original_text: string
+  proposed_text: string | null
+  warnings: string[]
+  notes: string[]
+  /** Pass as from_paragraph to calibrate the rest of a long section. */
+  next_from: number | null
+  calibration: VoiceCalibrateResponse
+}
+
+export interface ApplyResult {
+  document: DocumentInfo
+  section_id: string
+  applied_paragraphs: number
+  section_text: string
+  next_from: number | null
+}
+
 export interface AnalysisPaperResponse {
   analysis: AnalysisResult
   citations: CitationSummary
   journal: JournalMatch
+  /** The editable copy, when the user asked to keep one. */
+  document?: DocumentInfo | null
+  /** Why no copy was kept, when one was asked for. */
+  document_note?: string | null
   meta: {
     word_count: number
     sections_found: string[]
@@ -127,6 +187,8 @@ export interface VoiceCalibrateRequest {
   journal: string
   field?: string
   intensity?: 'polish' | 'rewrite' | 'restructure'
+  /** The review's note on the section being calibrated (issue and fix), up to 700 characters. */
+  focus?: string
 }
 
 export interface VoiceCalibrateResponse {
@@ -175,6 +237,8 @@ export interface ParagraphHeatDetail {
   paragraph_burstiness_cv: number
   sentences: SentenceHeatDetail[]
   primary_issue: string | null
+  /** Patterns seen across the whole paragraph (stock-phrase density, same openings, three-item lists, em dashes). */
+  paragraph_signals?: string[]
 }
 
 export interface HeatmapAnalyzeRequest {
@@ -233,6 +297,11 @@ export interface AbstractVariantDetail {
   seo_keywords?: string[]
   claim_audit?: ClaimAuditDetail
   invariants_verified: boolean
+  /** True when a protected number or citation was lost: the text is withheld. */
+  blocked?: boolean
+  block_reasons?: string[]
+  /** Problems still present after the server's retry. */
+  warnings?: string[]
 }
 
 export interface AbstractForgeRequest {
@@ -240,6 +309,8 @@ export interface AbstractForgeRequest {
   methodology_context?: string
   journal?: string
   field?: string
+  /** The journal's abstract word limit. */
+  max_words?: number
 }
 
 export interface InvariantDetailSummary {
@@ -264,6 +335,7 @@ export interface AbstractForgeResponse {
   comparative_summary: string
   invariants_preserved_count: number
   invariant_telemetry?: InvariantDetailSummary
+  max_words?: number | null
 }
 
 export interface ToneAuditResult {

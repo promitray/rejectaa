@@ -62,6 +62,7 @@ The JSON must match this schema EXACTLY. Wrong field names or value types cause 
 
 {
   "paper_format": "<exactly one of: research_article, communication, perspective, review, mini_review>",
+  "field": "<the paper's scientific field in 2-5 words, in that field's own terms>",
   "mood": "<exactly one of: furious, skeptical, unimpressed, neutral, interested, delighted>",
   "mood_score": <integer 0-100, your overall impression>,
   "verdict": "<one sentence __VERDICT__>",

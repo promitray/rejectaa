@@ -428,3 +428,88 @@ def test_the_prompt_demands_all_four_parts_without_a_fixed_example() -> None:
         for part in ('"problem"', '"evidence"', '"impact"', '"solution"', '"impact_area"'):
             assert part in prompt
         assert "pyrene" not in prompt.lower()  # nothing from one field is baked into the prompt
+
+
+# ------------------------------------------------------------------ section content: where a section starts and ends
+
+ABSTRACT_TEXT = "We pioneer a self-reporting release system driven by dynamic covalent ligation of chromophores."
+INTRO = "The design and synthesis of self-reporting delivery systems has attracted intense research interest. More background follows here."
+SYNTH = "The polymer was obtained by radical copolymerisation with a molar mass of 8700 g mol and a dispersity of 2.3."
+RELEASE = "Heating above 80 degrees released the reporter within minutes and the fluorescence switched on."
+CONCL = "In conclusion the platform holds potential for imaging substrate release events."
+BODY = "\n\n".join(["A title line and the authors", ABSTRACT_TEXT, INTRO, SYNTH, RELEASE, CONCL])
+
+
+def content_ctx(**overrides: Any) -> AnalysisContext:
+    values: dict[str, Any] = dict(source_text=BODY, body=BODY, abstract=ABSTRACT_TEXT, structure_mode="derived", article_type=pp.COMMUNICATION, citations_total=0)
+    values.update(overrides)
+    return AnalysisContext(**values)
+
+
+def test_a_derived_section_runs_from_its_anchor_to_where_the_next_one_starts() -> None:
+    sections = [
+        derived("Background", "The design and synthesis of self-reporting delivery systems"),
+        derived("Synthesis", "The polymer was obtained by radical copolymerisation"),
+        derived("Release", "Heating above 80 degrees released the reporter within minutes"),
+    ]
+    out = run(payload(sections=sections), content_ctx())
+    background, synthesis, release = (out["sections"][n] for n in ("Background", "Synthesis", "Release"))
+    assert background["content"] == INTRO
+    assert synthesis["content"] == SYNTH
+    assert release["content"] == RELEASE + "\n\n" + CONCL  # the last section runs to the end of the body
+    assert background["word_count"] == len(INTRO.split())
+    assert background["start_pct"] < synthesis["start_pct"] < release["start_pct"]
+    assert background["end_pct"] == synthesis["start_pct"] and release["end_pct"] == 100
+
+
+def test_the_text_before_the_first_section_title_and_abstract_is_not_part_of_a_section() -> None:
+    out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx())
+    assert "title line" not in out["sections"]["Background"]["content"]
+    assert ABSTRACT_TEXT not in out["sections"]["Background"]["content"]
+
+
+def test_an_anchor_that_is_also_in_the_abstract_is_taken_from_the_text_after_it() -> None:
+    body = "\n\n".join(["Title", ABSTRACT_TEXT, "Intro: " + ABSTRACT_TEXT + " More text of the introduction follows."])
+    out = run(payload(sections=[derived("Intro", "We pioneer a self-reporting release system driven by dynamic covalent")]), content_ctx(source_text=body, body=body))
+    assert out["sections"]["Intro"]["content"].startswith("We pioneer")
+    assert out["sections"]["Intro"]["start_pct"] > 20  # not the abstract at the top
+
+
+def test_two_sections_with_the_same_start_do_not_both_get_text() -> None:
+    same = "The polymer was obtained by radical copolymerisation"
+    out = run(payload(sections=[derived("One", same), derived("Two", same)]), content_ctx())
+    assert [("content" in s and s["content"] is not None) for s in out["sections"].values()].count(True) <= 1
+
+
+def test_very_long_content_is_shortened_and_flagged_but_the_word_count_is_the_real_one() -> None:
+    long_text = "word " * 5000
+    body = "\n\n".join(["Title", ABSTRACT_TEXT, INTRO + " " + long_text])
+    out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx(source_text=body, body=body))
+    section = out["sections"]["Background"]
+    assert section["content_truncated"] is True and len(section["content"]) <= 12002
+    assert section["word_count"] > 5000
+
+
+def test_a_section_whose_anchor_is_not_in_the_body_keeps_its_score_but_has_no_content() -> None:
+    ctx = content_ctx(body="Only a short body without the anchor sentence in it at all.")
+    out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), ctx)
+    assert out["sections"]["Background"]["score"] == 60
+    assert out["sections"]["Background"].get("content") is None
+
+
+def test_detected_sections_carry_the_text_the_parser_found_under_the_heading() -> None:
+    ctx = content_ctx(
+        structure_mode="detected",
+        article_type=pp.RESEARCH_ARTICLE,
+        section_texts={"introduction": INTRO, "results": SYNTH + "\n\n" + RELEASE},
+        section_roles={"introduction": "introduction", "results": "results"},
+    )
+    out = run(payload(sections=[{"name": "introduction", "score": 70, "issue": "i", "fix": "f"}, {"name": "results", "score": 60, "issue": "i", "fix": "f"}]), ctx)
+    assert out["sections"]["introduction"]["content"] == INTRO
+    assert out["sections"]["results"]["content"] == SYNTH + "\n\n" + RELEASE
+    assert out["sections"]["introduction"]["start_pct"] < out["sections"]["results"]["start_pct"]
+
+
+def test_without_a_body_there_is_no_content() -> None:
+    out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx(body=""))
+    assert out["sections"]["Background"].get("content") is None

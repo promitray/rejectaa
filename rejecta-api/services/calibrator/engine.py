@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel
 
 from services.calibrator.classifier import ClassificationResult, InputTypeClassifier
 from services.calibrator.corpus import JournalCorpusService
-from services.calibrator.vault import InvariantBundle, ScientificVault
+from services.calibrator.vault import InvariantBundle, InvariantRecord, ScientificVault
 from services.calibrator.verifier import CalibrationAuditor
+from services.calibrator.quality import check_output, citation_tokens, fix_citation_punctuation, mode_rules
+from config import settings
 from services.llm.base import AbstractAnalysisProvider
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,10 @@ class CalibrationResult(BaseModel):
     audit_notes: List[str]
     block_reasons: List[str] = []
     guidance_items: List[str] = []
+    # For writing the result back into a Word file: the model's output with every protected token still in it,
+    # and what each token stands for.
+    calibrated_masked_text: str | None = None
+    vault_values: Dict[str, str] = {}
 
 
 class VoiceCalibratorService:
@@ -49,29 +56,55 @@ class VoiceCalibratorService:
         journal_name: str,
         field: str = "Multidisciplinary",
         intensity: Literal["polish", "rewrite", "restructure"] = "rewrite",
+        focus: str | None = None,
+        extra_invariants: Dict[str, str] | None = None,
     ) -> CalibrationResult:
-        """Calibrate input text with hard output verification or reviewer guidance handling."""
-        # Step 0: Input Type Classification
-        classification: ClassificationResult = InputTypeClassifier.classify(text)
+        """Calibrate input text with hard output verification or reviewer guidance handling.
+
+        `focus` is the editor's note on a manuscript section (issue and fix from the review). When it is given the
+        text is known to be a manuscript section, so it is never read as a reviewer's critique.
+
+        `extra_invariants` are tokens already placed in `text` by the caller (formatted runs of a Word paragraph,
+        such as superscript citations). They are protected and verified like the vault's own tokens.
+        """
+        focus = re.sub(r"\s+", " ", focus).strip() if focus else None
+        # Step 0: Input Type Classification (skipped for a section: we know what it is)
+        classification: ClassificationResult | None = None if focus else InputTypeClassifier.classify(text)
 
         # Path A: Reviewer Critique Detected -> Do NOT fabricate research prose; Generate Structured Guidance
-        if classification.is_reviewer_feedback:
+        if classification is not None and classification.is_reviewer_feedback:
             return await self._handle_reviewer_guidance(text, journal_name, field)
 
         # Path B: Standard Manuscript Draft Calibration
         # Step 1: Secure Invariants into the Vault with Span Records
         vault_bundle: InvariantBundle = ScientificVault.mask(text)
+        if extra_invariants:
+            vault_bundle = InvariantBundle(
+                masked_text=vault_bundle.masked_text,
+                vault={**vault_bundle.vault, **extra_invariants},
+                records=vault_bundle.records
+                + [InvariantRecord(token, value, "format", -1, -1) for token, value in extra_invariants.items()],
+                token_count=vault_bundle.token_count + len(extra_invariants),
+            )
 
         # Step 2: Fetch Journal Register Profile
         register = await JournalCorpusService.get_journal_register_profile(journal_name)
 
         # Step 3: Construct Constrained Calibration Prompt
-        system_prompt = self._build_system_prompt(register, intensity, field, has_invariants=(vault_bundle.token_count > 0))
-        user_prompt = self._build_user_prompt(vault_bundle.masked_text)
+        system_prompt = self._build_system_prompt(
+            register, intensity, field, has_invariants=(vault_bundle.token_count > 0), focus=focus
+        )
+        user_prompt = self._build_user_prompt(vault_bundle.masked_text, intensity)
+        categories = {r.token_id: r.category for r in vault_bundle.records}
+        cite_tokens = citation_tokens(vault_bundle.vault, categories)
 
-        # Step 4: Execute LLM Call with Missing Token Retry
+        def plain(masked: str) -> str:
+            return re.sub(r"__REJ_INV_\d{4}__", lambda m: vault_bundle.vault.get(m.group(0), ""), masked)
+
+        # Step 4: Execute LLM Call; check it in code (and with a meaning check); send it back once with the reasons
         raw_calibrated = ""
-        notes = []
+        notes: List[str] = []
+        problems: List[str] = []
         current_user_prompt = user_prompt
         for attempt in range(2):
             try:
@@ -81,18 +114,10 @@ class VoiceCalibratorService:
                     temperature=0.10 if attempt > 0 else 0.15,
                 )
                 parsed = self.llm.parse_json_response(response_json_str)
-                raw_calibrated = parsed.get("calibrated_masked_text", "")
+                raw_calibrated = str(parsed.get("calibrated_masked_text", "") or "")
                 notes = parsed.get("modifications", [])
                 if not isinstance(notes, list):
                     notes = [str(notes)]
-
-                # Check if all tokens were preserved
-                all_present = all(t in raw_calibrated for t in vault_bundle.vault.keys())
-                if all_present or attempt == 1:
-                    break
-                # If attempt 0 dropped tokens, formulate a targeted retry
-                missing = [t for t in vault_bundle.vault.keys() if t not in raw_calibrated]
-                current_user_prompt += f"\n\nCRITICAL FIX: You omitted protected token(s) {', '.join(missing)}. You MUST keep all original tokens in your output!"
             except Exception as e:
                 logger.error("VoiceCalibrator LLM generation failed: %s", e)
                 return CalibrationResult(
@@ -110,6 +135,36 @@ class VoiceCalibratorService:
                     audit_notes=[f"Generation error: {e}"],
                     block_reasons=[f"Model execution error: {e}"],
                 )
+
+            # citation numbers go back to the side of the punctuation the author put them on
+            raw_calibrated = fix_citation_punctuation(vault_bundle.masked_text, raw_calibrated, cite_tokens)
+            missing = [t for t in vault_bundle.vault.keys() if t not in raw_calibrated]
+            problems = []
+            if missing:
+                problems.append(
+                    f"You omitted protected token(s) {', '.join(missing)}. You MUST keep all original tokens in your output!"
+                )
+            else:
+                problems.extend(check_output(plain(vault_bundle.masked_text), plain(raw_calibrated), intensity))
+                # a second model call compares the meaning (off with CALIBRATOR_MEANING_CHECK=false)
+                if settings.CALIBRATOR_MEANING_CHECK:
+                    problems.extend(await self._meaning_check(plain(vault_bundle.masked_text), plain(raw_calibrated)))
+            if not problems or attempt == 1:
+                break
+            current_user_prompt = (
+                f"{user_prompt}\n\nCRITICAL FIX: your previous version had these problems. Write it again from the "
+                "original text above and fix exactly these, keeping everything else:\n- "
+                + "\n- ".join(problems)
+                + f"\n\nYOUR PREVIOUS VERSION:\n{raw_calibrated}"
+            )
+
+        # what is still wrong after the retry is shown to the user, never hidden
+        quality_warnings = [f"Check: {problem}" for problem in problems if "protected token" not in problem]
+        if not register.get("recognised", True):
+            quality_warnings.append(
+                f"'{journal_name}' is not a journal name we recognise, so a general academic register was used. "
+                "Enter the exact journal name (for example 'Polymer Chemistry') for its house style."
+            )
 
         # Step 5: Detokenize & Verify Every Single Protected Invariant
         restored_text, verification_report = ScientificVault.verify_and_unmask(
@@ -148,9 +203,47 @@ class VoiceCalibratorService:
             word_count_calibrated=len(safe_calibrated_text.split()) if safe_calibrated_text else 0,
             synthetic_markers_removed=audit_report["markers_eliminated_count"],
             intensity_applied=intensity,
-            audit_notes=notes + audit_report["warnings"],
+            audit_notes=quality_warnings + notes + audit_report["warnings"],
             block_reasons=audit_report["block_reasons"],
+            calibrated_masked_text=raw_calibrated if safe_calibrated_text is not None else None,
+            vault_values=dict(vault_bundle.vault),
         )
+
+    async def _meaning_check(self, original: str, rewritten: str) -> List[str]:
+        """A second, strict reading: what did the rewrite drop, strengthen or add? Returns problems as instructions."""
+        system_prompt = (
+            "You check a rewrite of a scientific passage against the original. Report ONLY real differences in meaning. "
+            "Ignore wording, style, order and sentence structure.\n"
+            "- lost: facts, list items, conditions, qualifiers or the subject of a claim that the original has and the rewrite does not\n"
+            "- stronger: claims stated more strongly or more generally than in the original (for example 'allow for' becoming a direct claim)\n"
+            "- added: facts or claims in the rewrite that are not in the original\n"
+            "Quote each as a short phrase from the original (lost, stronger) or the rewrite (added). Return JSON only: "
+            '{"lost": [], "stronger": [], "added": []}. Use empty lists when the meaning is the same.'
+        )
+        try:
+            raw = await self.llm.generate(
+                system_prompt=system_prompt,
+                user_prompt=f"ORIGINAL:\n{original}\n\nREWRITE:\n{rewritten}",
+                temperature=0.0,
+            )
+            parsed = self.llm.parse_json_response(raw)
+        except Exception:  # the check is a help, not a gate
+            logger.warning("Calibrator meaning check failed", exc_info=True)
+            return []
+        templates = {
+            "lost": "This was in the original and is missing: '{}'. Put it back.",
+            "stronger": "This claim is now stronger than in the original: '{}'. Keep the original strength.",
+            "added": "This is not in the original and must not be added: '{}'.",
+        }
+        problems: List[str] = []
+        for key, template in templates.items():
+            items = parsed.get(key, [])
+            if isinstance(items, list):
+                for item in items[:5]:
+                    phrase = re.sub(r"\s+", " ", str(item)).strip()[:160]
+                    if phrase:
+                        problems.append(template.format(phrase))
+        return problems
 
     async def _handle_reviewer_guidance(
         self,
@@ -218,8 +311,23 @@ Return a single valid JSON object:
             ],
         )
 
-    def _build_system_prompt(self, register: Dict[str, Any], intensity: str, field: str, has_invariants: bool = True) -> str:
+    def _build_system_prompt(
+        self,
+        register: Dict[str, Any],
+        intensity: str,
+        field: str,
+        has_invariants: bool = True,
+        focus: str | None = None,
+    ) -> str:
         banned_str = ", ".join(register.get("banned_synthetic_markers", []))
+        rules = mode_rules(intensity)
+        focus_block = ""
+        if focus:
+            focus_block = f"""EDITOR'S NOTE FOR THIS SECTION (from the pre-submission review):
+{focus}
+Address this note ONLY by restructuring or rewording what is already in the text. If addressing it would need content that is not in the text (a new experiment, measurement, comparison or claim), do NOT write that content. Put a bracketed placeholder where it belongs, in the form [AUTHOR TO ADD: what is needed], and never put digits in a placeholder.
+
+"""
 
         if has_invariants:
             invariant_rules = """CRITICAL INVARIANTS (NON-NEGOTIABLE):
@@ -233,7 +341,7 @@ Return a single valid JSON object:
 2. NEVER fabricate empirical claims, causal assertions, or study parameters that are not in the input."""
 
         return f"""You are the Executive Senior Scientific Editor at {register['target_journal']} in {field}.
-Your mandate: Transform the submitted excerpt into concise, authoritative, empirical prose expected by the editorial board.
+Your mandate: bring the submitted excerpt into the register expected by the editorial board, changing only what the mode allows and never the science.
 
 {invariant_rules}
 
@@ -241,23 +349,33 @@ EDITORIAL PRINCIPLES:
 1. BAN GENERIC ACADEMIC FLUFF:
    - FORBIDDEN: "highlighting the significant advancements", "substantial predictive utility", "demonstrating paramount effectiveness", "invaluable contribution", "pivotal role", "vibrant tapestry".
    - INSTEAD: State empirical findings directly and concisely.
-2. STRUCTURAL COMPRESSION:
-   - Do NOT just replace words with synonyms. Reorganize sentence order, fuse clauses, eliminate throat-clearing preambles.
-   - Lead directly with the methodology or core empirical claim.
-3. HEDGING & CALIBRATION OF OVERCLAIMS:
+2. MODE: {rules.name.upper()}
+   - You may: {rules.allowed}.
+   - You must not: {rules.forbidden}.
+   - Keep at least {round(100 * rules.min_length_ratio)}% of the original length.
+3. KEEP THE MEANING EXACTLY (all modes):
+   - Keep the subject of every claim (if the original says "the design and synthesis of X attracted interest", do not make it "X attracted interest").
+   - Keep every qualifier at its strength: "may", "suggest", "allow for", "potential" must not become a direct claim.
+   - Keep every item of every list, every condition, and every compound label, abbreviation and name exactly as written.
+   - Do not add "significant", "novel", "first", "remarkable" or any claim the original does not make.
+4. HEDGING & CALIBRATION OF OVERCLAIMS:
    - Soften unsubstantiated superlative claims ("decisively outperforming", "dramatically exceeds") to calibrated scientific comparisons ("exceeding the baseline", "improving upon prior benchmarks") unless explicit statistical test results are provided.
-4. TARGET JOURNAL TONE:
+5. TARGET JOURNAL TONE:
    - Voice: {register['voice']}
    - Cadence: {register.get('target_cadence', 'Direct declarative academic rhythm.')}
    - Eradicate these synthetic clichés: {banned_str}.
 
-OUTPUT FORMAT:
+{focus_block}OUTPUT FORMAT:
 Return a single valid JSON object with EXACTLY this structure:
 {{
-  "calibrated_masked_text": "<concise, restructured calibrated version>",
+  "calibrated_masked_text": "<the calibrated version>",
   "modifications": ["concise list of structural and stylistic enhancements made"]
 }}
 """.strip()
 
-    def _build_user_prompt(self, masked_text: str) -> str:
-        return f"Calibrate the following manuscript draft to tier-1 journal standards, removing all filler and tightening the argumentative flow:\n\n{masked_text}"
+    def _build_user_prompt(self, masked_text: str, intensity: str = "rewrite") -> str:
+        rules = mode_rules(intensity)
+        return (
+            f"Calibrate the following manuscript text in {rules.name.upper()} mode ({rules.allowed}; {rules.forbidden}):"
+            f"\n\n{masked_text}"
+        )

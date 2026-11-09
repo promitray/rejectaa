@@ -47,6 +47,19 @@ def alnum(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", unicodedata.normalize("NFKC", text).lower())
 
 
+def _index_text(text: str) -> tuple[str, str, list[int]]:
+    """(normalised text, its letters and digits, and for each of those letters its position in the normalised text)."""
+    norm = unicodedata.normalize("NFKC", text)
+    chars: list[str] = []
+    index: list[int] = []
+    for position, char in enumerate(norm):
+        for lower in char.lower():
+            if "a" <= lower <= "z" or "0" <= lower <= "9":
+                chars.append(lower)
+                index.append(position)
+    return norm, "".join(chars), index
+
+
 @dataclass
 class AnalysisContext:
     """What the pipeline knows about the paper, shared with the prompt builder and the checks."""
@@ -69,17 +82,14 @@ class AnalysisContext:
     corpus: str = field(init=False, default="")
     norm_text: str = field(init=False, default="")  # the paper, Unicode-normalised
     corpus_index: list[int] = field(init=False, default_factory=list)  # corpus position -> position in norm_text
+    body_norm: str = field(init=False, default="")  # the readable body (paragraphs), Unicode-normalised
+    body_corpus: str = field(init=False, default="")  # letters and digits of the body
+    body_index: list[int] = field(init=False, default_factory=list)  # body_corpus position -> position in body_norm
     numbers: set[str] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
-        self.norm_text = unicodedata.normalize("NFKC", self.source_text)
-        chars: list[str] = []
-        for position, char in enumerate(self.norm_text):
-            for lower in char.lower():
-                if "a" <= lower <= "z" or "0" <= lower <= "9":
-                    chars.append(lower)
-                    self.corpus_index.append(position)
-        self.corpus = "".join(chars)
+        self.norm_text, self.corpus, self.corpus_index = _index_text(self.source_text)
+        self.body_norm, self.body_corpus, self.body_index = _index_text(self.body)
         self.numbers = set(re.findall(r"\d+(?:\.\d+)?", f"{self.numbers_text or self.source_text} {self.extra_text}"))
 
 
@@ -291,6 +301,125 @@ def _section_starts(ctx: AnalysisContext, sections: dict[str, dict[str, Any]]) -
     return sorted((pos, name) for pos, name in found if pos >= 0)
 
 
+MAX_CONTENT_CHARS = 12000  # most text of one section sent back to the app
+TOOL_TEXT_CHARS = 6000  # most text one Calibrate run takes (about 900 words), so the rewrite fits the model's output
+MAX_CAPTION_CHARS = 600  # a paragraph that starts like a caption and is longer than this is body text that got merged with it
+_CAPTION = re.compile(r"^(?:Fig(?:ure)?s?\.?|Scheme|Table|Chart|Graph)\s*S?\d+[A-Za-z]?\b", re.IGNORECASE)
+
+
+def _tool_text(content: str) -> tuple[str | None, list[str]]:
+    """The section text prepared for Calibrate and Heatmap: captions left out, cut at a paragraph boundary.
+
+    Returns (text or None when almost nothing is left, notes for the user).
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", content) if p.strip()]
+    kept = [p for p in paragraphs if not (_CAPTION.match(p) and len(p) <= MAX_CAPTION_CHARS)]
+    notes: list[str] = []
+    if len(paragraphs) != len(kept):
+        notes.append(f"{len(paragraphs) - len(kept)} figure, scheme or table caption(s) left out.")
+    chosen: list[str] = []
+    used = 0
+    cut = False
+    for paragraph in kept:
+        extra = len(paragraph) + (2 if chosen else 0)
+        if used + extra > TOOL_TEXT_CHARS:
+            cut = True
+            if not chosen:  # the first paragraph alone is too long: cut it at a word boundary
+                chosen.append(paragraph[:TOOL_TEXT_CHARS].rsplit(" ", 1)[0] + " …")
+            break
+        chosen.append(paragraph)
+        used += extra
+    text = "\n\n".join(chosen)
+    if cut:
+        notes.append(f"Long section: only the first {len(text.split())} words are sent. Run again for the rest.")
+    return (text if len(text) >= 20 else None), notes
+
+
+def _clean_field(value: Any) -> str | None:
+    """A short plain name for the paper's field, or None. It ends up in the tools' prompts, so it is kept simple."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" .")
+    return text if 2 <= len(text) <= 60 and re.fullmatch(r"[A-Za-z][A-Za-z0-9 &,/()'\-]*", text) else None
+
+
+def _find_in_body(text: str, ctx: AnalysisContext, start: int = 0) -> int:
+    """Where `text` starts in the body's letters-and-digits text, searching from `start`; -1 if it is not there."""
+    wanted = alnum(text)
+    if len(wanted) < MIN_ANCHOR_CHARS:
+        return -1
+    position = ctx.body_corpus.find(wanted, start)
+    if position < 0 and len(wanted) >= ANCHOR_PREFIX_CHARS:
+        position = ctx.body_corpus.find(wanted[:ANCHOR_PREFIX_CHARS], start)
+    return position
+
+
+def _section_spans(ctx: AnalysisContext, sections: dict[str, dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    """Where each section starts and ends in the body (positions in the body's letters and digits).
+
+    A derived section starts at its verified anchor and runs until the next section starts. The first
+    search begins after the abstract, so a sentence that is both in the abstract and in the text is
+    taken from the text. A detected section is the text the parser found under its heading.
+    """
+    spans: dict[str, tuple[int, int]] = {}
+    total = len(ctx.body_corpus)
+    if ctx.structure_mode == "derived":
+        floor = 0
+        tail = alnum(ctx.abstract)[-40:]
+        if len(tail) >= MIN_ANCHOR_CHARS:
+            found = ctx.body_corpus.find(tail)
+            floor = found + len(tail) if found >= 0 else 0
+        starts: list[tuple[int, str]] = []
+        for name, fields in sections.items():
+            anchor = str(fields.get("anchor", ""))
+            position = _find_in_body(anchor, ctx, floor)
+            if position < 0:
+                position = _find_in_body(anchor, ctx, 0)
+            if position >= 0:
+                starts.append((position, name))
+        starts.sort()
+        unique: list[tuple[int, str]] = []
+        for position, name in starts:
+            if not unique or unique[-1][0] != position:  # two sections cannot start at the same place
+                unique.append((position, name))
+        for i, (position, name) in enumerate(unique):
+            spans[name] = (position, unique[i + 1][0] if i + 1 < len(unique) else total)
+    else:
+        for name in sections:
+            text = ctx.section_texts.get(name, "")
+            position = _find_in_body(text[:100], ctx)
+            if position >= 0:
+                spans[name] = (position, min(total, position + len(alnum(text))))
+    return spans
+
+
+def _attach_content(ctx: AnalysisContext, sections: dict[str, dict[str, Any]]) -> None:
+    """Add the text each section covers, its size and where it sits in the paper. Nothing is added if it cannot be found."""
+    total = len(ctx.body_corpus)
+    if not total:
+        return
+    for name, (start, end) in _section_spans(ctx, sections).items():
+        if ctx.structure_mode == "derived":
+            stop = ctx.body_index[end] if end < total else len(ctx.body_norm)
+            content = ctx.body_norm[ctx.body_index[start] : stop].strip()
+        else:
+            content = ctx.section_texts[name].strip()
+        if not content:
+            continue
+        words = len(content.split())
+        tool_text, tool_notes = _tool_text(content)
+        truncated = len(content) > MAX_CONTENT_CHARS
+        if truncated:
+            content = content[:MAX_CONTENT_CHARS].rsplit(" ", 1)[0] + " …"
+        sections[name].update(
+            content=content,
+            content_truncated=truncated,
+            word_count=words,
+            start_pct=round(100 * start / total),
+            end_pct=min(100, round(100 * end / total)),
+            tool_text=tool_text,
+            tool_notes=tool_notes,
+        )
+
+
 def _clean_sections(raw: Any, ctx: AnalysisContext | None, notes: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Valid sections keyed by name, and the roles they have."""
     kept: list[tuple[int, str, dict[str, Any]]] = []  # (position in paper, name, fields)
@@ -397,9 +526,12 @@ def finalize_payload(parsed: dict[str, Any], ctx: AnalysisContext | None) -> dic
     notes: list[str] = []
     sections, roles = _clean_sections(parsed.get("sections"), ctx, notes)
     out["sections"] = sections
+    out["field"] = _clean_field(parsed.get("field"))
     out.pop("absent_sections", None)
     if ctx is None:
         return out
+
+    _attach_content(ctx, sections)
 
     # ---- article type: stated in the file or chosen by the author wins over the model's reading
     model_type = pp.coerce_article_type(parsed.get("paper_format"))

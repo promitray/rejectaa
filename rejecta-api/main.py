@@ -18,11 +18,14 @@ from auth.subject import get_subject, public_rate_limit
 from auth.tokens import TokenConfigError, get_keyring
 from auth.usage import Subject, consume, refund_stale_reservations
 from config import settings
-from db.pool import check_database, close_pool, init_pool
+from db.pool import check_database, close_pool, get_pool, init_pool
 from routers import admin_insights, admin_partners, admin_plans, admin_users, oauth
 from routers import auth as auth_routes
 from routers import auth_mfa as auth_mfa_routes
 from routers import authors as authors_routes
+from routers import documents as documents_routes
+from services.documents import service as document_service
+from services.documents.store import Owner, PostgresDocumentStore
 from routers import me as me_routes
 from routers import wellknown as wellknown_routes
 from models import (
@@ -47,7 +50,7 @@ from services import citations, journals, llm, parser
 from services import paper_profile
 from services.analysis_guard import AnalysisContext, paper_context
 from services.calibrator import VoiceCalibratorService
-from services.forge import AbstractForgeEngine, AbstractForgeResult
+from services.forge import AbstractForgeEngine, AbstractForgeResult, ForgeError
 from services.heatmap import HeatmapAnalysisResult, HeatmapEngine
 from services.citations import MAX_REFERENCES, build_citation_summary, verify_citations
 from services.journals import match_journal
@@ -81,10 +84,30 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         refunded = await refund_stale_reservations()
         if refunded:
             logger.info("Refunded %s usage reservations left open by a previous run", refunded)
+    purger = asyncio.create_task(_purge_expired_documents()) if settings.DATABASE_URL.strip() else None
     try:
         yield
     finally:
+        if purger is not None:
+            purger.cancel()
         await close_pool()
+
+
+DOCUMENT_PURGE_INTERVAL_SECONDS = 3600
+
+
+async def _purge_expired_documents() -> None:
+    """Delete working copies whose 24 hours are over: at startup, then every hour."""
+    while True:
+        try:
+            removed = await PostgresDocumentStore(get_pool()).purge_expired()
+            if removed:
+                logger.info("Deleted %s expired working copies", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failed purge is retried next hour
+            logger.warning("Could not delete expired working copies", exc_info=True)
+        await asyncio.sleep(DOCUMENT_PURGE_INTERVAL_SECONDS)
 
 
 app = FastAPI(
@@ -107,6 +130,7 @@ _ = (parser, citations, journals, llm)
 
 app.add_exception_handler(ApiError, api_error_handler)
 app.include_router(auth_routes.router)
+app.include_router(documents_routes.router)
 app.include_router(auth_mfa_routes.router)
 app.include_router(me_routes.router)
 app.include_router(authors_routes.router)
@@ -269,6 +293,7 @@ async def analyse_paper(
     mode: str = Form(default="a"),
     email: str = Form(default=""),
     article_type: str = Form(default="auto"),
+    keep_copy: bool = Form(default=False),
     subject: Subject = Depends(get_subject),
 ) -> AnalysisPaperResponse:
     """Full pipeline: PDF or Word (.docx) → parse → citations + journal → LLM.
@@ -288,6 +313,9 @@ async def analyse_paper(
         article_type: "auto" (read it from the file), or one of research_article,
                communication, perspective, review, mini_review. A choice here wins
                over a label printed in the file.
+        keep_copy: Keep an editable Word copy for 24 hours, so calibrated sections can
+               be applied to the paper (/documents endpoints). Off by default: without
+               it nothing is stored.
 
     Returns:
         AnalysisPaperResponse with analysis, citations,
@@ -410,10 +438,17 @@ async def analyse_paper(
             report_email is not None,
         )
 
+        document_info = None
+        document_note = None
+        if keep_copy:
+            document_info, document_note = await _keep_working_copy(subject, content, filename, parsed, analysis)
+
         return AnalysisPaperResponse(
             analysis=analysis,
             citations=citation_summary,
             journal=journal_data,
+            document=document_info,
+            document_note=document_note,
             meta=PaperMeta(
                 word_count=parsed.word_count,
                 sections_found=(
@@ -431,6 +466,22 @@ async def analyse_paper(
 
 
 
+async def _keep_working_copy(subject: Subject, content: bytes, filename: str, parsed, analysis: AnalysisResult):
+    """The editable copy asked for with keep_copy. A failure here never fails the analysis itself."""
+    sections = [
+        (name, section.content or "", section.content_truncated) for name, section in analysis.sections.items()
+    ]
+    try:
+        store = PostgresDocumentStore(get_pool())
+        info = await document_service.create_working_copy(
+            store, Owner(kind=subject.kind, id=subject.id), content, filename, parsed, sections
+        )
+        return info, None
+    except Exception:  # noqa: BLE001 - the report is still useful without the copy
+        logger.warning("Could not keep a working copy", exc_info=True)
+        return None, "The editable copy could not be created this time. The analysis above is complete."
+
+
 @app.post("/voice-calibrate", response_model=VoiceCalibrateResponse)
 async def voice_calibrate_endpoint(
     req: VoiceCalibrateRequest, subject: Subject = Depends(get_subject)
@@ -444,6 +495,7 @@ async def voice_calibrate_endpoint(
             journal_name=req.journal,
             field=req.field,
             intensity=req.intensity,  # type: ignore[arg-type]
+            focus=req.focus,
         )
     return VoiceCalibrateResponse(
         calibrated_text=result.calibrated_text,
@@ -484,12 +536,16 @@ async def abstract_forge_endpoint(
     async with consume(subject, features.ABSTRACT_FORGE):
         provider = get_provider_cached()
         forge_engine = AbstractForgeEngine(llm_service=provider)
-        return await forge_engine.forge(
-            abstract_draft=req.abstract_draft,
-            methodology_context=req.methodology_context,
-            journal_name=req.journal,
-            field=req.field,
-        )
+        try:
+            return await forge_engine.forge(
+                abstract_draft=req.abstract_draft,
+                methodology_context=req.methodology_context,
+                journal_name=req.journal,
+                field=req.field,
+                max_words=req.max_words,
+            )
+        except ForgeError as exc:  # the quota is refunded when the call fails
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/rebuttal-writer/analyze", response_model=RebuttalAnalyzeResponse)

@@ -23,7 +23,7 @@ const STEPS = [
   {
     n: '01',
     title: 'Upload the manuscript',
-    body: 'PDF or Word (.docx). Name the target journal. No account. The file is parsed in memory and is not stored.',
+    body: 'PDF or Word (.docx). Name the target journal. No account. An editable copy is kept for 24 hours so you can apply changes, then deleted. Untick it to store nothing.',
   },
   {
     n: '02',
@@ -125,7 +125,7 @@ export default function Landing(): ReactElement {
               </a>
             </div>
             <p className="mt-4 text-xs text-gray-500">
-              No account · PDF or Word · manuscript is not stored
+              No account · PDF or Word · editable copy kept 24 hours (optional)
             </p>
           </div>
           <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-200 bg-gray-50 px-6 py-10">

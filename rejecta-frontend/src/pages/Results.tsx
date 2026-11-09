@@ -1,9 +1,10 @@
 import type { ReactElement, ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { deleteDocument, downloadDocument, undoDocument } from '../api'
 import Frowns from '../components/Frowns'
 import { useRejectaStore } from '../store'
-import type { CitationResult, CitationStatus, Mood, RejectionReason, SectionScore } from '../types'
+import type { CitationResult, CitationStatus, DocumentInfo, Mood, RejectionReason, SectionScore } from '../types'
 
 const VISIBLE_CITATIONS = 10
 
@@ -147,6 +148,9 @@ export default function Results(): ReactElement {
   const notAssessed = analysis.not_assessed ?? []
   const groundingNotes = analysis.grounding_notes ?? []
   const derivedSections = result.meta.structure_mode === 'derived'
+  const paperCopy = result.document ?? null
+  // section name in the report -> section of the working copy, when it was found there
+  const copySections = new Map((paperCopy?.sections ?? []).filter((s) => s.mapped).map((s) => [s.name, s.id]))
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-8">
@@ -279,6 +283,12 @@ export default function Results(): ReactElement {
           </Panel>
         ) : null}
 
+        {paperCopy || result.document_note ? (
+          <Panel title="Your editable paper" badge="pro" icon="✎">
+            {paperCopy ? <PaperCopyPanel copy={paperCopy} /> : <p className="text-sm text-amber-800">{result.document_note}</p>}
+          </Panel>
+        ) : null}
+
         <Panel title="Citation autopsy" badge="free" icon="⌕">
           <div className="flex flex-wrap gap-2">
             <Chip className="bg-green-50 text-green-700">{result.citations.verified} verified</Chip>
@@ -324,6 +334,8 @@ export default function Results(): ReactElement {
                   section={section}
                   readerMode={readerMode}
                   targetJournal={result.journal.target}
+                  field={analysis.field}
+                  copy={paperCopy && copySections.has(name) ? { documentId: paperCopy.id, sectionId: copySections.get(name) as string } : null}
                 />
               ))}
             </div>
@@ -518,6 +530,72 @@ function Panel({
   )
 }
 
+function PaperCopyPanel({ copy }: { copy: DocumentInfo }): ReactElement {
+  const setDocument = useRejectaStore((state) => state.setDocument)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+
+  const run = async (action: () => Promise<void>): Promise<void> => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      await action()
+    } catch (err: unknown) {
+      setMessage(err instanceof Error ? err.message : 'Something went wrong')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const base = copy.filename.replace(/\.[^.]+$/, '') || 'manuscript'
+  return (
+    <div className="text-sm text-gray-700">
+      <p>
+        Version {copy.version} of <span className="font-medium">{copy.filename}</span> · kept until{' '}
+        {new Date(copy.expires_at).toLocaleString()}
+      </p>
+      <p className="mt-1 text-xs text-gray-500">
+        Use Calibrate on a section below, then “Update in paper” to write the result into this copy.
+      </p>
+      {copy.notes.map((note) => (
+        <p key={note} className="mt-1 text-xs text-gray-500">{note}</p>
+      ))}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => run(() => downloadDocument(copy.id, `${base}-rejecta-v${copy.version}.docx`))}
+          className="rounded bg-stone-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+        >
+          Download paper (.docx)
+        </button>
+        <button
+          type="button"
+          disabled={busy || !copy.can_undo}
+          onClick={() => run(async () => setDocument(await undoDocument(copy.id)))}
+          className="rounded border border-stone-300 px-3 py-1.5 text-xs font-medium text-stone-800 disabled:opacity-40"
+        >
+          Undo last change
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() =>
+            run(async () => {
+              await deleteDocument(copy.id)
+              setDocument(null)
+            })
+          }
+          className="rounded border border-red-200 px-3 py-1.5 text-xs font-medium text-red-700 disabled:opacity-50"
+        >
+          Delete copy now
+        </button>
+      </div>
+      {message ? <p className="mt-2 text-xs text-red-700">{message}</p> : null}
+    </div>
+  )
+}
+
 function Chip({ className, children }: { className: string; children: ReactNode }): ReactElement {
   return <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${className}`}>{children}</span>
 }
@@ -594,17 +672,41 @@ function SectionRow({
   section,
   readerMode,
   targetJournal,
+  field,
+  copy,
 }: {
   name: string
   section: SectionScore
   readerMode: boolean
   targetJournal: string
+  field?: string | null
+  /** The matching section of the working copy, so Calibrate can write the result back into the paper. */
+  copy?: { documentId: string; sectionId: string } | null
 }): ReactElement {
   const navigate = useNavigate()
   const width = Math.min(100, Math.max(0, section.score))
   const [showFix, setShowFix] = useState(false)
+  const [showContent, setShowContent] = useState(false)
 
+  // The section text for the tools is prepared by the server (captions left out, length limited) and passed on as it is.
   const handleCalibrateSection = (): void => {
+    if (section.tool_text) {
+      navigate('/calibrate', {
+        state: {
+          text: section.tool_text,
+          journal: targetJournal,
+          ...(field ? { field } : {}),
+          focus: {
+            section: sectionLabel(name),
+            issue: section.issue ?? section.weakness ?? '',
+            fix: section.fix ?? '',
+          },
+          notes: section.tool_notes ?? [],
+          ...(copy ? { document: copy } : {}),
+        },
+      })
+      return
+    }
     const promptSample = `[${sectionLabel(name)} Section]\nIssue to address: ${section.issue ?? 'Improve scientific register'}\nTarget remediation: ${section.fix ?? 'Align with journal standard'}`
     navigate('/calibrate', {
       state: {
@@ -615,6 +717,17 @@ function SectionRow({
   }
 
   const handleHeatmapSection = (): void => {
+    if (section.tool_text) {
+      navigate('/heatmap', {
+        state: {
+          text: section.tool_text,
+          journal: targetJournal,
+          ...(field ? { field } : {}),
+          notes: section.tool_notes ?? [],
+        },
+      })
+      return
+    }
     const promptSample = `[${sectionLabel(name)} Section]\nIssue to address: ${section.issue ?? 'Analyze sentence rhythm and transition density'}\nRemediation focus: ${section.fix ?? 'Vary sentence length and clarify active agency'}`
     navigate('/heatmap', {
       state: {
@@ -688,6 +801,37 @@ function SectionRow({
           ) : null}
         </div>
       )}
+      {section.content ? (
+        <div className="mt-1.5 sm:pl-[7.5rem]">
+          <button
+            type="button"
+            onClick={() => setShowContent((value) => !value)}
+            aria-expanded={showContent}
+            className="text-xs text-stone-500 underline hover:text-stone-800"
+          >
+            {showContent ? 'Hide content ▴' : 'Show content ▾'}
+          </button>
+          {showContent ? (
+            <div className="mt-1.5 rounded-lg border border-gray-200 bg-gray-50 p-3">
+              <p className="text-xs text-gray-500">
+                {section.word_count != null ? `${section.word_count.toLocaleString()} words` : null}
+                {section.start_pct != null && section.end_pct != null
+                  ? ` · covers ${section.start_pct}%–${section.end_pct}% of the paper`
+                  : null}
+                {section.source === 'derived' ? ' · runs until the next section starts, so the end is approximate' : null}
+              </p>
+              <div className="mt-2 max-h-72 space-y-2 overflow-auto text-xs leading-relaxed text-gray-700">
+                {section.content.split(/\n{2,}/).map((paragraph, index) => (
+                  <p key={index}>{paragraph}</p>
+                ))}
+              </div>
+              {section.content_truncated ? (
+                <p className="mt-2 text-xs text-gray-400">Shortened: only the first part of this section is shown.</p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   )
 }
