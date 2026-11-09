@@ -5,6 +5,7 @@ import type {
   AnalysisPaperResponse,
   HeatmapAnalyzeRequest,
   HeatmapAnalyzeResponse,
+  ArticleType,
   Mode,
   RebuttalAnalyzeRequest,
   RebuttalAnalyzeResponse,
@@ -32,12 +33,14 @@ export async function submitPaper(
   journal: string,
   mode: Mode,
   email: string,
+  articleType: ArticleType | 'auto' = 'auto',
 ): Promise<AnalysisPaperResponse> {
   const form = new FormData()
   form.append('file', file)
   form.append('journal', journal)
   form.append('mode', mode)
   form.append('email', email)
+  form.append('article_type', articleType)
   return tool<AnalysisPaperResponse>('/analyse-paper', { body: form })
 }
 

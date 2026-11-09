@@ -22,11 +22,16 @@ mfa_tokens_consumed = SlidingWindowLimiter(1, 15 * MINUTE)
 # Free unauthenticated tools (/parse, /citations, /journal-match).
 public_per_ip = SlidingWindowLimiter(30, MINUTE)
 
+# Author lookups (ORCID/OpenAlex), per signed-in user. Cached answers are cheap,
+# so the limit is mostly there to stop someone walking the whole ORCID space.
+authors_per_user = SlidingWindowLimiter(60, MINUTE)
+
 # Partner token endpoint.
 oauth_per_ip = SlidingWindowLimiter(30, MINUTE)
 oauth_failures_per_client = SlidingWindowLimiter(10, 15 * MINUTE)
 
 ALL = (
+    authors_per_user,
     oauth_per_ip,
     oauth_failures_per_client,
     public_per_ip,

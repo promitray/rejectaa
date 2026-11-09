@@ -13,7 +13,7 @@ from services.llm.base import AbstractAnalysisProvider, MODE_A
 HF_API_URL_TEMPLATE = "https://api-inference.huggingface.co/models/{model_name}"
 HF_AUTH_HEADER = "Authorization"
 HF_BEARER_PREFIX = "Bearer "
-MAX_NEW_TOKENS = 2500
+MAX_NEW_TOKENS = 3500
 
 
 class HuggingFaceProvider(AbstractAnalysisProvider):

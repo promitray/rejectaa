@@ -56,9 +56,26 @@ class ToneAuditor:
         r"\bwe\s+agree\s+that\s+(?:clarifying|strengthening|expanding)\b",
     ]
 
+    # Stock phrases that make every response read the same (-5 pts each).
+    _BOILERPLATE_PHRASES = [
+        r"\bapologi[sz]e\s+if\s+our\s+original\s+phrasing\b",
+        r"\brefining\s+our\s+empirical\s+evaluations?\b",
+        r"\bwas\s+not\s+sufficiently\s+clear\b",
+    ]
+
+    @staticmethod
+    def _content_words(text: str) -> set[str]:
+        return {w for w in re.findall(r"[a-z][a-z\-]{4,}", text.lower())}
+
     @classmethod
-    def audit(cls, response_text: str) -> ToneAudit:
-        """Audit drafted response text for diplomatic posture and academic decorum."""
+    def audit(cls, response_text: str, reviewer_requests: List[str] | None = None) -> ToneAudit:
+        """Audit drafted response text for diplomatic posture and academic decorum.
+
+        Args:
+            response_text: The drafted author response.
+            reviewer_requests: Concrete asks the reviewer made. When given, a response that
+                actually engages with them scores slightly higher than a generic one.
+        """
         text = response_text.strip()
         if not text:
             return ToneAudit(
@@ -103,6 +120,23 @@ class ToneAuditor:
 
         if diplomatic_hits > 0:
             score += min(12, diplomatic_hits * 6)
+
+        # 4b. Stock phrases that make responses interchangeable
+        for pat in cls._BOILERPLATE_PHRASES:
+            match = re.search(pat, text_lower)
+            if match:
+                flags.append(f"boilerplate_phrase: '{match.group(0)}'")
+                score -= 5
+
+        # 4c. Reward engaging with what the reviewer actually asked for
+        if reviewer_requests:
+            response_words = cls._content_words(text)
+            for request in reviewer_requests:
+                request_words = cls._content_words(request)
+                if request_words and len(request_words & response_words) / len(request_words) >= 0.4:
+                    positive_cues.append(f"addresses_request: {request[:40]}")
+                    score += 5
+                    break
 
         # 5. Length sanity check
         words = len(text.split())

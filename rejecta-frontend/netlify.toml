@@ -4,6 +4,9 @@
 
 [build.environment]
   NODE_VERSION = "20"
+  # Netlify's secrets scan flags any env var value it finds in the repo. VITE_* values are public by design
+  # (Vite inlines them into the browser bundle) and these two are only a URL and a path, not secrets.
+  SECRETS_SCAN_OMIT_KEYS = "VITE_AUTH_BASE,VITE_API_URL"
 
 # Auth routes are proxied to the API so the refresh-token cookie is
 # first-party to this site (the API lives on another domain). Must come

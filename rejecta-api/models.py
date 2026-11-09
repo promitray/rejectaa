@@ -22,6 +22,14 @@ class ParsedDocument(BaseModel):
     sections: dict[str, str]
     references: list[str]
     word_count: int = Field(ge=0)
+    # How the paper was read. All optional so older callers and tests keep working.
+    article_type: str | None = None  # research_article | communication | perspective | review | mini_review
+    article_type_source: str = "none"  # label | user | none
+    structure: str = "none"  # detected | partial | none: how much of the paper sits under real headings
+    coverage: float = 0.0
+    refers_to_si: bool = False  # the paper points to Supporting Information that was not uploaded
+    section_roles: dict[str, str] = Field(default_factory=dict)  # section key -> role
+    body: str = Field(default="", exclude=True)  # cleaned body text, used when headings are missing
 
 
 class PublicationType(str, Enum):
@@ -50,6 +58,8 @@ class CitationResult(BaseModel):
     confidence_score: float = Field(ge=0.0, le=1.0, default=1.0)
     diagnostic_reason: str = ""
     suggested_action: str | None = None
+    # True when a lookup service was busy or unreachable, so the reference was NOT actually checked.
+    check_incomplete: bool = False
 
 
 class CitationSummary(BaseModel):
@@ -58,6 +68,8 @@ class CitationSummary(BaseModel):
     verified: int = Field(ge=0)
     ghost: int = Field(ge=0)
     unverified: int = Field(ge=0)
+    # Subset of `unverified` that could not be checked (service busy), as opposed to "not found".
+    check_incomplete: int = Field(default=0, ge=0)
     total: int = Field(ge=0)
     preprint_count: int = Field(default=0, ge=0)
     peer_reviewed_count: int = Field(default=0, ge=0)
@@ -115,6 +127,8 @@ class SectionScore(BaseModel):
     fix: str | None = None
     strength: str | None = None
     weakness: str | None = None
+    source: str | None = None  # "detected" (a heading in the file) or "derived" (found from the content)
+    anchor: str | None = None  # exact words from the paper where a derived section begins
 
     @field_validator("score", mode="before")
     @classmethod
@@ -135,6 +149,13 @@ class RejectionReason(BaseModel):
     reason: str = "Unspecified issue"
     severity: Severity = Severity.major
     fix: str = ""
+    # The four parts of a reason. `reason` repeats the problem and `fix` the solution, for older clients.
+    problem: str = ""
+    evidence: str = ""  # words from the manuscript this reason is about; checked against the paper
+    location: str = ""  # section and nearby figure of the evidence, worked out by code
+    impact_area: str = ""  # novelty | scientific_validity | publication_potential
+    impact: str = ""
+    solution: str = ""
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -143,6 +164,15 @@ class RejectionReason(BaseModel):
         if isinstance(value, str) and value in {item.value for item in Severity}:
             return value
         return Severity.major.value
+
+
+class CriterionScore(BaseModel):
+    """One scored criterion. The overall score is a weighted mean of these."""
+
+    score: int = Field(ge=0, le=100)
+    reason: str = ""
+    weight: float = 0.0
+    computed: bool = False  # True when the code computed it (citation integrity), not the model
 
 
 class AnalysisResult(BaseModel):
@@ -157,6 +187,10 @@ class AnalysisResult(BaseModel):
     novelty_assessment: str
     journal_fit: str
     provider_used: str
+    paper_format: str | None = None  # article type the analysis used
+    criteria: dict[str, CriterionScore] = Field(default_factory=dict)
+    not_assessed: list[str] = Field(default_factory=list)  # things the file did not let us judge
+    grounding_notes: list[str] = Field(default_factory=list)  # model claims that were removed or flagged
 
     @field_validator("mood", mode="before")
     @classmethod
@@ -187,6 +221,8 @@ class PaperMeta(BaseModel):
     references_found: int = Field(ge=0)
     mode: str
     processing_ms: int = Field(ge=0)
+    article_type: str | None = None
+    structure_mode: str | None = None  # "detected" headings or "derived" from the content
 
 
 class AnalysisPaperResponse(BaseModel):
@@ -270,7 +306,7 @@ class RebuttalAnalyzeRequest(BaseModel):
 
     reviewer_report_text: str = Field(..., min_length=20, max_length=25000, description="Raw reviewer comments or editorial critique text.")
     manuscript_context: str | None = Field(default=None, description="Optional key findings, methods, data the author can cite.")
-    journal: str = Field(default="Nature Machine Intelligence", description="Target journal name.")
+    journal: str | None = Field(default=None, description="Target journal name. Optional; no default is assumed.")
     author_tone: Literal["collaborative", "diplomatic_firm", "formal_rigorous"] = Field(
         default="collaborative", description="Preferred diplomatic stance tone."
     )
