@@ -19,6 +19,9 @@ MAX_NEW_TOKENS = 3500
 class HuggingFaceProvider(AbstractAnalysisProvider):
     """Analysis provider using HuggingFace hosted or local models."""
 
+    # Small open models have short context windows; the paper is cut to fit and the model is told so.
+    body_budget_chars = 26_000
+
     def __init__(
         self,
         model_name: str,

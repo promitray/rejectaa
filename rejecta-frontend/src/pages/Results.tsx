@@ -1,10 +1,19 @@
 import type { ReactElement, ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { deleteDocument, downloadDocument, undoDocument } from '../api'
+import { deleteDocument, downloadDocument, submitPaper, undoDocument } from '../api'
 import Frowns from '../components/Frowns'
 import { useRejectaStore } from '../store'
-import type { CitationResult, CitationStatus, DocumentInfo, Mood, RejectionReason, SectionScore } from '../types'
+import type {
+  CitationResult,
+  CitationStatus,
+  DocumentInfo,
+  Mood,
+  RejectionReason,
+  RevisionComparison,
+  ScoreChange,
+  SectionScore,
+} from '../types'
 
 const VISIBLE_CITATIONS = 10
 
@@ -74,6 +83,7 @@ const ARTICLE_TYPE_LABEL: Record<string, string> = {
   perspective: 'Perspective',
   review: 'Review article',
   mini_review: 'Mini-review',
+  editorial: 'Editorial',
 }
 
 const IMPACT_AREA_LABEL: Record<string, string> = {
@@ -91,6 +101,8 @@ const CRITERION_LABEL: Record<string, string> = {
   coverage_balance: 'Coverage & balance',
   critical_synthesis: 'Critical synthesis',
   outlook: 'Outlook',
+  purpose: 'Purpose',
+  context_accuracy: 'Context & accuracy',
   citation_integrity: 'Citation integrity',
 }
 
@@ -128,6 +140,24 @@ export default function Results(): ReactElement {
   const navigate = useNavigate()
   const result = useRejectaStore((state) => state.result)
   const reset = useRejectaStore((state) => state.reset)
+  const lastSubmission = useRejectaStore((state) => state.lastSubmission)
+  const [rerunning, setRerunning] = useState(false)
+  const [rerunError, setRerunError] = useState<string | null>(null)
+
+  // "Run again": the same file and settings, analysed afresh instead of returning the earlier report.
+  const runAgain = (): void => {
+    if (!lastSubmission || rerunning) return
+    const { file, journal, mode, email, articleType, keepCopy } = lastSubmission
+    setRerunning(true)
+    setRerunError(null)
+    submitPaper(file, journal, mode, email, articleType, keepCopy, true)
+      .then((data) => {
+        useRejectaStore.getState().setResult(data)
+        window.scrollTo({ top: 0 })
+      })
+      .catch((err: unknown) => setRerunError(err instanceof Error ? err.message : 'Analysis failed — please try again'))
+      .finally(() => setRerunning(false))
+  }
 
   useEffect(() => {
     if (!result) {
@@ -170,7 +200,31 @@ export default function Results(): ReactElement {
           </div>
           <ScoreRing score={analysis.mood_score} />
         </div>
+        {result.meta.cached || lastSubmission ? (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-gray-100 pt-3">
+            <p className="text-xs text-gray-500">
+              {result.meta.cached
+                ? `You analysed this exact file with the same settings${formatWhen(result.meta.analysed_at)}. This is that report, so the same file always gets the same result.`
+                : result.meta.analysed_at
+                  ? `Analysed${formatWhen(result.meta.analysed_at)}.`
+                  : null}
+            </p>
+            {lastSubmission ? (
+              <button
+                type="button"
+                onClick={runAgain}
+                disabled={rerunning}
+                className="shrink-0 rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-100 transition disabled:opacity-50"
+              >
+                {rerunning ? 'Analysing again…' : '↻ Run again'}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {rerunError ? <p className="mt-2 text-xs text-red-700">{rerunError}</p> : null}
       </section>
+
+      {result.revision ? <RevisionPanel revision={result.revision} /> : null}
 
       {/* Voice Calibrator Quick Action Callout */}
       <div className="mt-4 flex items-center justify-between rounded-xl border border-stone-200 bg-stone-50 p-4">
@@ -356,6 +410,13 @@ export default function Results(): ReactElement {
                   key={`${item.severity}-${index}`}
                   item={item}
                   targetJournal={result.journal.target}
+                  field={analysis.field}
+                  sectionText={item.section ? analysis.sections[item.section]?.tool_text : null}
+                  copy={
+                    paperCopy && item.section && copySections.has(item.section)
+                      ? { documentId: paperCopy.id, sectionId: copySections.get(item.section) as string }
+                      : null
+                  }
                 />
               ))}
             </div>
@@ -371,10 +432,19 @@ export default function Results(): ReactElement {
             <p className="text-sm font-medium text-gray-900">
               {result.journal.openalex_name ?? result.journal.target}
             </p>
-            <Chip className={result.journal.found ? 'bg-green-50 text-green-700' : 'bg-gray-100 text-gray-600'}>
-              {result.journal.found ? 'found' : 'not found'}
+            <Chip
+              className={
+                !result.journal.found
+                  ? 'bg-gray-100 text-gray-600'
+                  : result.journal.match_quality === 'approximate'
+                    ? 'bg-amber-50 text-amber-800'
+                    : 'bg-green-50 text-green-700'
+              }
+            >
+              {!result.journal.found ? 'not found' : result.journal.match_quality === 'approximate' ? 'closest match' : 'found'}
             </Chip>
           </div>
+          {result.journal.note ? <p className="mt-2 text-sm text-amber-800">{result.journal.note}</p> : null}
           {result.journal.found ? (
             <div className="mt-3">
               {typeof result.journal.works_count === 'number' ? (
@@ -836,22 +906,144 @@ function SectionRow({
   )
 }
 
+function formatWhen(iso?: string | null): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? '' : ` on ${date.toLocaleString()}`
+}
+
+const ISSUE_STATUS: Record<string, { label: string; className: string }> = {
+  resolved: { label: 'Resolved', className: 'bg-green-50 text-green-700' },
+  partly_resolved: { label: 'Partly resolved', className: 'bg-amber-50 text-amber-800' },
+  open: { label: 'Still open', className: 'bg-red-50 text-red-700' },
+  not_assessed: { label: 'Not assessed', className: 'bg-gray-100 text-gray-600' },
+}
+
+function Delta({ before, after }: { before: number | null; after: number | null }): ReactElement {
+  if (before == null || after == null) {
+    return <span className="text-xs text-gray-400">{before == null ? 'new' : 'not in this version'}</span>
+  }
+  const change = after - before
+  const tone = change > 0 ? 'text-green-700' : change < 0 ? 'text-red-700' : 'text-gray-500'
+  return (
+    <span className="text-xs tabular-nums text-gray-700">
+      {before} → {after}{' '}
+      <span className={tone}>({change > 0 ? '+' : ''}{change})</span>
+    </span>
+  )
+}
+
+function ChangeList({ title, items, labels }: { title: string; items: ScoreChange[]; labels?: Record<string, string> }): ReactElement | null {
+  if (items.length === 0) return null
+  return (
+    <div className="mt-3">
+      <p className="text-[10px] font-bold uppercase tracking-wide text-gray-500">{title}</p>
+      <ul className="mt-1 space-y-1">
+        {items.map((item) => (
+          <li key={item.name} className="flex items-center justify-between gap-3 text-sm">
+            <span className="text-gray-800">{labels?.[item.name] ?? sectionLabel(item.name)}</span>
+            <Delta before={item.before} after={item.after} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function RevisionPanel({ revision }: { revision: RevisionComparison }): ReactElement {
+  const resolved = revision.issues.filter((issue) => issue.status === 'resolved').length
+  return (
+    <section className="mt-4 rounded-xl border border-sky-200 bg-sky-50/40 p-5">
+      <p className="text-xs font-semibold uppercase tracking-wider text-sky-900">
+        {revision.same_file ? 'Same file as before' : 'Revised version recognised'}
+      </p>
+      <p className="mt-1 text-sm text-gray-700">
+        {revision.same_file
+          ? `You analysed this same file${formatWhen(revision.previous_analysed_at)}. Differences below come from the analysis itself, not from your paper.`
+          : `This looks like a new version of “${revision.previous_filename}”, analysed${formatWhen(revision.previous_analysed_at)} (about ${Math.round(revision.similarity * 100)}% of the text is unchanged).`}
+      </p>
+      {!revision.same_journal ? (
+        <p className="mt-1 text-xs text-amber-800">
+          The earlier analysis was for {revision.previous_journal}, so the scores were judged against a different journal.
+        </p>
+      ) : null}
+      <div className="mt-3 flex items-center justify-between rounded-lg bg-white px-3 py-2">
+        <span className="text-sm font-medium text-gray-900">Overall score</span>
+        <Delta before={revision.score_before} after={revision.score_after} />
+      </div>
+      <ChangeList title="Criteria" items={revision.criteria} labels={CRITERION_LABEL} />
+      <ChangeList title="Sections" items={revision.sections} />
+      {revision.issues.length > 0 ? (
+        <div className="mt-3">
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-500">
+            Issues raised last time · {resolved} of {revision.issues.length} resolved
+          </p>
+          <ul className="mt-1 space-y-2">
+            {revision.issues.map((issue, index) => {
+              const status = ISSUE_STATUS[issue.status] ?? ISSUE_STATUS.not_assessed
+              return (
+                <li key={index} className="rounded-lg border border-gray-200 bg-white p-2.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-sm text-gray-800">{issue.problem}</p>
+                    <Chip className={status.className}>{status.label}</Chip>
+                  </div>
+                  {issue.note ? <p className="mt-1 text-xs text-gray-500">{issue.note}</p> : null}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
 function ReasonCard({
   item,
   targetJournal,
+  field,
+  sectionText,
+  copy,
 }: {
   item: RejectionReason
   targetJournal: string
+  field?: string | null
+  /** The whole section's tool text, used when the server found no paragraphs around the evidence. */
+  sectionText?: string | null
+  /** The section of the working copy the evidence sits in, so the fix can be written back into the paper. */
+  copy?: { documentId: string; sectionId: string } | null
 }): ReactElement {
   const navigate = useNavigate()
   const style = SEVERITY_STYLE[item.severity]
 
+  // The text of the manuscript the reason is about goes to the Calibrator, with the reason as its focus.
   const handleFixReason = (): void => {
-    const promptText = `[Addressing Rejection Risk: ${item.reason}]\nRequired Remediation: ${item.fix}\nTask: Rephrase and strengthen manuscript evidence according to this directive.`
+    const text = item.tool_text || sectionText
+    const focus = {
+      section: item.section ? sectionLabel(item.section) : 'Passage under review',
+      issue: item.problem || item.reason,
+      fix: item.solution || item.fix,
+    }
+    if (text || copy) {
+      navigate('/calibrate', {
+        state: {
+          text: text ?? '',
+          journal: targetJournal,
+          ...(field ? { field } : {}),
+          focus,
+          notes: item.tool_text ? item.tool_notes ?? [] : [],
+          ...(copy ? { document: copy, ...(item.evidence ? { evidence: item.evidence } : {}) } : {}),
+        },
+      })
+      return
+    }
+    // Neither the paragraphs nor the section could be found: start from the quoted passage itself.
     navigate('/calibrate', {
       state: {
-        text: promptText,
+        text: item.evidence ?? '',
         journal: targetJournal,
+        ...(field ? { field } : {}),
+        focus,
       },
     })
   }

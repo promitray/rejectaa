@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     # Free key from openalex.org. Without it OpenAlex throttles anonymous search heavily.
     OPENALEX_API_KEY: str = ""
-    OPENAI_MODEL: str = "gpt-4o"
+    # A dated snapshot, so the model (and its scores) cannot change underneath us. "gpt-4o" moves.
+    OPENAI_MODEL: str = "gpt-4o-2024-08-06"
     HF_MODEL_NAME: str = "mistralai/Mistral-7B-Instruct-v0.3"
     HF_API_TOKEN: str = ""
     HF_USE_LOCAL: bool = False
@@ -53,6 +54,10 @@ class Settings(BaseSettings):
     CALIBRATOR_MEANING_CHECK: bool = True
     # Abstract Forge: one extra model call compares the three versions with the draft for meaning.
     FORGE_MEANING_CHECK: bool = True
+    # Paper analysis: characters of manuscript text the model gets. 200k (about 50k tokens) fits nearly
+    # every paper whole. Lower it only if the model's per-minute token limit is too small; a cut paper is
+    # judged on what was cut out.
+    ANALYSIS_BODY_BUDGET_CHARS: int = 200_000
 
     # Database (Supabase Postgres, schema "app").
     # DATABASE_URL: runtime connection as the least-privilege role rejecta_api.

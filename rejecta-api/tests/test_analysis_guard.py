@@ -11,7 +11,8 @@ from services.analysis_guard import (
     mood_for_score,
     paper_context,
 )
-from services.llm.base import AbstractAnalysisProvider, BODY_BUDGET_CHARS, MAX_USER_MESSAGE_CHARS
+from config import settings
+from services.llm.base import MESSAGE_OVERHEAD_CHARS, AbstractAnalysisProvider
 
 PAPER = (
     "We pioneer a self-reporting profluorescent release system driven by the thermo-reversible dynamic "
@@ -80,34 +81,62 @@ def test_derived_sections_are_kept_in_paper_order_when_the_anchor_is_in_the_pape
     out = run(
         payload(
             sections=[
-                derived("Release", "Heating above 80 degrees released the reporter"),
-                derived("Design", "The design and synthesis of self-reporting delivery systems"),
+                derived("Results and discussion", "Heating above 80 degrees released the reporter"),
+                derived("Introduction", "The design and synthesis of self-reporting delivery systems", role="introduction"),
             ]
         ),
         make_ctx(),
     )
-    assert list(out["sections"]) == ["Design", "Release"]  # sorted by where they start in the paper
-    assert out["sections"]["Design"]["source"] == "derived"
+    assert list(out["sections"]) == ["Introduction", "Results and discussion"]  # sorted by where they start
+    assert out["sections"]["Introduction"]["source"] == "derived"
+
+
+def test_derived_section_names_come_from_the_fixed_list_not_from_the_model() -> None:
+    out = run(
+        payload(
+            sections=[
+                derived("Design and motivation", "The design and synthesis of self-reporting delivery systems", role="introduction"),
+                derived("Thermal release studies", "Heating above 80 degrees released the reporter", role="results"),
+                derived("Concluding remarks", "In conclusion the platform holds potential for imaging", role="discussion"),
+            ]
+        ),
+        make_ctx(),
+    )
+    assert list(out["sections"]) == ["Introduction", "Results and discussion", "Conclusion"]
+
+
+def test_two_derived_parts_with_the_same_name_keep_the_first_one() -> None:
+    out = run(
+        payload(
+            sections=[
+                derived("Results", "Heating above 80 degrees released the reporter"),
+                derived("Discussion of results", "The polymer was obtained with a molar mass of"),
+            ]
+        ),
+        make_ctx(),
+    )
+    assert list(out["sections"]) == ["Results and discussion"]
+    assert out["sections"]["Results and discussion"]["anchor"].startswith("The polymer was obtained")
 
 
 def test_derived_section_with_an_invented_anchor_is_removed_and_reported() -> None:
     out = run(
         payload(
             sections=[
-                derived("Design", "The design and synthesis of self-reporting delivery systems"),
+                derived("Design", "The design and synthesis of self-reporting delivery systems", role="introduction"),
                 derived("Toxicity", "Cell viability was measured by an MTT assay in HeLa cells"),
             ]
         ),
         make_ctx(),
     )
-    assert list(out["sections"]) == ["Design"]
+    assert list(out["sections"]) == ["Introduction"]
     assert any("Toxicity" in note for note in out["grounding_notes"])
 
 
 def test_anchor_matches_across_hyphen_breaks_and_ligatures() -> None:
     ctx = make_ctx(source_text="self-reporting ﬂuorescence is silenced by unpaired spins of nitroxide moieties.")
     out = run(payload(sections=[derived("Quenching", "self reporting fluorescence is silenced by unpaired spins")]), ctx)
-    assert "Quenching" in out["sections"]
+    assert "Results and discussion" in out["sections"]
 
 
 def test_detected_sections_must_be_ones_the_parser_found() -> None:
@@ -197,10 +226,18 @@ def test_overall_score_is_the_weighted_mean_of_criteria_with_a_computed_citation
     assert out["mood"] == "delighted"
 
 
-def test_citation_criterion_counts_only_checked_references_and_penalises_ghosts() -> None:
+def test_citation_criterion_penalises_ghosts_only() -> None:
     ctx = make_ctx(citations_total=10, citations_verified=6, citations_unchecked=2, citations_ghost=1)
     out = run(payload(), ctx)
-    assert out["criteria"][pp.CITATION_CRITERION]["score"] == 65  # 6 of 8 checked = 75, minus 10 for one ghost
+    assert out["criteria"][pp.CITATION_CRITERION]["score"] == 85  # 15 points for one ghost
+    many = run(payload(), make_ctx(citations_total=10, citations_verified=0, citations_ghost=6))
+    assert many["criteria"][pp.CITATION_CRITERION]["score"] == 40  # the penalty is capped at 60
+
+
+def test_references_the_databases_do_not_know_cost_nothing() -> None:
+    ctx = make_ctx(citations_total=5, citations_verified=1, citations_unchecked=0, citations_ghost=0)
+    out = run(payload(), ctx)
+    assert out["criteria"][pp.CITATION_CRITERION]["score"] == 100
 
 
 def test_no_citation_criterion_when_nothing_could_be_checked() -> None:
@@ -279,14 +316,35 @@ def test_prompt_for_unknown_type_offers_both_criteria_sets() -> None:
 
 
 def test_a_huge_body_is_trimmed_but_the_citation_summary_and_journal_data_are_kept() -> None:
-    huge = "word " * 40000
+    budget = settings.ANALYSIS_BODY_BUDGET_CHARS
+    huge = "word " * (budget // 5 + 20000)
     ctx = make_ctx(body=huge, source_text=huge)
     with paper_context(ctx):
         message = _Provider().build_user_message("abstract", {}, "J", "CITATION-SUMMARY-MARKER", {"x": "JOURNAL-MARKER"})
-    assert len(message) <= MAX_USER_MESSAGE_CHARS
+    assert len(message) <= budget + MESSAGE_OVERHEAD_CHARS
     assert "CITATION-SUMMARY-MARKER" in message and "JOURNAL-MARKER" in message
     assert "text omitted" in message
-    assert BODY_BUDGET_CHARS < len(huge)
+    assert "Never treat content you were not shown as missing" in message
+
+
+def test_a_typical_long_paper_is_sent_whole() -> None:
+    body = "The polythioester was made by ring-opening polymerization. " * 1000  # about 60k characters
+    ctx = make_ctx(body=body, source_text=body)
+    with paper_context(ctx):
+        message = _Provider().build_user_message("abstract", {}, "J", "c", {})
+    assert body.strip() in message
+    assert "text omitted" not in message
+
+
+def test_a_provider_with_a_small_context_cuts_the_paper_and_says_so() -> None:
+    class Small(_Provider):
+        body_budget_chars = 26_000
+
+    body = "word " * 20000
+    ctx = make_ctx(body=body, source_text=body)
+    with paper_context(ctx):
+        message = Small().build_user_message("abstract", {}, "J", "c", {})
+    assert len(message) < 26_000 + MESSAGE_OVERHEAD_CHARS and "text omitted" in message
 
 
 def test_without_a_context_the_message_is_still_built() -> None:
@@ -344,7 +402,7 @@ def test_a_complete_reason_is_kept_with_a_location_found_by_code() -> None:
     assert item["reason"] == item["problem"] and item["fix"] == item["solution"]  # older clients keep working
     assert item["impact_area"] == "scientific_validity"
     assert item["evidence"] == REAL_EVIDENCE
-    assert "section: Release" in item["location"]  # worked out from where the evidence sits, not asked of the model
+    assert "section: Results and discussion" in item["location"]  # worked out from where the evidence sits, not asked of the model
 
 
 def test_the_location_names_the_figure_next_to_the_evidence() -> None:
@@ -449,11 +507,13 @@ def content_ctx(**overrides: Any) -> AnalysisContext:
 def test_a_derived_section_runs_from_its_anchor_to_where_the_next_one_starts() -> None:
     sections = [
         derived("Background", "The design and synthesis of self-reporting delivery systems"),
-        derived("Synthesis", "The polymer was obtained by radical copolymerisation"),
+        derived("Synthesis", "The polymer was obtained by radical copolymerisation", role="methods"),
         derived("Release", "Heating above 80 degrees released the reporter within minutes"),
     ]
     out = run(payload(sections=sections), content_ctx())
-    background, synthesis, release = (out["sections"][n] for n in ("Background", "Synthesis", "Release"))
+    background, synthesis, release = (
+        out["sections"][n] for n in ("Introduction", "Experimental", "Results and discussion")
+    )
     assert background["content"] == INTRO
     assert synthesis["content"] == SYNTH
     assert release["content"] == RELEASE + "\n\n" + CONCL  # the last section runs to the end of the body
@@ -464,15 +524,15 @@ def test_a_derived_section_runs_from_its_anchor_to_where_the_next_one_starts() -
 
 def test_the_text_before_the_first_section_title_and_abstract_is_not_part_of_a_section() -> None:
     out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx())
-    assert "title line" not in out["sections"]["Background"]["content"]
-    assert ABSTRACT_TEXT not in out["sections"]["Background"]["content"]
+    assert "title line" not in out["sections"]["Introduction"]["content"]
+    assert ABSTRACT_TEXT not in out["sections"]["Introduction"]["content"]
 
 
 def test_an_anchor_that_is_also_in_the_abstract_is_taken_from_the_text_after_it() -> None:
     body = "\n\n".join(["Title", ABSTRACT_TEXT, "Intro: " + ABSTRACT_TEXT + " More text of the introduction follows."])
     out = run(payload(sections=[derived("Intro", "We pioneer a self-reporting release system driven by dynamic covalent")]), content_ctx(source_text=body, body=body))
-    assert out["sections"]["Intro"]["content"].startswith("We pioneer")
-    assert out["sections"]["Intro"]["start_pct"] > 20  # not the abstract at the top
+    assert out["sections"]["Introduction"]["content"].startswith("We pioneer")
+    assert out["sections"]["Introduction"]["start_pct"] > 20  # not the abstract at the top
 
 
 def test_two_sections_with_the_same_start_do_not_both_get_text() -> None:
@@ -485,7 +545,7 @@ def test_very_long_content_is_shortened_and_flagged_but_the_word_count_is_the_re
     long_text = "word " * 5000
     body = "\n\n".join(["Title", ABSTRACT_TEXT, INTRO + " " + long_text])
     out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx(source_text=body, body=body))
-    section = out["sections"]["Background"]
+    section = out["sections"]["Introduction"]
     assert section["content_truncated"] is True and len(section["content"]) <= 12002
     assert section["word_count"] > 5000
 
@@ -493,8 +553,8 @@ def test_very_long_content_is_shortened_and_flagged_but_the_word_count_is_the_re
 def test_a_section_whose_anchor_is_not_in_the_body_keeps_its_score_but_has_no_content() -> None:
     ctx = content_ctx(body="Only a short body without the anchor sentence in it at all.")
     out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), ctx)
-    assert out["sections"]["Background"]["score"] == 60
-    assert out["sections"]["Background"].get("content") is None
+    assert out["sections"]["Introduction"]["score"] == 60
+    assert out["sections"]["Introduction"].get("content") is None
 
 
 def test_detected_sections_carry_the_text_the_parser_found_under_the_heading() -> None:
@@ -512,4 +572,4 @@ def test_detected_sections_carry_the_text_the_parser_found_under_the_heading() -
 
 def test_without_a_body_there_is_no_content() -> None:
     out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx(body=""))
-    assert out["sections"]["Background"].get("content") is None
+    assert out["sections"]["Introduction"].get("content") is None

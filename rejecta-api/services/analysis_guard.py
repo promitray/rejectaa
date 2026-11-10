@@ -29,6 +29,8 @@ ANCHOR_PREFIX_CHARS = 24
 MAX_GROUNDING_NOTES = 8
 MISSING_METHODS_PENALTY = 8  # research article with no Experimental/Methods section in the file
 SI_PENALTY = 5  # most a missing Supporting Information can cost; it is the upload's limit, not a flaw
+GHOST_PENALTY = 15  # citation integrity lost per reference that cannot exist
+MAX_GHOST_PENALTY = 60
 UNVERIFIED_QUOTE = "[unverified quote removed]"
 
 # Mood bands, the same ones the prompt gives the model.
@@ -79,6 +81,9 @@ class AnalysisContext:
     citations_unchecked: int = 0
     extra_text: str = ""  # citation summary and journal data: numbers there are legitimate
     numbers_text: str = ""  # text whose numbers count as "in the paper" (the body, not the reference list)
+    parse_warnings: list[str] = field(default_factory=list)  # what the parser could not read
+    # A revision: the issues raised on the earlier version, as [{"id", "severity", "problem"}].
+    previous_issues: list[dict[str, Any]] = field(default_factory=list)
     corpus: str = field(init=False, default="")
     norm_text: str = field(init=False, default="")  # the paper, Unicode-normalised
     corpus_index: list[int] = field(init=False, default_factory=list)  # corpus position -> position in norm_text
@@ -335,6 +340,61 @@ def _tool_text(content: str) -> tuple[str | None, list[str]]:
     return (text if len(text) >= 20 else None), notes
 
 
+def _evidence_window(content: str, evidence: str) -> tuple[str | None, list[str]]:
+    """The paragraph holding `evidence` and its neighbours, for Calibrate: captions left out, at most
+    TOOL_TEXT_CHARS, the evidence paragraph first, then the ones after it, then the ones before it."""
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", content) if p.strip()]
+    prose = [p for p in paragraphs if not (_CAPTION.match(p) and len(p) <= MAX_CAPTION_CHARS)]
+    wanted = alnum(evidence)[:ANCHOR_PREFIX_CHARS * 2]
+    hit = next((i for i, p in enumerate(prose) if wanted and wanted in alnum(p)), None)
+    if hit is None:
+        return None, []
+    chosen = {hit}
+    used = len(prose[hit])
+    after, before = hit + 1, hit - 1
+    while after < len(prose) or before >= 0:
+        for index in (after, before):
+            if 0 <= index < len(prose) and index not in chosen and used + len(prose[index]) + 2 <= TOOL_TEXT_CHARS:
+                chosen.add(index)
+                used += len(prose[index]) + 2
+        after, before = after + 1, before - 1
+        if used >= TOOL_TEXT_CHARS:
+            break
+    text = "\n\n".join(prose[i] for i in sorted(chosen))
+    if len(text) > TOOL_TEXT_CHARS:  # the evidence paragraph alone is too long
+        text = text[:TOOL_TEXT_CHARS].rsplit(" ", 1)[0] + " …"
+    notes = []
+    if len(chosen) < len(prose):
+        notes.append(f"Only the {len(chosen)} paragraph(s) around the passage this reason is about are sent.")
+    return (text if len(text) >= 20 else None), notes
+
+
+def _attach_reason_text(ctx: AnalysisContext, sections: dict[str, dict[str, Any]], reasons: list[dict[str, Any]]) -> None:
+    """For each rejection reason: the section its evidence sits in and the paragraphs around the evidence."""
+    total = len(ctx.body_corpus)
+    spans = _section_spans(ctx, sections) if total else {}
+    for reason in reasons:
+        evidence = reason.get("evidence", "")
+        position = _find_in_body(evidence, ctx) if total else -1
+        name = next((n for n, (start, end) in spans.items() if start <= position < end), "") if position >= 0 else ""
+        content = ""
+        if name:
+            if ctx.structure_mode == "derived":
+                start, end = spans[name]
+                stop = ctx.body_index[end] if end < total else len(ctx.body_norm)
+                content = ctx.body_norm[ctx.body_index[start] : stop]
+            else:
+                content = ctx.section_texts.get(name, "")
+        elif position >= 0:
+            content = ctx.body_norm
+        elif alnum(evidence) and alnum(evidence)[:ANCHOR_PREFIX_CHARS] in alnum(ctx.abstract):
+            content = ctx.abstract
+        tool_text, notes = _evidence_window(content, evidence) if content else (None, [])
+        reason["section"] = name
+        reason["tool_text"] = tool_text
+        reason["tool_notes"] = notes
+
+
 def _clean_field(value: Any) -> str | None:
     """A short plain name for the paper's field, or None. It ends up in the tools' prompts, so it is kept simple."""
     text = re.sub(r"\s+", " ", str(value or "")).strip(" .")
@@ -420,17 +480,25 @@ def _attach_content(ctx: AnalysisContext, sections: dict[str, dict[str, Any]]) -
         )
 
 
-def _clean_sections(raw: Any, ctx: AnalysisContext | None, notes: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Valid sections keyed by name, and the roles they have."""
-    kept: list[tuple[int, str, dict[str, Any]]] = []  # (position in paper, name, fields)
-    seen: set[str] = set()
-    roles: list[str] = []
+MAX_SECTION_NAME_CHARS = 120  # a paper's own numbered headings can be long
+
+
+def _clean_sections(
+    raw: Any, ctx: AnalysisContext | None, notes: list[str], article_type: str | None = None
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Valid sections keyed by name, and the roles they have.
+
+    Names never come from the model's imagination: a detected section keeps its heading from the file, and
+    a section of a paper without headings is filed under a fixed name (Introduction, Experimental, Results
+    and discussion, Conclusion...), so the same paper always gets the same sections.
+    """
+    kept: list[tuple[int, str, dict[str, Any], str]] = []  # (position in paper, name, fields, role)
     detected_keys = {_key(k): k for k in (ctx.section_texts if ctx else {})}
 
     for entry in _section_entries(raw):
         name = re.sub(r"\s+", " ", entry["name"]).strip(" .:-")
         score = _to_score(entry.get("score"))
-        if not (2 <= len(name) <= 48) or score is None:
+        if not (2 <= len(name) <= MAX_SECTION_NAME_CHARS) or score is None:
             continue
         role = str(entry.get("role", "other")).lower()
         role = role if role in pp.ALL_ROLES else "other"
@@ -446,7 +514,7 @@ def _clean_sections(raw: Any, ctx: AnalysisContext | None, notes: list[str]) -> 
                 continue
             fields["source"] = "derived"
             fields["anchor"] = anchor[:200]
-            key_name = name
+            key_name, role = pp.canonical_section_name(name, role, article_type)
         elif ctx is not None:
             match = detected_keys.get(_key(name))
             if match is None:
@@ -457,16 +525,18 @@ def _clean_sections(raw: Any, ctx: AnalysisContext | None, notes: list[str]) -> 
             role = ctx.section_roles.get(match, role)
         else:
             key_name = name
-
-        if _key(key_name) in seen:
-            continue
-        seen.add(_key(key_name))
-        roles.append(role)
-        kept.append((position, key_name, fields))
+        kept.append((position, key_name, fields, role))
 
     if ctx is not None and ctx.structure_mode == "derived":
-        kept.sort(key=lambda item: item[0])  # reading order of the paper
-    return {name: fields for _, name, fields in kept[:MAX_SECTIONS]}, roles[:MAX_SECTIONS]
+        kept.sort(key=lambda item: item[0])  # reading order: a name used twice keeps its first place
+    unique: list[tuple[int, str, dict[str, Any], str]] = []
+    seen: set[str] = set()
+    for item in kept:
+        if _key(item[1]) not in seen:
+            seen.add(_key(item[1]))
+            unique.append(item)
+    unique = unique[:MAX_SECTIONS]
+    return {name: fields for _, name, fields, _ in unique}, [role for *_, role in unique]
 
 
 # --------------------------------------------------------------------------- criteria and score
@@ -489,14 +559,21 @@ def _criteria_from_model(raw: Any, profile: pp.Profile) -> dict[str, dict[str, A
 
 
 def _citation_criterion(ctx: AnalysisContext) -> dict[str, Any] | None:
-    """Reference integrity from the citation check. Skipped when nothing could be checked."""
+    """Reference integrity from the citation check. Skipped when nothing could be checked.
+
+    Only ghost references (a DOI or arXiv id that does not exist) cost points. A reference the databases
+    have no record of is not evidence of anything: books, reports, theses and older or regional work are
+    often missing from them, so counting it would mark down papers for citing them.
+    """
     checked = ctx.citations_total - ctx.citations_unchecked
     if ctx.citations_total <= 0 or checked <= 0:
         return None
-    score = round(100 * ctx.citations_verified / checked) - min(40, 10 * ctx.citations_ghost)
+    score = 100 - min(MAX_GHOST_PENALTY, GHOST_PENALTY * ctx.citations_ghost)
     reason = f"{ctx.citations_verified} of {checked} checked references verified"
     if ctx.citations_ghost:
         reason += f"; {ctx.citations_ghost} could not exist (ghost)"
+    else:
+        reason += "; none that could not exist"
     return {
         "score": max(0, min(100, score)),
         "reason": reason + ".",
@@ -520,11 +597,37 @@ def _text_fields(payload: dict[str, Any]) -> Iterator[tuple[dict[str, Any], str]
             yield container, "reason"
 
 
+ISSUE_STATUSES = ("resolved", "partly_resolved", "open")
+MAX_ISSUE_NOTE_CHARS = 400
+
+
+def _previous_issue_statuses(raw: Any, ctx: AnalysisContext) -> list[dict[str, Any]]:
+    """The model's verdict on each earlier issue: only issues that exist, only the three statuses, once each."""
+    known = {item["id"] for item in ctx.previous_issues}
+    out: dict[int, dict[str, Any]] = {}
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        status = str(item.get("status", "")).strip().lower().replace(" ", "_")
+        if number in known and status in ISSUE_STATUSES and number not in out:
+            note = re.sub(r"\s+", " ", str(item.get("note") or "")).strip()[:MAX_ISSUE_NOTE_CHARS]
+            out[number] = {"id": number, "status": status, "note": note}
+    return [out[n] for n in sorted(out)]
+
+
 def finalize_payload(parsed: dict[str, Any], ctx: AnalysisContext | None) -> dict[str, Any]:
     """Turn the model's JSON into a checked report. Without a context only the section shape is normalised."""
     out = dict(parsed)
     notes: list[str] = []
-    sections, roles = _clean_sections(parsed.get("sections"), ctx, notes)
+    early_type = (
+        ctx.article_type if ctx is not None and ctx.article_type in pp.ARTICLE_TYPES
+        else pp.coerce_article_type(parsed.get("paper_format"))
+    )
+    sections, roles = _clean_sections(parsed.get("sections"), ctx, notes, early_type)
     out["sections"] = sections
     out["field"] = _clean_field(parsed.get("field"))
     out.pop("absent_sections", None)
@@ -540,6 +643,12 @@ def finalize_payload(parsed: dict[str, Any], ctx: AnalysisContext | None) -> dic
 
     # ---- a rejection reason must point to text that is in the paper
     out["rejection_reasons"] = _clean_reasons(out.get("rejection_reasons"), ctx, notes, _section_starts(ctx, sections))
+    _attach_reason_text(ctx, sections, out["rejection_reasons"])
+    if article_type in pp.NON_RESEARCH_TYPES:
+        # An editorial is invited: it is never sent to review, so it cannot be desk-rejected.
+        for reason in out["rejection_reasons"]:
+            if reason.get("severity") in ("desk_reject", "major"):
+                reason["severity"] = "minor"
 
     # ---- remove quotations that are not in the paper, flag numbers that are not
     removed = [0]
@@ -593,6 +702,12 @@ def finalize_payload(parsed: dict[str, Any], ctx: AnalysisContext | None) -> dic
                 not_assessed.append(f'No "{role}" section was found, though a {profile.label.lower()} normally has one.')
     if article_type == pp.UNKNOWN:
         not_assessed.append("The article type could not be determined, so no section was treated as expected.")
+    if article_type in pp.NON_RESEARCH_TYPES:
+        not_assessed.append(
+            f"This is an {profile.label.lower()}, not a research paper. It was judged on purpose, accuracy, clarity "
+            "and fit, not on novelty or rigor, and an editorial is never desk-rejected."
+        )
+    not_assessed.extend(ctx.parse_warnings)
 
     final_score = max(0, min(100, int(round(overall)) - penalty))
     out["mood_score"] = final_score
@@ -601,6 +716,10 @@ def finalize_payload(parsed: dict[str, Any], ctx: AnalysisContext | None) -> dic
     out["criteria"] = criteria
     out["not_assessed"] = not_assessed
     out["grounding_notes"] = notes[:MAX_GROUNDING_NOTES]
+    out["previous_issues"] = _previous_issue_statuses(parsed.get("previous_issues"), ctx) if ctx.previous_issues else []
+    if ctx.previous_issues:
+        for container in out["previous_issues"]:
+            container["note"] = _scrub_quotes(container["note"], ctx, [0])
     return out
 
 

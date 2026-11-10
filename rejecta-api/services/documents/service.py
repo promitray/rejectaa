@@ -171,8 +171,8 @@ def _section(stored: StoredDocument, section_id: str) -> dict[str, Any]:
     raise ApiError(404, "section_not_found", "No such section in this working copy.")
 
 
-def select_paragraphs(paragraphs: list, section: dict[str, Any], skip: int) -> tuple[list[int], list[str], int | None]:
-    """Prose paragraphs of the section to calibrate now: (indices, notes, where the next part starts or None)."""
+def _prose(paragraphs: list, section: dict[str, Any]) -> tuple[list[int], dict[str, int]]:
+    """Indices of the section's prose paragraphs, and how many of each other kind it has."""
     prose: list[int] = []
     kept: dict[str, int] = {}
     for index in range(section["start"], section["end"] + 1):
@@ -181,6 +181,24 @@ def select_paragraphs(paragraphs: list, section: dict[str, Any], skip: int) -> t
             prose.append(index)
         elif kind != "empty":
             kept[kind] = kept.get(kind, 0) + 1
+    return prose, kept
+
+
+def evidence_start(paragraphs: list, section: dict[str, Any], evidence: str) -> int:
+    """How many prose paragraphs of the section come before the one holding `evidence` (0 if not found)."""
+    wanted = alnum(evidence)[:48]
+    if len(wanted) < 20:
+        return 0
+    prose, _ = _prose(paragraphs, section)
+    for number, index in enumerate(prose):
+        if wanted in alnum(docx_ops.paragraph_text(paragraphs[index])):
+            return number
+    return 0
+
+
+def select_paragraphs(paragraphs: list, section: dict[str, Any], skip: int) -> tuple[list[int], list[str], int | None]:
+    """Prose paragraphs of the section to calibrate now: (indices, notes, where the next part starts or None)."""
+    prose, kept = _prose(paragraphs, section)
     chosen: list[int] = []
     used = 0
     for index in prose[skip:]:
@@ -227,7 +245,11 @@ async def calibrate_section(
     section = _section(stored, section_id)
     document = docx_ops.open_docx(stored.docx)
     paragraphs = docx_ops.body_paragraphs(document)
-    selected, notes, next_from = select_paragraphs(paragraphs, section, request.from_paragraph)
+    skip = request.from_paragraph
+    if skip == 0 and request.evidence:
+        # "Fix with Calibrator" on a rejection reason: start at the paragraph the reason is about
+        skip = evidence_start(paragraphs, section, request.evidence)
+    selected, notes, next_from = select_paragraphs(paragraphs, section, skip)
     if not selected:
         raise ApiError(422, "nothing_to_calibrate", "This part of the section has no prose paragraphs to calibrate.")
 
@@ -254,7 +276,7 @@ async def calibrate_section(
         "range_start": section["start"],
         "range_texts": texts[section["start"] : section["end"] + 1],
         "selected": selected,
-        "from_paragraph": request.from_paragraph,
+        "from_paragraph": skip,
         "masked_output": result.calibrated_masked_text,
         "format_tokens": selection.tokens,
         "plain_tokens": {k: v for k, v in result.vault_values.items() if k not in selection.tokens},

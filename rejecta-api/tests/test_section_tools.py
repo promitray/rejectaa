@@ -89,7 +89,7 @@ def test_the_section_carries_tool_text_and_notes_in_the_analysis() -> None:
     }
     with paper_context(ctx):
         out = _Provider().normalize_analysis_payload(raw)
-    section = out["sections"]["Background"]
+    section = out["sections"]["Introduction"]
     assert CAPTION in section["content"]  # the full content is untouched: the reader sees what the paper has
     assert CAPTION not in section["tool_text"] and section["tool_text"].startswith("The design and synthesis")
     assert section["tool_notes"] == ["1 figure, scheme or table caption(s) left out."]

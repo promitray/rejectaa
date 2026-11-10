@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { AuthorEntry, AuthorRole } from './authors/types'
-import type { AnalysisPaperResponse, DocumentInfo, Mode } from './types'
+import type { AnalysisPaperResponse, ArticleType, DocumentInfo, Mode } from './types'
 
 export const MAX_AUTHORS = 10
 
@@ -11,8 +11,20 @@ export function newAuthor(role: AuthorRole = 'co'): AuthorEntry {
   return { key: `author-${authorCounter}`, role, name: '', orcid: '', scholarId: '' }
 }
 
+/** The last upload, kept in memory only, so "Run again" can send the same file again. */
+export interface LastSubmission {
+  file: File
+  journal: string
+  mode: Mode
+  email: string
+  articleType: ArticleType | 'auto'
+  keepCopy: boolean
+}
+
 interface RejectaStore {
   result: AnalysisPaperResponse | null
+  lastSubmission: LastSubmission | null
+  setLastSubmission: (s: LastSubmission | null) => void
   loading: boolean
   error: string | null
   mode: Mode
@@ -29,6 +41,7 @@ interface RejectaStore {
 
 const initialState = {
   result: null,
+  lastSubmission: null,
   loading: false,
   error: null,
   mode: 'a' as Mode,
@@ -38,6 +51,7 @@ export const useRejectaStore = create<RejectaStore>((set) => ({
   ...initialState,
   authors: [newAuthor('first'), newAuthor('corresponding')],
   setResult: (result) => set({ result }),
+  setLastSubmission: (lastSubmission) => set({ lastSubmission }),
   setDocument: (document) =>
     set((state) => (state.result ? { result: { ...state.result, document } } : {})),
   setLoading: (loading) => set({ loading }),

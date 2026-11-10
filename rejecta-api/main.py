@@ -1,9 +1,12 @@
 """FastAPI application entry point for Rejecta API."""
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
+from pathlib import PurePath
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -32,8 +35,6 @@ from models import (
     AnalyseRequest,
     AnalysisPaperResponse,
     AnalysisResult,
-    CitationResult,
-    CitationStatus,
     AbstractForgeRequest,
     AbstractForgeResponse,
     RebuttalAnalyzeRequest,
@@ -48,14 +49,16 @@ from models import (
 )
 from services import citations, journals, llm, parser
 from services import paper_profile
-from services.analysis_guard import AnalysisContext, paper_context
 from services.calibrator import VoiceCalibratorService
 from services.forge import AbstractForgeEngine, AbstractForgeResult, ForgeError
 from services.heatmap import HeatmapAnalysisResult, HeatmapEngine
-from services.citations import MAX_REFERENCES, build_citation_summary, verify_citations
+from services.citations import build_citation_summary, verify_citations
 from services.journals import match_journal
 from services.llm import get_provider_cached
 from services.parser import MAX_FILE_SIZE_BYTES, parse_document, upload_name_error
+from services.pipeline import run_analysis
+from services import analysis_cache, revisions
+from db.pool import DatabaseUnavailableError
 
 APP_TITLE = "Rejecta API"
 APP_VERSION = "0.1.0"
@@ -97,12 +100,15 @@ DOCUMENT_PURGE_INTERVAL_SECONDS = 3600
 
 
 async def _purge_expired_documents() -> None:
-    """Delete working copies whose 24 hours are over: at startup, then every hour."""
+    """Delete expired working copies (24 hours) and analysis history (180 days): at startup, then hourly."""
     while True:
         try:
             removed = await PostgresDocumentStore(get_pool()).purge_expired()
             if removed:
                 logger.info("Deleted %s expired working copies", removed)
+            removed = await revisions.PostgresHistoryStore(get_pool()).purge_expired()
+            if removed:
+                logger.info("Deleted %s expired analysis history records", removed)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a failed purge is retried next hour
@@ -294,6 +300,7 @@ async def analyse_paper(
     email: str = Form(default=""),
     article_type: str = Form(default="auto"),
     keep_copy: bool = Form(default=False),
+    fresh: bool = Form(default=False),
     subject: Subject = Depends(get_subject),
 ) -> AnalysisPaperResponse:
     """Full pipeline: PDF or Word (.docx) → parse → citations + journal → LLM.
@@ -311,11 +318,18 @@ async def analyse_paper(
                Accepted so the app and API share one contract.
                Not stored or sent yet.
         article_type: "auto" (read it from the file), or one of research_article,
-               communication, perspective, review, mini_review. A choice here wins
+               communication, perspective, review, mini_review, editorial. A choice here wins
                over a label printed in the file.
         keep_copy: Keep an editable Word copy for 24 hours, so calibrated sections can
                be applied to the paper (/documents endpoints). Off by default: without
                it nothing is stored.
+        fresh: Analyse again even if this account analysed the same file with the same
+               settings before. Without it that earlier result is returned (meta.cached),
+               at no quota cost.
+
+    A short record of every analysis (scores, issues and a fingerprint of the text, no text) is
+    kept for 180 days, so that a revised version of the same paper is recognised: its report then
+    has `revision`, the earlier scores and what became of the earlier issues.
 
     Returns:
         AnalysisPaperResponse with analysis, citations,
@@ -344,8 +358,25 @@ async def analyse_paper(
         if chosen_type is None:
             raise HTTPException(
                 status_code=400,
-                detail="article_type must be auto, research_article, communication, perspective, review or mini_review",
+                detail="article_type must be auto, research_article, communication, perspective, review, mini_review or editorial",
             )
+
+    owner = Owner(kind=subject.kind, id=subject.id)
+    file_sha256 = hashlib.sha256(content).hexdigest()
+    key = analysis_cache.cache_key(owner, file_sha256, journal, mode, chosen_type, _model_id())
+    cached = None if fresh else analysis_cache.get(key)
+    if cached is not None:
+        cached.meta.cached = True
+        if keep_copy:
+            try:
+                parsed = parse_document(content, filename, chosen_type)
+                cached.document, cached.document_note = await _keep_working_copy(
+                    subject, content, filename, parsed, cached.analysis
+                )
+            except ValueError:
+                cached.document_note = "The working copy could not be made from this file."
+        logger.info("analyse-paper served from cache | journal=%s mode=%s", journal, mode)
+        return cached
 
     # Quota is reserved only after cheap validation, and refunded if any step fails.
     async with consume(subject, features.ANALYSE_PAPER):
@@ -358,73 +389,22 @@ async def analyse_paper(
             logger.error("Document parse failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail="Document parsing failed unexpectedly") from exc
 
-        citation_outcome, journal_outcome = await asyncio.gather(
-            verify_citations(parsed.references),
-            match_journal(parsed.abstract, journal.strip()),
-            return_exceptions=True,
-        )
-
-        if isinstance(citation_outcome, Exception):
-            logger.warning("Citation lookup failed; marking all unverified", exc_info=citation_outcome)
-            citation_results = [
-                CitationResult(raw=ref, status=CitationStatus.unverified)
-                for ref in parsed.references[:MAX_REFERENCES]
-            ]
-        else:
-            citation_results = citation_outcome
-
-        if isinstance(journal_outcome, Exception):
-            logger.warning("Journal lookup failed; continuing without a match", exc_info=journal_outcome)
-            journal_data = JournalMatch(found=False, target=journal.strip())
-        else:
-            journal_data = journal_outcome
-
-        citation_summary = build_citation_summary(citation_results)
-        # Facts only. Editorial warnings stay in the API response for the UI; feeding
-        # them to the model skewed scores (e.g. 75 -> 38 on a landmark paper).
-        not_found = citation_summary.unverified - citation_summary.check_incomplete
-        citation_summary_str = (
-            f"{citation_summary.verified} verified, "
-            f"{citation_summary.ghost} ghost (DOI or arXiv ID does not exist in CrossRef/arXiv; "
-            f"possible fabricated reference), "
-            f"{not_found} unverified (checked, no matching record found), "
-            f"{citation_summary.check_incomplete} not checked (a lookup service was busy, so nothing can be "
-            f"concluded about them) "
-            f"out of {citation_summary.total} total references."
-        )
-
-        provider = get_provider_cached()
-        journal_dump = journal_data.model_dump()
-        context = AnalysisContext(
-            source_text=parsed.full_text,
-            article_type=parsed.article_type or paper_profile.UNKNOWN,
-            type_source=parsed.article_type_source,
-            structure_mode="detected" if parsed.structure == "detected" else "derived",
-            section_texts={k: v for k, v in parsed.sections.items() if k in parsed.section_roles},
-            section_roles=parsed.section_roles,
-            abstract=parsed.abstract,
-            body=parsed.body,
-            refers_to_si=parsed.refers_to_si,
-            citations_total=citation_summary.total,
-            citations_verified=citation_summary.verified,
-            citations_ghost=citation_summary.ghost,
-            citations_unchecked=citation_summary.check_incomplete,
-            extra_text=f"{citation_summary_str} {journal_dump}",
-            numbers_text=f"{parsed.abstract} {parsed.body}",
-        )
+        history = _history_store()
+        fingerprint = revisions.signature(f"{parsed.abstract}\n{parsed.body}")
+        previous = None
         try:
-            with paper_context(context):
-                analysis = await provider.analyse(
-                    abstract=parsed.abstract,
-                    sections=parsed.sections,
-                    target_journal=journal.strip(),
-                    citation_summary=citation_summary_str,
-                    journal_data=journal_dump,
-                    mode=mode,
-                )
+            previous = await revisions.find_previous(history, owner, fingerprint, file_sha256)
+        except Exception:  # noqa: BLE001 - without the history the analysis is simply not compared
+            logger.warning("Could not look up earlier analyses", exc_info=True)
+
+        try:
+            result = await run_analysis(parsed, journal.strip(), mode, previous=previous)
         except Exception as exc:
             logger.error("LLM analysis failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail="Analysis failed — please try again") from exc
+        analysis, citation_summary, journal_data, context = (
+            result.analysis, result.citations, result.journal, result.context
+        )
 
         elapsed = round((time.perf_counter() - start) * 1000)
         logger.info(
@@ -438,17 +418,33 @@ async def analyse_paper(
             report_email is not None,
         )
 
+        try:
+            await history.save(
+                owner,
+                revisions.NewRecord(
+                    filename=PurePath(filename or "manuscript").name,
+                    journal=journal.strip(),
+                    article_type=analysis.paper_format,
+                    file_sha256=file_sha256,
+                    signature=fingerprint,
+                    summary=revisions.summarize(analysis),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - the report is complete without the history record
+            logger.warning("Could not save the analysis history record", exc_info=True)
+
         document_info = None
         document_note = None
         if keep_copy:
             document_info, document_note = await _keep_working_copy(subject, content, filename, parsed, analysis)
 
-        return AnalysisPaperResponse(
+        response = AnalysisPaperResponse(
             analysis=analysis,
             citations=citation_summary,
             journal=journal_data,
             document=document_info,
             document_note=document_note,
+            revision=result.revision,
             meta=PaperMeta(
                 word_count=parsed.word_count,
                 sections_found=(
@@ -461,8 +457,33 @@ async def analyse_paper(
                 processing_ms=elapsed,
                 article_type=analysis.paper_format,
                 structure_mode=context.structure_mode,
+                analysed_at=datetime.now(timezone.utc).isoformat(),
             ),
         )
+        analysis_cache.put(key, response)
+        return response
+
+
+_MEMORY_HISTORY = revisions.MemoryHistoryStore()
+
+
+def _history_store() -> revisions.HistoryStore:
+    """Postgres when the database is configured; otherwise memory (local runs without a database)."""
+    if settings.DATABASE_URL.strip():
+        try:
+            return revisions.PostgresHistoryStore(get_pool())
+        except DatabaseUnavailableError:
+            pass
+    return _MEMORY_HISTORY
+
+
+def _model_id() -> str:
+    """Which model answers, for the cache key. A provider that cannot be built fails later, inside the quota."""
+    try:
+        provider = get_provider_cached()
+    except Exception:  # noqa: BLE001
+        return f"{settings.LLM_PROVIDER}:unavailable"
+    return f"{settings.LLM_PROVIDER}:{getattr(provider, 'model', '') or getattr(provider, 'model_name', '')}"
 
 
 

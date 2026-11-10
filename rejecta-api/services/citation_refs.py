@@ -297,13 +297,15 @@ def candidate_from_crossref(item: dict[str, Any]) -> Candidate:
                 families.append(simplify_name(str(name)))
     titles = item.get("title") or []
     journals = [str(t) for key in ("short-container-title", "container-title") for t in (item.get(key) or []) if t]
+    # Journals with article numbers instead of pages (Wiley "2200111", ACS "e2023...") cite that number.
+    page = item.get("page") or item.get("article-number")
     return Candidate(
         title=str(titles[0]) if titles else None,
         families=[f for f in families if f],
         years=_years_from_parts(item.get("issued"), item.get("published"), item.get("published-print"),
                                 item.get("published-online")),
         volume=_norm_volume(str(item["volume"])) if item.get("volume") else None,
-        first_page=_first_page(str(item["page"])) if item.get("page") else None,
+        first_page=_first_page(str(page)) if page else None,
         journals=journals,
     )
 
@@ -441,8 +443,10 @@ def compare(parsed: ParsedReference, candidate: Candidate) -> MatchReport:
     report = MatchReport()
     if parsed.first_author and candidate.families:
         wanted = parsed.first_author
+        # Two-letter surnames (Hu, Du, Li, Wu, Xu) match only exactly: as a suffix they would match many names.
         report.author = any(
-            len(wanted) >= 3 and (family == wanted or family.endswith(wanted) or wanted.endswith(family) and len(family) >= 4)
+            (len(wanted) >= 2 and family == wanted)
+            or (len(wanted) >= 3 and (family.endswith(wanted) or wanted.endswith(family) and len(family) >= 4))
             for family in candidate.families[:4]
         )
     if parsed.first_author and candidate.families and not report.author:

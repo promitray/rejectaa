@@ -18,13 +18,16 @@ from services.citation_refs import trim_after_citation
 logger = logging.getLogger(__name__)
 
 MAX_ABSTRACT_CHARS = 1800
-MAX_SECTION_CHARS = 14000
-MAX_REFERENCES = 60
+# Sections are not cut: the prompt builder decides how much text the model gets.
+MAX_SECTION_CHARS = 400_000
+MAX_REFERENCES = 300
 MIN_REFERENCE_LENGTH = 20
 MAX_FILE_SIZE_BYTES = 10_485_760
 FALLBACK_ABSTRACT_CHARS = 1200
 MIN_SECTION_CONTENT_LENGTH = 50
-FALLBACK_BODY_CHARS = 8000
+FALLBACK_BODY_CHARS = 400_000
+MIN_WORDS_FOR_REFERENCE_WARNING = 2000
+REFERENCE_RECALL_WARNING = 0.9  # warn when fewer than this share of a numbered list could be read
 
 # Heading titles (matched on a line by themselves, optional leading number)
 # mapped to the section the analysis prompt expects.
@@ -38,6 +41,9 @@ SECTION_TITLES: dict[str, tuple[str, ...]] = {
         "experimental", "experimental section", "experimental procedures", "experimental details",
         "experimental methods", "materials", "general procedures", "computational details",
         "computational methods",
+        # Nature / Science / Cell layouts, where Methods often follows the main reference list
+        "online methods", "star methods", "star★methods", "method details", "methods summary",
+        "materials and experimental methods",
     ),
     "results": (
         "results", "findings", "experiments", "evaluation",
@@ -66,7 +72,10 @@ OTHER_TITLES = (
     "funding", "author information", "associated content", "abbreviations", "notes",
     "credit authorship contribution statement",
 )
-REFERENCE_TITLES = ("references", "bibliography", "literature cited", "notes and references")
+REFERENCE_TITLES = (
+    "references", "bibliography", "literature cited", "notes and references", "references and notes",
+    "cited references", "works cited",
+)
 MAX_THEMATIC_SECTIONS = 8
 BODY_FALLBACK_MIN_SECTION_CHARS = 200
 
@@ -435,14 +444,12 @@ def _build_document(
 ) -> ParsedDocument:
     """Shared text-to-structure step for every input format."""
     lines = full_text.split("\n")
-    ref_start = _find_reference_line(lines)
-    body_lines = lines[:ref_start] if ref_start is not None else lines
-    ref_lines = lines[ref_start + 1 :] if ref_start is not None else []
+    body_lines, ref_blocks = _split_reference_blocks(lines)
     if reflow:
         body_lines = _reflow_lines(body_lines)
 
     user_type = paper_profile.coerce_article_type(article_type_hint)
-    label_type = paper_profile.detect_article_type(label_lines if label_lines else body_lines)
+    label_type = paper_profile.detect_article_type(label_lines if label_lines else body_lines[:60])
     article_type = user_type or label_type
     type_source = "user" if user_type else ("label" if label_type else "none")
 
@@ -450,8 +457,27 @@ def _build_document(
     sections, roles, covered_chars = _extract_sections_detailed(body_lines, article_type, per_line=not reflow)
     body = _body_text(body_lines, per_line=not reflow)
     structure, coverage = paper_profile.assess_structure(roles, covered_chars, len(body), article_type)
-    references = _extract_references(ref_lines, one_per_line=one_reference_per_line)
+    if structure != "detected" and article_type is None:
+        # Numbered headings ("1. Introduction", "2. Ring-opening polymerization", ...) name the sections of
+        # many papers whose type is not printed on them (often reviews in an author's own layout). Taken from the file, they stay the same between runs.
+        numbered = _extract_sections_detailed(body_lines, article_type, per_line=not reflow, numbered_topics=True)
+        numbered_structure, numbered_coverage = paper_profile.assess_structure(
+            numbered[1], numbered[2], len(body), article_type
+        )
+        if numbered_structure == "detected":
+            sections, roles, covered_chars = numbered
+            structure, coverage = numbered_structure, numbered_coverage
+    references: list[str] = []
+    numbered_total = 0
+    for position, block in enumerate(ref_blocks):
+        found, numbered = _extract_references_counted(
+            block, one_reference_per_line, first_number=1 if position == 0 else None
+        )
+        references.extend(found)
+        numbered_total += numbered
+    references = references[:MAX_REFERENCES]
     word_count = len(full_text.split())
+    warnings = _parse_warnings(ref_blocks, references, numbered_total, word_count)
 
     logger.debug("Detected sections: %s (structure=%s, type=%s)", sorted(sections.keys()), structure, article_type)
     logger.debug("Extracted %d references", len(references))
@@ -469,6 +495,7 @@ def _build_document(
         refers_to_si=paper_profile.refers_to_si(full_text),
         section_roles=roles,
         body=body,
+        parse_warnings=warnings,
     )
 
 
@@ -576,6 +603,48 @@ def _find_reference_line(lines: list[str]) -> int | None:
     return found
 
 
+MIN_REFERENCE_BLOCK_LINES = 3
+
+
+def _split_reference_blocks(lines: list[str]) -> tuple[list[str], list[list[str]]]:
+    """(body lines, reference blocks). Every References heading starts a block.
+
+    A block runs until the next References heading, or until a heading of the paper itself (Methods,
+    Acknowledgements, Supporting Information...) that follows at least a few lines of references. So a
+    Nature or Cell paper, where Methods and a second reference list come after the main references, keeps
+    its Methods in the body and both reference lists in the references.
+    """
+    starts = [i for i, line in enumerate(lines) if _heading_title(line) in REFERENCE_TITLES]
+    if not starts:
+        return lines, []
+    body: list[str] = list(lines[: starts[0]])
+    blocks: list[list[str]] = []
+    for number, start in enumerate(starts):
+        limit = starts[number + 1] if number + 1 < len(starts) else len(lines)
+        end = limit
+        for index in range(start + 1 + MIN_REFERENCE_BLOCK_LINES, limit):
+            title = _heading_title(lines[index])
+            if title is not None and title not in REFERENCE_TITLES:
+                end = index
+                break
+        blocks.append(lines[start + 1 : end])
+        body.extend(lines[end:limit])
+    return body, blocks
+
+
+def _parse_warnings(blocks: list[list[str]], references: list[str], numbered_total: int, word_count: int) -> list[str]:
+    """What a reader of the report should know about how well the file could be read."""
+    warnings: list[str] = []
+    if not blocks and word_count >= MIN_WORDS_FOR_REFERENCE_WARNING:
+        warnings.append("No reference list heading was found in the file, so its references were not checked.")
+    elif numbered_total and len(references) < REFERENCE_RECALL_WARNING * numbered_total:
+        warnings.append(
+            f"Only {len(references)} of the {numbered_total} numbered references could be read from the file; "
+            "the others were not checked."
+        )
+    return warnings
+
+
 def _extract_abstract(lines: list[str], style_abstract: str | None = None) -> str:
     """Take the text between the Abstract heading and the next heading.
 
@@ -639,14 +708,14 @@ def _topic_heading(line: str, wanted_number: int) -> str | None:
 
 
 def _extract_sections_detailed(
-    lines: list[str], article_type: str | None = None, per_line: bool = False
+    lines: list[str], article_type: str | None = None, per_line: bool = False, numbered_topics: bool = False
 ) -> tuple[dict[str, str], dict[str, str], int]:
     """Sections under real headings: (sections, role of each, characters they cover).
 
     Standard headings map to introduction / methods / results / discussion. For perspectives and
     reviews every numbered top-level heading between them is a "thematic" section named by its title.
     """
-    thematic_paper = article_type in paper_profile.THEMATIC_TYPES
+    thematic_paper = numbered_topics or article_type in paper_profile.THEMATIC_TYPES
     boundaries: list[tuple[int, str | None, str | None]] = []  # (line, role, key)
     next_number = 1
     for index, line in enumerate(lines):
@@ -663,6 +732,11 @@ def _extract_sections_detailed(
             topic = _topic_heading(line, next_number)
             if topic is not None:
                 next_number += 1
+                following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+                if len(line.strip()) > 60 and following and len(following) <= 40 and following[:1].isupper() \
+                        and not following.endswith(".") and _heading_title(following) is None:
+                    topic = f"{topic} {following}"  # a long heading wrapped onto a second line
+                    index += 1
                 boundaries.append((index, paper_profile.ROLE_THEMATIC, topic))
 
     parts: dict[str, list[str]] = {}
@@ -707,11 +781,20 @@ def _extract_sections(lines: list[str]) -> dict[str, str]:
 
 
 def _extract_references(ref_lines: list[str], one_per_line: bool = False) -> list[str]:
-    """Extract bibliography entries from the lines after the References heading.
+    """Extract bibliography entries from the lines after the References heading."""
+    return _extract_references_counted(ref_lines, one_per_line)[0]
+
+
+def _extract_references_counted(
+    ref_lines: list[str], one_per_line: bool = False, first_number: int | None = 1
+) -> tuple[list[str], int]:
+    """(references, number of entries a numbered list says it has, or 0).
 
     With `one_per_line` (Word files) every non-empty line is one reference, up to the next
-    known heading such as Appendix or Acknowledgements.
+    known heading such as Appendix or Acknowledgements. `first_number` is the number the list starts
+    at; None takes it from the first numbered line (a second list that continues the numbering).
     """
+    numbered_total = 0
     if one_per_line:
         chunks: list[str] = []
         for line in ref_lines:
@@ -726,12 +809,15 @@ def _extract_references(ref_lines: list[str], one_per_line: bool = False) -> lis
         kept = [line for line in ref_lines if not _NUMBER_ONLY.match(line.strip())]
         reference_section = "\n".join(kept).strip()
         if not reference_section:
-            return []
-        chunks = _split_reference_candidates(reference_section)
+            return [], 0
+        starts = _numbered_starts(reference_section, first_number)
+        if len(starts) >= MIN_NUMBERED_ENTRIES:
+            numbered_total = int(starts[-1].group(1)) - int(starts[0].group(1)) + 1
+        chunks = _split_reference_candidates(reference_section, first_number)
     cleaned: list[str] = []
     for chunk in chunks:
         chunk = _trim_after_reference(chunk)
-        normalized = re.sub(r"\s+", " ", chunk).strip()
+        normalized = re.sub(r"\s+", " ", chunk.translate(_INVISIBLE_CHARS)).strip()
         normalized = re.sub(REFERENCE_PREFIX_PATTERN, "", normalized).strip()
         # a line break inside a hyphenated name or a page range leaves a space: "Ouellet- Plamondon", "827– 831"
         normalized = re.sub(r"(?<=[A-Za-z])- (?=[A-Z])", "-", normalized)
@@ -747,8 +833,8 @@ def _extract_references(ref_lines: list[str], one_per_line: bool = False) -> lis
                 continue  # a footnote or comment inside the list, not a citation
             cleaned.append(piece)
             if len(cleaned) >= MAX_REFERENCES:
-                return cleaned
-    return cleaned
+                return cleaned, numbered_total
+    return cleaned, numbered_total
 
 
 _LIST_NUMBER = re.compile(r"^(\d{1,3})\s+(?=\S)")
@@ -821,25 +907,36 @@ def _trim_after_reference(chunk: str) -> str:
 
 # A line that starts a numbered entry: "[7] ", "7. ", "7) " or just "7 " (RSC, ACS and Nature layouts),
 # followed by an author, or by a sub-reference marker such as "(a)".
-_NUMBERED_START = re.compile(r"(?m)^[ \t]*\[?(\d{1,3})[\.\)\]]?[ \t]+(?=(?:\([a-z]\)\s*)?[\[A-Z])")
+# A title may itself start with a number ("3 125 Years IACS: ..."), so a number then a capitalised word counts too.
+_NUMBERED_START = re.compile(
+    r"(?m)^[ \t]*\[?(\d{1,3})[\.\)\]]?[ \t]+(?=(?:\([a-z]\)\s*)?[\[A-Z]|\d{1,4}[ \t]+[A-Z][a-z])"
+)
 MAX_NUMBER_JUMP = 2  # tolerate an entry the PDF extraction lost
 MIN_NUMBERED_ENTRIES = 3
 
 
-def _split_numbered_entries(section: str) -> list[str] | None:
+def _numbered_starts(section: str, first: int | None = 1) -> list[re.Match[str]]:
+    """The lines that start entries 1, 2, 3, ... (or first, first+1, ... when the list continues another)."""
+    starts: list[re.Match[str]] = []
+    expected = first
+    for match in _NUMBERED_START.finditer(section):
+        number = int(match.group(1))
+        if expected is None:
+            expected = number
+        if expected <= number <= expected + MAX_NUMBER_JUMP:
+            starts.append(match)
+            expected = number + 1
+    return starts
+
+
+def _split_numbered_entries(section: str, first: int | None = 1) -> list[str] | None:
     """Split a numbered reference list using the numbers themselves.
 
     A line only counts as a new entry when its number is the next one in the sequence (1, 2, 3, ...),
     so a wrapped line that happens to start with a digit ("45 Angew.") is not mistaken for one.
     Returns None when the text is not a numbered list.
     """
-    starts: list[re.Match[str]] = []
-    expected = 1
-    for match in _NUMBERED_START.finditer(section):
-        number = int(match.group(1))
-        if expected <= number <= expected + MAX_NUMBER_JUMP:
-            starts.append(match)
-            expected = number + 1
+    starts = _numbered_starts(section, first)
     if len(starts) < MIN_NUMBERED_ENTRIES:
         return None
     entries = []
@@ -852,8 +949,8 @@ def _split_numbered_entries(section: str) -> list[str] | None:
 def _running_key(line: str) -> str | None:
     """Page numbers change from page to page; with digits blanked, a running header looks the same."""
     stripped = line.strip()
-    if len(stripped) < 10:
-        return None
+    if len(stripped) < 10 or len(re.findall(r"[A-Za-z]", stripped)) < 3:
+        return None  # a page range on its own line ("1770–1782.") repeats on every page of references
     return re.sub(r"\d+", "#", stripped).lower()
 
 
@@ -919,9 +1016,9 @@ def _years_per_entry(entries: list[str]) -> float:
     return sum(len(_YEAR_IN_ENTRY.findall(entry)) for entry in entries) / max(1, len(entries))
 
 
-def _split_reference_candidates(reference_section: str) -> list[str]:
+def _split_reference_candidates(reference_section: str, first_number: int | None = 1) -> list[str]:
     """Split references using known citation formatting patterns."""
-    numbered = _split_numbered_entries(reference_section)
+    numbered = _split_numbered_entries(reference_section, first_number)
     if numbered is not None:
         return numbered
     for pattern in (REF_SPLIT_PATTERN_A, REF_SPLIT_PATTERN_B):

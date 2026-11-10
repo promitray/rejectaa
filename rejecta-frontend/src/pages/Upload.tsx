@@ -144,6 +144,9 @@ export default function Upload(): ReactElement {
     setError(null)
     setLoading(true)
 
+    useRejectaStore.getState().setLastSubmission({
+      file: selected, journal: journal.trim(), mode: selectedMode, email: email.trim(), articleType, keepCopy,
+    })
     const request = submitPaper(selected, journal.trim(), selectedMode, email.trim(), articleType, keepCopy)
     navigate('/processing')
 
@@ -322,6 +325,7 @@ export default function Upload(): ReactElement {
           <option value="perspective">Perspective</option>
           <option value="review">Review article</option>
           <option value="mini_review">Mini-review</option>
+          <option value="editorial">Editorial / foreword</option>
         </select>
         <p className="mt-1 text-xs text-gray-500">
           The type decides which sections are expected, so a short communication is not marked down for sections it does not have.

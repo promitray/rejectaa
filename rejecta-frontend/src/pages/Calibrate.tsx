@@ -23,6 +23,8 @@ export default function Calibrate(): ReactElement {
     notes?: string[]
     /** Set when the paper has a working copy: the server calibrates its own text and can write it back. */
     document?: { documentId: string; sectionId: string }
+    /** Set by "Fix with Calibrator": the words the rejection reason points to, where calibration starts. */
+    evidence?: string
   } | null
   const paperCopy = state?.document
   const focusNote = state?.focus
@@ -72,6 +74,7 @@ export default function Calibrate(): ReactElement {
           intensity,
           ...(focusNote ? { focus: focusNote } : {}),
           from_paragraph: fromParagraph,
+          ...(state?.evidence && fromParagraph === 0 ? { evidence: state.evidence } : {}),
         })
         setProposal(res)
         setResult(res.calibration)

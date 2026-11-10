@@ -315,3 +315,23 @@ def test_a_section_id_that_does_not_exist_is_a_404(client) -> None:
     document_id = new_copy(store)
     response = http.post(f"/documents/{document_id}/sections/s9/calibrate", json={"journal": "Polymer Chemistry"})
     assert response.status_code == 404
+
+
+def test_fix_with_calibrator_starts_at_the_paragraph_the_rejection_reason_points_to() -> None:
+    store = MemoryDocumentStore()
+    document_id = uuid.UUID(new_copy(store))
+    evidence = "Oxidation gave the open-shell copolymer P2"
+    proposal = run(service.calibrate_section(store, OWNER, document_id, "s2", request(evidence=evidence), FakeLLM()))
+    assert proposal.original_text.startswith("Oxidation gave the open-shell copolymer P2")
+    assert "free radical copolymerisation" not in proposal.original_text
+    applied = run(service.apply_proposal(store, OWNER, document_id, uuid.UUID(proposal.proposal_id)))
+    assert applied.applied_paragraphs == 1
+    texts = [p.text for p in paper_paragraphs(store, str(document_id))]
+    assert RESULTS_1 in texts  # the paragraphs before the evidence are untouched
+
+
+def test_evidence_that_is_not_in_the_section_starts_at_its_beginning() -> None:
+    store = MemoryDocumentStore()
+    document_id = uuid.UUID(new_copy(store))
+    proposal = run(service.calibrate_section(store, OWNER, document_id, "s2", request(evidence="words that appear nowhere in this paper at all"), FakeLLM()))
+    assert proposal.original_text.startswith(RESULTS_1[:30])

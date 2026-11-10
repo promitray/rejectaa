@@ -40,7 +40,7 @@ export interface CitationSummary {
   items: CitationResult[]
 }
 
-export type ArticleType = 'research_article' | 'communication' | 'perspective' | 'review' | 'mini_review'
+export type ArticleType = 'research_article' | 'communication' | 'perspective' | 'review' | 'mini_review' | 'editorial'
 
 export interface SectionScore {
   score: number
@@ -85,6 +85,11 @@ export interface RejectionReason {
   impact_area?: 'novelty' | 'scientific_validity' | 'publication_potential' | ''
   impact?: string
   solution?: string
+  /** The report section the evidence sits in (a key of `sections`), or '' when it is outside them. */
+  section?: string
+  /** The paragraphs around the evidence, prepared by the server for "Fix with Calibrator". */
+  tool_text?: string | null
+  tool_notes?: string[]
 }
 
 export interface AnalysisResult {
@@ -109,12 +114,48 @@ export interface AnalysisResult {
   grounding_notes?: string[]
 }
 
+export interface ScoreChange {
+  name: string
+  /** null: not scored in that version */
+  before: number | null
+  after: number | null
+}
+
+export interface PreviousIssue {
+  problem: string
+  severity: string
+  status: 'resolved' | 'partly_resolved' | 'open' | 'not_assessed'
+  note: string
+}
+
+/** This upload next to the earlier version of the same paper that the account analysed. */
+export interface RevisionComparison {
+  previous_analysis_id: string
+  previous_analysed_at: string
+  previous_filename: string
+  previous_journal: string
+  /** The very same file again: any difference is the analysis varying, not the paper. */
+  same_file: boolean
+  same_journal: boolean
+  similarity: number
+  score_before: number
+  score_after: number
+  criteria: ScoreChange[]
+  sections: ScoreChange[]
+  issues: PreviousIssue[]
+}
+
 export interface JournalMatch {
   found: boolean
   target: string
   openalex_name: string | null
   works_count: number | null
   recent_papers: Array<{ title: string; year: number | null }>
+  similar_papers?: Array<{ title: string; year: number | null }>
+  match_quality?: 'exact' | 'approximate'
+  note?: string | null
+  two_year_mean_citedness?: number | null
+  h_index?: number | null
 }
 
 export interface DocumentSection {
@@ -168,6 +209,8 @@ export interface AnalysisPaperResponse {
   document?: DocumentInfo | null
   /** Why no copy was kept, when one was asked for. */
   document_note?: string | null
+  /** Set when this paper is a version of one the account analysed before. */
+  revision?: RevisionComparison | null
   meta: {
     word_count: number
     sections_found: string[]
@@ -177,6 +220,9 @@ export interface AnalysisPaperResponse {
     article_type?: ArticleType | 'unknown' | null
     /** "detected" headings, or sections "derived" from the content when the file has no headings. */
     structure_mode?: 'detected' | 'derived' | null
+    /** The same file with the same settings was analysed before: this is that report. */
+    cached?: boolean
+    analysed_at?: string | null
   }
 }
 

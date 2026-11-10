@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import anthropic
-from fastapi import HTTPException
 
 from models import AnalysisResult
-from services.llm.base import AbstractAnalysisProvider, MODE_A
+from services.llm.base import COMPACT_RETRY_NOTE, AbstractAnalysisProvider, MODE_A
 
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 4000
-FIX_JSON_MESSAGE = "Your prior response was invalid JSON. Return only corrected valid JSON."
+MAX_TOKENS = 4000  # the general-purpose tools (Calibrator, Forge, ...)
+ANALYSIS_MAX_TOKENS = 8000  # the full report; at 4000 long reports were cut off mid-JSON
+FIX_JSON_MESSAGE = (
+    "Your previous response was not valid JSON matching the required schema. Return only the corrected, "
+    "valid JSON."
+)
 SERVER_ERROR_MESSAGE = "Failed to parse model output after retry"
+
+logger = logging.getLogger(__name__)
 
 
 class AnthropicProvider(AbstractAnalysisProvider):
@@ -42,6 +48,23 @@ class AnthropicProvider(AbstractAnalysisProvider):
             block.text for block in response.content if getattr(block, "text", None)
         )
 
+    async def _complete(self, system_prompt: str, messages: list[dict[str, str]]) -> tuple[str, bool, str]:
+        """(text, whether it was cut off at the token limit, the exact model that answered)."""
+        response = await self.client.messages.create(
+            model=self.model,
+            max_tokens=ANALYSIS_MAX_TOKENS,
+            temperature=0,
+            system=system_prompt,
+            messages=messages,
+        )
+        text = "".join(block.text for block in response.content if getattr(block, "text", None))
+        return text, response.stop_reason == "max_tokens", getattr(response, "model", None) or self.model
+
+    def _result(self, text: str, model_version: str) -> AnalysisResult:
+        parsed = self.parse_json_response(text)
+        parsed["provider_used"] = f"anthropic/{model_version}"
+        return AnalysisResult.model_validate(self.normalize_analysis_payload(parsed))
+
     async def analyse(
         self,
         abstract: str,
@@ -51,7 +74,11 @@ class AnthropicProvider(AbstractAnalysisProvider):
         journal_data: dict[str, Any],
         mode: str = MODE_A,
     ) -> AnalysisResult:
-        """Run analysis through Anthropic and return validated result."""
+        """Run analysis through Anthropic and return validated result.
+
+        A report cut off at the token limit is asked for again, shorter. An answer that is not valid JSON or
+        fails validation is sent back once for repair; if that fails too, the error is raised.
+        """
         system_prompt = self.get_system_prompt(mode)
         user_message = self.build_user_message(
             abstract=abstract,
@@ -60,40 +87,22 @@ class AnthropicProvider(AbstractAnalysisProvider):
             citation_summary=citation_summary,
             journal_data=journal_data,
         )
-
-        first = await self.client.messages.create(
-            model=self.model,
-            max_tokens=MAX_TOKENS,
-            temperature=0,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        first_text = "".join(
-            block.text for block in first.content if getattr(block, "text", None)
-        )
+        messages = [{"role": "user", "content": user_message}]
+        text, cut_off, version = await self._complete(system_prompt, messages)
+        if cut_off:
+            logger.warning("Analysis output hit the token limit; asking for a shorter report")
+            messages = [{"role": "user", "content": f"{user_message}\n\n{COMPACT_RETRY_NOTE}"}]
+            text, _, version = await self._complete(system_prompt, messages)
 
         try:
-            parsed = self.parse_json_response(first_text)
-        except ValueError:
-            retry = await self.client.messages.create(
-                model=self.model,
-                max_tokens=MAX_TOKENS,
-                temperature=0,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_message},
-                    {"role": "assistant", "content": first_text},
-                    {"role": "user", "content": FIX_JSON_MESSAGE},
-                ],
-            )
-            retry_text = "".join(
-                block.text for block in retry.content if getattr(block, "text", None)
+            return self._result(text, version)
+        except Exception:
+            logger.warning("Analysis output failed validation; asking the model to repair it", exc_info=True)
+            retry_text, _, version = await self._complete(
+                system_prompt,
+                [*messages, {"role": "assistant", "content": text}, {"role": "user", "content": FIX_JSON_MESSAGE}],
             )
             try:
-                parsed = self.parse_json_response(retry_text)
-            except ValueError as exc:
-                raise HTTPException(status_code=500, detail=SERVER_ERROR_MESSAGE) from exc
-
-        parsed["provider_used"] = f"anthropic/{self.model}"
-        normalized = self.normalize_analysis_payload(parsed)
-        return AnalysisResult.model_validate(normalized)
+                return self._result(retry_text, version)
+            except Exception as exc:
+                raise ValueError(SERVER_ERROR_MESSAGE) from exc

@@ -38,6 +38,7 @@ export async function submitPaper(
   email: string,
   articleType: ArticleType | 'auto' = 'auto',
   keepCopy = false,
+  fresh = false,
 ): Promise<AnalysisPaperResponse> {
   const form = new FormData()
   form.append('file', file)
@@ -46,6 +47,8 @@ export async function submitPaper(
   form.append('email', email)
   form.append('article_type', articleType)
   form.append('keep_copy', keepCopy ? 'true' : 'false')
+  // without it, the same file with the same settings returns the earlier report (and costs no quota)
+  form.append('fresh', fresh ? 'true' : 'false')
   return tool<AnalysisPaperResponse>('/analyse-paper', { body: form })
 }
 
@@ -57,6 +60,8 @@ export interface DocumentCalibrateBody {
   intensity?: 'polish' | 'rewrite' | 'restructure'
   focus?: string
   from_paragraph?: number
+  /** Start at the paragraph holding these words (a rejection reason's evidence) when from_paragraph is 0. */
+  evidence?: string
 }
 
 export function calibrateDocumentSection(

@@ -1,0 +1,73 @@
+# Labelled papers for scripts/eval_scoring.py. See eval/README.md for how to add one.
+#
+# Fields
+#   id           short unique name; the PDF is eval/papers/<file>
+#   journal      the journal name exactly as a user would type it in the app
+#   label        strong | weak | out_of_scope   (see scripts/eval_metrics.py)
+#   group        A Methods after References · B standard IMRaD · C chemistry with SI · D review
+#                E weak (retracted / rejected / low tier) · F format edge cases and non-research types
+#   split        dev (used while fixing) | heldout (only for the final check; never tune on these)
+#   upload_type  article type chosen in the app, if the test needs one (default: auto)
+#   expect       ground truth from reading the paper by hand; only the keys given are checked
+#                  article_type   research_article | communication | perspective | review | mini_review | editorial
+#                  references     number of entries in the paper's reference list
+#                  has_methods    true when the paper has a Methods / Experimental section in the file
+#                  journal_match  the OpenAlex display name the journal should resolve to
+#   labelled_by  who checked the expectations (two people for every paper)
+
+papers:
+  - id: chemcomm-2026-iacs-editorial
+    file: chemcomm-2026-iacs-editorial.pdf
+    journal: chemistry communication
+    label: out_of_scope
+    group: F
+    split: dev
+    source: "Dash & Maiti, Chem. Commun. 2026, 62, 22107 (doi:10.1039/d6cc90216b), Editorial"
+    expect:
+      article_type: editorial
+      references: 5
+      has_methods: false
+      journal_match: Chemical Communications
+    labelled_by: []
+    notes: >
+      First failure reported by the team (2026-11-10): scored 40 with two desk-reject reasons for
+      "insufficient novelty". It is an invited editorial for a themed collection, so it has no research
+      to judge. Also: "chemistry communication" matched "Structural Chemistry & Crystallography
+      Communication" (121 works) instead of Chemical Communications; reference 3 was merged into
+      reference 2; the first-page header was taken as the abstract.
+
+  - id: marc-2024-polythioesters-minireview
+    file: marc-2024-polythioesters-minireview.pdf
+    journal: Macromolecular Rapid Communications
+    label: strong
+    group: D
+    split: dev
+    source: "Woodhouse, Kocaarslan, Garden & Mutlu, Macromol. Rapid Commun. 2024 (doi:10.1002/marc.202400260), accepted manuscript"
+    expect:
+      article_type: mini_review
+      references: 88
+      has_methods: false
+      journal_match: Macromolecular Rapid Communications
+    labelled_by: []
+    notes: >
+      Run by the team against "Polymer Chemistry" (2026-11-10): 71, one major reason "limited discussion of
+      biosynthesis". The paper has a full section on biosynthesis (Section 4), but the model never saw it:
+      only 26k of the 51k-character body is sent, and Sections 2.2 to 5.2 are cut. Only 60 of 88
+      references are extracted; reference 7 loses its pages at a line break; 3 of 4 sampled "unverified"
+      references verify on a second try. "Polymer Chemistry" matched the defunct Journal of Polymer
+      Science Part A instead of RSC Polymer Chemistry.
+
+  # Template for the next papers (copy, fill in, remove the leading '#'):
+  # - id: nature-2024-example
+  #   file: nature-2024-example.pdf
+  #   journal: Nature
+  #   label: strong
+  #   group: A
+  #   split: dev
+  #   source: "Author et al., Nature 2024, 600, 100 (doi:...)"
+  #   expect:
+  #     article_type: research_article
+  #     references: 52
+  #     has_methods: true
+  #     journal_match: Nature
+  #   labelled_by: [name1, name2]
