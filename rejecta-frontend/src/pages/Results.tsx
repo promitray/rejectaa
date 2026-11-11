@@ -1,9 +1,19 @@
 import type { ReactElement, ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { deleteDocument, downloadDocument, submitPaper, undoDocument } from '../api'
 import Frowns from '../components/Frowns'
 import { useRejectaStore } from '../store'
-import type { CitationResult, CitationStatus, Mood, RejectionReason, SectionScore } from '../types'
+import type {
+  CitationResult,
+  CitationStatus,
+  DocumentInfo,
+  Mood,
+  RejectionReason,
+  RevisionComparison,
+  ScoreChange,
+  SectionScore,
+} from '../types'
 
 const VISIBLE_CITATIONS = 10
 
@@ -73,6 +83,7 @@ const ARTICLE_TYPE_LABEL: Record<string, string> = {
   perspective: 'Perspective',
   review: 'Review article',
   mini_review: 'Mini-review',
+  editorial: 'Editorial',
 }
 
 const IMPACT_AREA_LABEL: Record<string, string> = {
@@ -90,6 +101,8 @@ const CRITERION_LABEL: Record<string, string> = {
   coverage_balance: 'Coverage & balance',
   critical_synthesis: 'Critical synthesis',
   outlook: 'Outlook',
+  purpose: 'Purpose',
+  context_accuracy: 'Context & accuracy',
   citation_integrity: 'Citation integrity',
 }
 
@@ -127,6 +140,24 @@ export default function Results(): ReactElement {
   const navigate = useNavigate()
   const result = useRejectaStore((state) => state.result)
   const reset = useRejectaStore((state) => state.reset)
+  const lastSubmission = useRejectaStore((state) => state.lastSubmission)
+  const [rerunning, setRerunning] = useState(false)
+  const [rerunError, setRerunError] = useState<string | null>(null)
+
+  // "Run again": the same file and settings, analysed afresh instead of returning the earlier report.
+  const runAgain = (): void => {
+    if (!lastSubmission || rerunning) return
+    const { file, journal, mode, email, articleType, keepCopy } = lastSubmission
+    setRerunning(true)
+    setRerunError(null)
+    submitPaper(file, journal, mode, email, articleType, keepCopy, true)
+      .then((data) => {
+        useRejectaStore.getState().setResult(data)
+        window.scrollTo({ top: 0 })
+      })
+      .catch((err: unknown) => setRerunError(err instanceof Error ? err.message : 'Analysis failed — please try again'))
+      .finally(() => setRerunning(false))
+  }
 
   useEffect(() => {
     if (!result) {
@@ -147,6 +178,9 @@ export default function Results(): ReactElement {
   const notAssessed = analysis.not_assessed ?? []
   const groundingNotes = analysis.grounding_notes ?? []
   const derivedSections = result.meta.structure_mode === 'derived'
+  const paperCopy = result.document ?? null
+  // section name in the report -> section of the working copy, when it was found there
+  const copySections = new Map((paperCopy?.sections ?? []).filter((s) => s.mapped).map((s) => [s.name, s.id]))
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-8">
@@ -166,7 +200,31 @@ export default function Results(): ReactElement {
           </div>
           <ScoreRing score={analysis.mood_score} />
         </div>
+        {result.meta.cached || lastSubmission ? (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-gray-100 pt-3">
+            <p className="text-xs text-gray-500">
+              {result.meta.cached
+                ? `You analysed this exact file with the same settings${formatWhen(result.meta.analysed_at)}. This is that report, so the same file always gets the same result.`
+                : result.meta.analysed_at
+                  ? `Analysed${formatWhen(result.meta.analysed_at)}.`
+                  : null}
+            </p>
+            {lastSubmission ? (
+              <button
+                type="button"
+                onClick={runAgain}
+                disabled={rerunning}
+                className="shrink-0 rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-100 transition disabled:opacity-50"
+              >
+                {rerunning ? 'Analysing again…' : '↻ Run again'}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {rerunError ? <p className="mt-2 text-xs text-red-700">{rerunError}</p> : null}
       </section>
+
+      {result.revision ? <RevisionPanel revision={result.revision} /> : null}
 
       {/* Voice Calibrator Quick Action Callout */}
       <div className="mt-4 flex items-center justify-between rounded-xl border border-stone-200 bg-stone-50 p-4">
@@ -279,6 +337,12 @@ export default function Results(): ReactElement {
           </Panel>
         ) : null}
 
+        {paperCopy || result.document_note ? (
+          <Panel title="Your editable paper" badge="pro" icon="✎">
+            {paperCopy ? <PaperCopyPanel copy={paperCopy} /> : <p className="text-sm text-amber-800">{result.document_note}</p>}
+          </Panel>
+        ) : null}
+
         <Panel title="Citation autopsy" badge="free" icon="⌕">
           <div className="flex flex-wrap gap-2">
             <Chip className="bg-green-50 text-green-700">{result.citations.verified} verified</Chip>
@@ -324,6 +388,8 @@ export default function Results(): ReactElement {
                   section={section}
                   readerMode={readerMode}
                   targetJournal={result.journal.target}
+                  field={analysis.field}
+                  copy={paperCopy && copySections.has(name) ? { documentId: paperCopy.id, sectionId: copySections.get(name) as string } : null}
                 />
               ))}
             </div>
@@ -344,6 +410,13 @@ export default function Results(): ReactElement {
                   key={`${item.severity}-${index}`}
                   item={item}
                   targetJournal={result.journal.target}
+                  field={analysis.field}
+                  sectionText={item.section ? analysis.sections[item.section]?.tool_text : null}
+                  copy={
+                    paperCopy && item.section && copySections.has(item.section)
+                      ? { documentId: paperCopy.id, sectionId: copySections.get(item.section) as string }
+                      : null
+                  }
                 />
               ))}
             </div>
@@ -359,10 +432,19 @@ export default function Results(): ReactElement {
             <p className="text-sm font-medium text-gray-900">
               {result.journal.openalex_name ?? result.journal.target}
             </p>
-            <Chip className={result.journal.found ? 'bg-green-50 text-green-700' : 'bg-gray-100 text-gray-600'}>
-              {result.journal.found ? 'found' : 'not found'}
+            <Chip
+              className={
+                !result.journal.found
+                  ? 'bg-gray-100 text-gray-600'
+                  : result.journal.match_quality === 'approximate'
+                    ? 'bg-amber-50 text-amber-800'
+                    : 'bg-green-50 text-green-700'
+              }
+            >
+              {!result.journal.found ? 'not found' : result.journal.match_quality === 'approximate' ? 'closest match' : 'found'}
             </Chip>
           </div>
+          {result.journal.note ? <p className="mt-2 text-sm text-amber-800">{result.journal.note}</p> : null}
           {result.journal.found ? (
             <div className="mt-3">
               {typeof result.journal.works_count === 'number' ? (
@@ -518,6 +600,72 @@ function Panel({
   )
 }
 
+function PaperCopyPanel({ copy }: { copy: DocumentInfo }): ReactElement {
+  const setDocument = useRejectaStore((state) => state.setDocument)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+
+  const run = async (action: () => Promise<void>): Promise<void> => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      await action()
+    } catch (err: unknown) {
+      setMessage(err instanceof Error ? err.message : 'Something went wrong')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const base = copy.filename.replace(/\.[^.]+$/, '') || 'manuscript'
+  return (
+    <div className="text-sm text-gray-700">
+      <p>
+        Version {copy.version} of <span className="font-medium">{copy.filename}</span> · kept until{' '}
+        {new Date(copy.expires_at).toLocaleString()}
+      </p>
+      <p className="mt-1 text-xs text-gray-500">
+        Use Calibrate on a section below, then “Update in paper” to write the result into this copy.
+      </p>
+      {copy.notes.map((note) => (
+        <p key={note} className="mt-1 text-xs text-gray-500">{note}</p>
+      ))}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => run(() => downloadDocument(copy.id, `${base}-rejecta-v${copy.version}.docx`))}
+          className="rounded bg-stone-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+        >
+          Download paper (.docx)
+        </button>
+        <button
+          type="button"
+          disabled={busy || !copy.can_undo}
+          onClick={() => run(async () => setDocument(await undoDocument(copy.id)))}
+          className="rounded border border-stone-300 px-3 py-1.5 text-xs font-medium text-stone-800 disabled:opacity-40"
+        >
+          Undo last change
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() =>
+            run(async () => {
+              await deleteDocument(copy.id)
+              setDocument(null)
+            })
+          }
+          className="rounded border border-red-200 px-3 py-1.5 text-xs font-medium text-red-700 disabled:opacity-50"
+        >
+          Delete copy now
+        </button>
+      </div>
+      {message ? <p className="mt-2 text-xs text-red-700">{message}</p> : null}
+    </div>
+  )
+}
+
 function Chip({ className, children }: { className: string; children: ReactNode }): ReactElement {
   return <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${className}`}>{children}</span>
 }
@@ -594,17 +742,41 @@ function SectionRow({
   section,
   readerMode,
   targetJournal,
+  field,
+  copy,
 }: {
   name: string
   section: SectionScore
   readerMode: boolean
   targetJournal: string
+  field?: string | null
+  /** The matching section of the working copy, so Calibrate can write the result back into the paper. */
+  copy?: { documentId: string; sectionId: string } | null
 }): ReactElement {
   const navigate = useNavigate()
   const width = Math.min(100, Math.max(0, section.score))
   const [showFix, setShowFix] = useState(false)
+  const [showContent, setShowContent] = useState(false)
 
+  // The section text for the tools is prepared by the server (captions left out, length limited) and passed on as it is.
   const handleCalibrateSection = (): void => {
+    if (section.tool_text) {
+      navigate('/calibrate', {
+        state: {
+          text: section.tool_text,
+          journal: targetJournal,
+          ...(field ? { field } : {}),
+          focus: {
+            section: sectionLabel(name),
+            issue: section.issue ?? section.weakness ?? '',
+            fix: section.fix ?? '',
+          },
+          notes: section.tool_notes ?? [],
+          ...(copy ? { document: copy } : {}),
+        },
+      })
+      return
+    }
     const promptSample = `[${sectionLabel(name)} Section]\nIssue to address: ${section.issue ?? 'Improve scientific register'}\nTarget remediation: ${section.fix ?? 'Align with journal standard'}`
     navigate('/calibrate', {
       state: {
@@ -615,6 +787,17 @@ function SectionRow({
   }
 
   const handleHeatmapSection = (): void => {
+    if (section.tool_text) {
+      navigate('/heatmap', {
+        state: {
+          text: section.tool_text,
+          journal: targetJournal,
+          ...(field ? { field } : {}),
+          notes: section.tool_notes ?? [],
+        },
+      })
+      return
+    }
     const promptSample = `[${sectionLabel(name)} Section]\nIssue to address: ${section.issue ?? 'Analyze sentence rhythm and transition density'}\nRemediation focus: ${section.fix ?? 'Vary sentence length and clarify active agency'}`
     navigate('/heatmap', {
       state: {
@@ -688,26 +871,179 @@ function SectionRow({
           ) : null}
         </div>
       )}
+      {section.content ? (
+        <div className="mt-1.5 sm:pl-[7.5rem]">
+          <button
+            type="button"
+            onClick={() => setShowContent((value) => !value)}
+            aria-expanded={showContent}
+            className="text-xs text-stone-500 underline hover:text-stone-800"
+          >
+            {showContent ? 'Hide content ▴' : 'Show content ▾'}
+          </button>
+          {showContent ? (
+            <div className="mt-1.5 rounded-lg border border-gray-200 bg-gray-50 p-3">
+              <p className="text-xs text-gray-500">
+                {section.word_count != null ? `${section.word_count.toLocaleString()} words` : null}
+                {section.start_pct != null && section.end_pct != null
+                  ? ` · covers ${section.start_pct}%–${section.end_pct}% of the paper`
+                  : null}
+                {section.source === 'derived' ? ' · runs until the next section starts, so the end is approximate' : null}
+              </p>
+              <div className="mt-2 max-h-72 space-y-2 overflow-auto text-xs leading-relaxed text-gray-700">
+                {section.content.split(/\n{2,}/).map((paragraph, index) => (
+                  <p key={index}>{paragraph}</p>
+                ))}
+              </div>
+              {section.content_truncated ? (
+                <p className="mt-2 text-xs text-gray-400">Shortened: only the first part of this section is shown.</p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
+  )
+}
+
+function formatWhen(iso?: string | null): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? '' : ` on ${date.toLocaleString()}`
+}
+
+const ISSUE_STATUS: Record<string, { label: string; className: string }> = {
+  resolved: { label: 'Resolved', className: 'bg-green-50 text-green-700' },
+  partly_resolved: { label: 'Partly resolved', className: 'bg-amber-50 text-amber-800' },
+  open: { label: 'Still open', className: 'bg-red-50 text-red-700' },
+  not_assessed: { label: 'Not assessed', className: 'bg-gray-100 text-gray-600' },
+}
+
+function Delta({ before, after }: { before: number | null; after: number | null }): ReactElement {
+  if (before == null || after == null) {
+    return <span className="text-xs text-gray-400">{before == null ? 'new' : 'not in this version'}</span>
+  }
+  const change = after - before
+  const tone = change > 0 ? 'text-green-700' : change < 0 ? 'text-red-700' : 'text-gray-500'
+  return (
+    <span className="text-xs tabular-nums text-gray-700">
+      {before} → {after}{' '}
+      <span className={tone}>({change > 0 ? '+' : ''}{change})</span>
+    </span>
+  )
+}
+
+function ChangeList({ title, items, labels }: { title: string; items: ScoreChange[]; labels?: Record<string, string> }): ReactElement | null {
+  if (items.length === 0) return null
+  return (
+    <div className="mt-3">
+      <p className="text-[10px] font-bold uppercase tracking-wide text-gray-500">{title}</p>
+      <ul className="mt-1 space-y-1">
+        {items.map((item) => (
+          <li key={item.name} className="flex items-center justify-between gap-3 text-sm">
+            <span className="text-gray-800">{labels?.[item.name] ?? sectionLabel(item.name)}</span>
+            <Delta before={item.before} after={item.after} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function RevisionPanel({ revision }: { revision: RevisionComparison }): ReactElement {
+  const resolved = revision.issues.filter((issue) => issue.status === 'resolved').length
+  return (
+    <section className="mt-4 rounded-xl border border-sky-200 bg-sky-50/40 p-5">
+      <p className="text-xs font-semibold uppercase tracking-wider text-sky-900">
+        {revision.same_file ? 'Same file as before' : 'Revised version recognised'}
+      </p>
+      <p className="mt-1 text-sm text-gray-700">
+        {revision.same_file
+          ? `You analysed this same file${formatWhen(revision.previous_analysed_at)}. Differences below come from the analysis itself, not from your paper.`
+          : `This looks like a new version of “${revision.previous_filename}”, analysed${formatWhen(revision.previous_analysed_at)} (about ${Math.round(revision.similarity * 100)}% of the text is unchanged).`}
+      </p>
+      {!revision.same_journal ? (
+        <p className="mt-1 text-xs text-amber-800">
+          The earlier analysis was for {revision.previous_journal}, so the scores were judged against a different journal.
+        </p>
+      ) : null}
+      <div className="mt-3 flex items-center justify-between rounded-lg bg-white px-3 py-2">
+        <span className="text-sm font-medium text-gray-900">Overall score</span>
+        <Delta before={revision.score_before} after={revision.score_after} />
+      </div>
+      <ChangeList title="Criteria" items={revision.criteria} labels={CRITERION_LABEL} />
+      <ChangeList title="Sections" items={revision.sections} />
+      {revision.issues.length > 0 ? (
+        <div className="mt-3">
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-500">
+            Issues raised last time · {resolved} of {revision.issues.length} resolved
+          </p>
+          <ul className="mt-1 space-y-2">
+            {revision.issues.map((issue, index) => {
+              const status = ISSUE_STATUS[issue.status] ?? ISSUE_STATUS.not_assessed
+              return (
+                <li key={index} className="rounded-lg border border-gray-200 bg-white p-2.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-sm text-gray-800">{issue.problem}</p>
+                    <Chip className={status.className}>{status.label}</Chip>
+                  </div>
+                  {issue.note ? <p className="mt-1 text-xs text-gray-500">{issue.note}</p> : null}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      ) : null}
+    </section>
   )
 }
 
 function ReasonCard({
   item,
   targetJournal,
+  field,
+  sectionText,
+  copy,
 }: {
   item: RejectionReason
   targetJournal: string
+  field?: string | null
+  /** The whole section's tool text, used when the server found no paragraphs around the evidence. */
+  sectionText?: string | null
+  /** The section of the working copy the evidence sits in, so the fix can be written back into the paper. */
+  copy?: { documentId: string; sectionId: string } | null
 }): ReactElement {
   const navigate = useNavigate()
   const style = SEVERITY_STYLE[item.severity]
 
+  // The text of the manuscript the reason is about goes to the Calibrator, with the reason as its focus.
   const handleFixReason = (): void => {
-    const promptText = `[Addressing Rejection Risk: ${item.reason}]\nRequired Remediation: ${item.fix}\nTask: Rephrase and strengthen manuscript evidence according to this directive.`
+    const text = item.tool_text || sectionText
+    const focus = {
+      section: item.section ? sectionLabel(item.section) : 'Passage under review',
+      issue: item.problem || item.reason,
+      fix: item.solution || item.fix,
+    }
+    if (text || copy) {
+      navigate('/calibrate', {
+        state: {
+          text: text ?? '',
+          journal: targetJournal,
+          ...(field ? { field } : {}),
+          focus,
+          notes: item.tool_text ? item.tool_notes ?? [] : [],
+          ...(copy ? { document: copy, ...(item.evidence ? { evidence: item.evidence } : {}) } : {}),
+        },
+      })
+      return
+    }
+    // Neither the paragraphs nor the section could be found: start from the quoted passage itself.
     navigate('/calibrate', {
       state: {
-        text: promptText,
+        text: item.evidence ?? '',
         journal: targetJournal,
+        ...(field ? { field } : {}),
+        focus,
       },
     })
   }

@@ -268,3 +268,44 @@ def test_a_reference_that_starts_with_a_number_is_not_stripped_unless_the_number
     assert parser._strip_list_numbers(["1 A. B, J. Chem. 2001, 1, 1.", "3 C. D, J. Chem. 2002, 2, 2."]) == [
         "1 A. B, J. Chem. 2001, 1, 1.", "3 C. D, J. Chem. 2002, 2, 2.",
     ]
+
+
+# ------------------------------------------------------------------ readable body text with paragraphs
+
+def _pdf_lines() -> list[str]:
+    full = "This is a full line of justified text that runs the whole width of the column"
+    return [
+        "Introduction",
+        full, full, "and this line ends the first paragraph here.",
+        "The second paragraph starts here with a capital letter and goes on for a while",
+        full, "and it ends here.",
+    ]
+
+
+def test_a_pdf_body_keeps_paragraphs_where_a_short_line_ends_a_sentence() -> None:
+    text = parser._paragraph_text(_pdf_lines())
+    paragraphs = text.split("\n\n")
+    assert paragraphs[0] == "Introduction"  # a heading is a paragraph of its own
+    assert paragraphs[1].endswith("ends the first paragraph here.")
+    assert paragraphs[2].startswith("The second paragraph starts")
+    assert len(paragraphs) == 3
+
+
+def test_in_a_word_body_every_line_is_a_paragraph() -> None:
+    assert parser._paragraph_text(["First paragraph.", "Second paragraph."], per_line=True) == "First paragraph.\n\nSecond paragraph."
+
+
+def test_back_matter_at_the_end_of_the_body_is_cut_but_an_early_heading_is_not() -> None:
+    lines = ["Title"] + [f"Body line {i} with enough words to count as text." for i in range(10)] + [
+        "Conflicts of interest", "There are none.", "Acknowledgements", "Thanks to everyone.",
+    ]
+    text = parser._body_text(lines, per_line=True)
+    assert "Body line 9" in text and "Conflicts" not in text and "Thanks" not in text
+    early = ["Funding", "Some early line."] + [f"Body line {i} with enough words to count as text." for i in range(10)]
+    assert "Body line 9" in parser._body_text(early, per_line=True)  # a heading in the first half is ignored
+
+
+def test_the_paragraph_body_still_gives_the_same_section_boundaries() -> None:
+    parsed = _build_document(REVIEW_TEXT, one_reference_per_line=True, article_type_hint="review")
+    assert list(parsed.sections)[0] == "introduction"
+    assert "\n\n" in parsed.body and "References" not in parsed.body

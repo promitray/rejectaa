@@ -1,26 +1,108 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import type { ReactElement } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { analyzeHeatmap } from '../api'
 import { ToolWait } from '../components/Loaders'
 import type { HeatmapAnalyzeResponse, ParagraphHeatDetail, SentenceHeatDetail } from '../types'
 
+type MetricKey = 'stylistic_signal' | 'flagged_sentences' | 'avg_length' | 'cadence_burstiness'
+
+interface MetricGuide {
+  key: MetricKey
+  title: string
+  badge: string
+  whatItIs: string
+  howItWorks: string
+  benchmarks: { range: string; label: string; badgeClass: string }[]
+}
+
+const METRIC_GUIDES: Record<MetricKey, MetricGuide> = {
+  stylistic_signal: {
+    key: 'stylistic_signal',
+    title: 'Stylistic Signal Index',
+    badge: 'Formulaic Phrasing Density',
+    whatItIs:
+      'Percentage of template-like or formulaic phrasing detected in your text. Lower scores indicate natural, specific academic writing.',
+    howItWorks:
+      'Word-weighted average of sentence scores scanning for stock phrases, repeated openers, and template patterns.',
+    benchmarks: [
+      { range: '0% – 25%', label: 'Clean / Natural', badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+      { range: '26% – 50%', label: 'Moderate Signals', badgeClass: 'bg-amber-50 text-amber-800 border-amber-200' },
+      { range: '51% – 100%', label: 'Elevated Signals', badgeClass: 'bg-rose-50 text-rose-800 border-rose-200' },
+    ],
+  },
+  flagged_sentences: {
+    key: 'flagged_sentences',
+    title: 'Sentences Flagged as Formulaic',
+    badge: 'Threshold Exceeded',
+    whatItIs:
+      'Count of sentences that crossed the formulaic threshold out of total sentences in the text.',
+    howItWorks:
+      'Sentences are flagged when their individual stylometric score exceeds 0.58.',
+    benchmarks: [
+      { range: '0 Flagged', label: 'Clean — no sentences flagged', badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+      { range: '1+ Flagged', label: 'Candidate sentences for rephrasing', badgeClass: 'bg-amber-50 text-amber-800 border-amber-200' },
+    ],
+  },
+  avg_length: {
+    key: 'avg_length',
+    title: 'Average Sentence Length',
+    badge: 'Readability',
+    whatItIs:
+      'Average number of words per sentence, indicating sentence pacing and complexity.',
+    howItWorks:
+      'Calculated as total word count divided by total sentences.',
+    benchmarks: [
+      { range: '18 – 28 words', label: 'Balanced academic standard', badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+      { range: '> 35 words', label: 'Dense / May cause reader fatigue', badgeClass: 'bg-amber-50 text-amber-800 border-amber-200' },
+      { range: '< 14 words', label: 'Short / May feel choppy', badgeClass: 'bg-stone-100 text-stone-800 border-stone-200' },
+    ],
+  },
+  cadence_burstiness: {
+    key: 'cadence_burstiness',
+    title: 'Cadence Burstiness (CV)',
+    badge: 'Rhythm & Variation',
+    whatItIs:
+      'Variation in sentence lengths. Human writing naturally alternates between short punchy sentences and longer explanations.',
+    howItWorks:
+      'Coefficient of Variation (CV = standard deviation / mean sentence length).',
+    benchmarks: [
+      { range: '≥ 0.35', label: 'Dynamic Human Cadence', badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+      { range: '0.22 – 0.34', label: 'Moderate Variation', badgeClass: 'bg-amber-50 text-amber-800 border-amber-200' },
+      { range: '< 0.22', label: 'Monotonous Rhythm', badgeClass: 'bg-rose-50 text-rose-800 border-rose-200' },
+    ],
+  },
+}
+
 export default function Heatmap(): ReactElement {
   const location = useLocation()
   const navigate = useNavigate()
-  const state = location.state as { text?: string; journal?: string; field?: string } | null
+  const state = location.state as {
+    text?: string
+    journal?: string
+    field?: string
+    /** What the server left out of or cut from the section text. */
+    notes?: string[]
+  } | null
 
-  const [text, setText] = useState<string>(
-    state?.text ??
-      'In this paper, we delve into deep neural architectures for clinical prognosis. It is paramount and a testament to recent progress that our proposed transformer demonstrates predictive utility across acute patients.\n\nFurthermore, our attention regularization minimizes gradient variance such that results improve significantly. Consequently, the findings were shown to be robust, and it is important to remember that baselines were surpassed without degradation.'
-  )
-  const [journal, setJournal] = useState<string>(state?.journal ?? 'Nature Machine Intelligence')
-  const [field, setField] = useState<string>(state?.field ?? 'Computer Science & Machine Learning')
+  const [text, setText] = useState<string>(state?.text ?? '')
+  const [journal, setJournal] = useState<string>(state?.journal ?? '')
+  const [field, setField] = useState<string>(state?.field ?? '')
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<HeatmapAnalyzeResponse | null>(null)
   const [selectedSentence, setSelectedSentence] = useState<SentenceHeatDetail | null>(null)
   const [selectedParagraph, setSelectedParagraph] = useState<ParagraphHeatDetail | null>(null)
+  const [activeMetricHelp, setActiveMetricHelp] = useState<MetricKey | null>(null)
+
+  useEffect(() => {
+    if (!activeMetricHelp) return
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setActiveMetricHelp(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [activeMetricHelp])
 
   const handleAnalyze = async (): Promise<void> => {
     if (!text.trim() || text.trim().length < 20) {
@@ -30,7 +112,11 @@ export default function Heatmap(): ReactElement {
     setError(null)
     setLoading(true)
     try {
-      const res = await analyzeHeatmap({ text, journal, field })
+      const res = await analyzeHeatmap({
+        text,
+        ...(journal.trim() ? { journal: journal.trim() } : {}),
+        ...(field.trim() ? { field: field.trim() } : {}),
+      })
       setResult(res)
       if (res.paragraphs.length > 0 && res.paragraphs[0].sentences.length > 0) {
         setSelectedParagraph(res.paragraphs[0])
@@ -62,14 +148,14 @@ export default function Heatmap(): ReactElement {
           <span className="text-xs uppercase tracking-widest font-semibold px-2 py-0.5 rounded bg-stone-900 text-stone-100">
             Stylometric Cadence Diagnostic
           </span>
-          <span className="text-xs text-stone-500">v1.0 Explainable Heatmap</span>
+          <span className="text-xs text-stone-500">v2.0 Explainable Heatmap</span>
         </div>
         <h1 className="text-3xl font-serif font-bold text-stone-900 tracking-tight">
           AI Signal Heatmap
         </h1>
         <p className="text-sm text-stone-600 mt-2 max-w-2xl leading-relaxed">
-          Analyzes paragraph rhythm, transition repetition, sentence-length uniformity, and passive construction density.
-          Highlights stylistic patterns to help authors diversify cadence—this is an editorial diagnostic tool, not an accusation of misconduct.
+          Finds formulaic phrasing (stock phrases, inflated verbs, hype words, template sentences, empty conclusions),
+          repeated openings and transitions, and monotonous rhythm. It describes style only: it does not and cannot tell who or what wrote the text.
         </p>
       </div>
 
@@ -83,6 +169,7 @@ export default function Heatmap(): ReactElement {
             type="text"
             value={journal}
             onChange={(e) => setJournal(e.target.value)}
+            placeholder="e.g. Polymer Chemistry"
             className="w-full text-sm px-3 py-2 border border-stone-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-stone-900"
           />
         </div>
@@ -95,6 +182,7 @@ export default function Heatmap(): ReactElement {
             type="text"
             value={field}
             onChange={(e) => setField(e.target.value)}
+            placeholder="e.g. Polymer chemistry"
             className="w-full text-sm px-3 py-2 border border-stone-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-stone-900"
           />
         </div>
@@ -110,6 +198,14 @@ export default function Heatmap(): ReactElement {
           </button>
         </div>
       </div>
+
+      {state?.notes?.length ? (
+        <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+          {state.notes.map((note) => (
+            <p key={note}>{note}</p>
+          ))}
+        </div>
+      ) : null}
 
       {/* Draft Input Box */}
       <div className="mb-6 p-4 rounded-lg bg-white border border-stone-200">
@@ -137,56 +233,338 @@ export default function Heatmap(): ReactElement {
 
       {/* Summary Score Strip */}
       {result && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-          <div className="p-4 bg-white rounded-lg border border-stone-200 text-center">
-            <div
-              className={`text-2xl font-bold ${
-                result.overall_level === 'elevated_signals'
-                  ? 'text-rose-700'
-                  : result.overall_level === 'mixed_signals'
-                  ? 'text-amber-700'
-                  : 'text-emerald-700'
-              }`}
+        <div className="mb-8">
+          {/* Sub-header with 'How these metrics work' guide button */}
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-xs font-semibold uppercase tracking-wider text-stone-700">
+              Diagnostic Metrics Summary
+            </span>
+            <button
+              type="button"
+              onClick={() => setActiveMetricHelp('stylistic_signal')}
+              className="text-xs text-stone-600 hover:text-stone-900 font-medium flex items-center gap-1.5 transition"
             >
-              {Math.round(result.overall_cadence_score * 100)}%
-            </div>
-            <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
-              Stylistic Signal Index
-            </div>
+              <span className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-stone-300 bg-stone-100 text-[10px] font-bold text-stone-700">
+                i
+              </span>
+              <span>About these metrics & how they work</span>
+            </button>
           </div>
 
-          <div className="p-4 bg-white rounded-lg border border-stone-200 text-center">
-            <div className="text-2xl font-bold text-stone-900">
-              {result.flagged_sentences_count} / {result.total_sentences}
-            </div>
-            <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
-              Sentences with Elevated Signals
-            </div>
-          </div>
-
-          <div className="p-4 bg-white rounded-lg border border-stone-200 text-center">
-            <div className="text-2xl font-bold text-stone-900">
-              {result.readability_metrics.average_sentence_length} words
-            </div>
-            <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
-              Avg Sentence Length
-            </div>
-          </div>
-
-          <div className="p-4 bg-white rounded-lg border border-stone-200 text-center relative group">
-            <div className="text-2xl font-bold text-stone-900">
-              {result.readability_metrics.sentence_burstiness_index}
-            </div>
-            <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
-              Cadence Burstiness (CV)
-            </div>
-            {result.readability_metrics.burstiness_qualitative_tag && (
-              <div className="text-[10px] text-stone-600 font-medium mt-1">
-                {result.readability_metrics.burstiness_qualitative_tag}
+          {/* Small Sample Size Warning Banner if < 15 sentences */}
+          {result.total_sentences < 15 && (
+            <div className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/90 p-3 text-xs text-amber-900 shadow-xs">
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-200 text-amber-900 font-bold text-[11px]">
+                !
+              </span>
+              <div>
+                <span className="font-semibold text-amber-950">
+                  Small sample notice ({result.total_sentences} {result.total_sentences === 1 ? 'sentence' : 'sentences'}):
+                </span>{' '}
+                Stylometric cadence and burstiness (CV) fluctuate on short passages. For reliable analysis, 15+ sentences are recommended.
               </div>
-            )}
-            <div className="hidden group-hover:block absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 p-2 bg-stone-900 text-stone-100 text-[11px] rounded shadow-lg z-10 text-left">
-              Measures sentence length variation (CV). Higher values (&gt;0.35) indicate natural alternation between complex explanations and punchy empirical claims.
+            </div>
+          )}
+
+          {/* 4 Metric Cards */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {/* 1. Stylistic Signal Index */}
+            <div
+              onClick={() => setActiveMetricHelp('stylistic_signal')}
+              className="relative group p-4 bg-white rounded-lg border border-stone-200 hover:border-stone-400 text-center cursor-pointer transition shadow-xs hover:shadow-sm"
+            >
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setActiveMetricHelp('stylistic_signal')
+                }}
+                className="absolute top-2.5 right-2.5 flex h-5 w-5 items-center justify-center rounded-full border border-stone-200 bg-stone-50 text-[10px] font-bold text-stone-500 hover:bg-stone-900 hover:text-white hover:border-stone-900 transition shadow-xs"
+                title="Click to learn how Stylistic Signal Index works"
+                aria-label="Stylistic Signal Index Info"
+              >
+                i
+              </button>
+              <div
+                className={`text-2xl font-bold ${
+                  result.overall_level === 'elevated_signals'
+                    ? 'text-rose-700'
+                    : result.overall_level === 'mixed_signals'
+                    ? 'text-amber-700'
+                    : 'text-emerald-700'
+                }`}
+              >
+                {Math.round(result.overall_cadence_score * 100)}%
+              </div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
+                Stylistic Signal Index
+              </div>
+              <div className="text-[10px] text-stone-400 group-hover:text-stone-700 mt-1 flex items-center justify-center gap-0.5 transition font-medium">
+                <span>How it works</span> <span>→</span>
+              </div>
+            </div>
+
+            {/* 2. Sentences flagged as formulaic */}
+            <div
+              onClick={() => setActiveMetricHelp('flagged_sentences')}
+              className="relative group p-4 bg-white rounded-lg border border-stone-200 hover:border-stone-400 text-center cursor-pointer transition shadow-xs hover:shadow-sm"
+            >
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setActiveMetricHelp('flagged_sentences')
+                }}
+                className="absolute top-2.5 right-2.5 flex h-5 w-5 items-center justify-center rounded-full border border-stone-200 bg-stone-50 text-[10px] font-bold text-stone-500 hover:bg-stone-900 hover:text-white hover:border-stone-900 transition shadow-xs"
+                title="Click to learn how Sentences Flagged works"
+                aria-label="Sentences Flagged Info"
+              >
+                i
+              </button>
+              <div className="text-2xl font-bold text-stone-900">
+                {result.flagged_sentences_count} / {result.total_sentences}
+              </div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
+                Sentences flagged as formulaic
+              </div>
+              <div className="text-[10px] text-stone-400 group-hover:text-stone-700 mt-1 flex items-center justify-center gap-0.5 transition font-medium">
+                <span>How it works</span> <span>→</span>
+              </div>
+            </div>
+
+            {/* 3. Avg Sentence Length */}
+            <div
+              onClick={() => setActiveMetricHelp('avg_length')}
+              className="relative group p-4 bg-white rounded-lg border border-stone-200 hover:border-stone-400 text-center cursor-pointer transition shadow-xs hover:shadow-sm"
+            >
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setActiveMetricHelp('avg_length')
+                }}
+                className="absolute top-2.5 right-2.5 flex h-5 w-5 items-center justify-center rounded-full border border-stone-200 bg-stone-50 text-[10px] font-bold text-stone-500 hover:bg-stone-900 hover:text-white hover:border-stone-900 transition shadow-xs"
+                title="Click to learn how Avg Sentence Length works"
+                aria-label="Avg Sentence Length Info"
+              >
+                i
+              </button>
+              <div className="text-2xl font-bold text-stone-900">
+                {result.readability_metrics.average_sentence_length} words
+              </div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
+                Avg Sentence Length
+              </div>
+              <div className="text-[10px] text-stone-400 group-hover:text-stone-700 mt-1 flex items-center justify-center gap-0.5 transition font-medium">
+                <span>How it works</span> <span>→</span>
+              </div>
+            </div>
+
+            {/* 4. Cadence Burstiness (CV) */}
+            <div
+              onClick={() => setActiveMetricHelp('cadence_burstiness')}
+              className="relative group p-4 bg-white rounded-lg border border-stone-200 hover:border-stone-400 text-center cursor-pointer transition shadow-xs hover:shadow-sm"
+            >
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setActiveMetricHelp('cadence_burstiness')
+                }}
+                className="absolute top-2.5 right-2.5 flex h-5 w-5 items-center justify-center rounded-full border border-stone-200 bg-stone-50 text-[10px] font-bold text-stone-500 hover:bg-stone-900 hover:text-white hover:border-stone-900 transition shadow-xs"
+                title="Click to learn how Cadence Burstiness works"
+                aria-label="Cadence Burstiness Info"
+              >
+                i
+              </button>
+              <div className="text-2xl font-bold text-stone-900">
+                {result.readability_metrics.sentence_burstiness_index}
+              </div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wider mt-1">
+                Cadence Burstiness (CV)
+              </div>
+              {result.readability_metrics.burstiness_qualitative_tag && (
+                <div className="text-[10px] text-stone-600 font-medium mt-1">
+                  {result.readability_metrics.burstiness_qualitative_tag}
+                </div>
+              )}
+              <div className="text-[10px] text-stone-400 group-hover:text-stone-700 mt-1 flex items-center justify-center gap-0.5 transition font-medium">
+                <span>How it works</span> <span>→</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Metric Explanation Modal Dialog */}
+      {result && activeMetricHelp && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs transition-opacity"
+          onClick={() => setActiveMetricHelp(null)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            className="relative w-full max-w-xl max-h-[90vh] flex flex-col bg-white rounded-xl shadow-2xl border border-stone-200 overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex items-start justify-between border-b border-stone-200 px-6 py-4 bg-stone-50/70">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-stone-200 text-stone-800">
+                    {METRIC_GUIDES[activeMetricHelp].badge}
+                  </span>
+                  <span className="text-xs text-stone-400">• Metric Guide</span>
+                </div>
+                <h2 className="text-lg font-bold text-stone-900 mt-1 font-serif">
+                  {METRIC_GUIDES[activeMetricHelp].title}
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveMetricHelp(null)}
+                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-200/60 hover:text-stone-700 transition text-base leading-none"
+                aria-label="Close dialog"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Quick Switcher Tabs */}
+            <div className="flex border-b border-stone-200 bg-stone-100/70 p-1.5 gap-1 overflow-x-auto text-xs">
+              {(
+                [
+                  ['stylistic_signal', 'Stylistic Index'],
+                  ['flagged_sentences', 'Flagged Sentences'],
+                  ['avg_length', 'Avg Length'],
+                  ['cadence_burstiness', 'Burstiness (CV)'],
+                ] as const
+              ).map(([key, label]) => {
+                const isActive = activeMetricHelp === key
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setActiveMetricHelp(key)}
+                    className={`px-3 py-1.5 rounded text-xs font-medium whitespace-nowrap transition ${
+                      isActive
+                        ? 'bg-white text-stone-900 shadow-xs font-semibold'
+                        : 'text-stone-600 hover:text-stone-900 hover:bg-white/50'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto space-y-5 text-stone-800 text-sm">
+              {/* Current Document Value Strip */}
+              <div className="flex items-center justify-between p-3 rounded-lg bg-stone-50 border border-stone-200">
+                <span className="text-xs font-semibold uppercase tracking-wider text-stone-500">
+                  Current Document Value
+                </span>
+                <span className="text-base font-bold text-stone-900">
+                  {activeMetricHelp === 'stylistic_signal' && (
+                    <span
+                      className={
+                        result.overall_level === 'elevated_signals'
+                          ? 'text-rose-700'
+                          : result.overall_level === 'mixed_signals'
+                          ? 'text-amber-700'
+                          : 'text-emerald-700'
+                      }
+                    >
+                      {Math.round(result.overall_cadence_score * 100)}% (
+                      {result.overall_level === 'elevated_signals'
+                        ? 'Elevated Signals'
+                        : result.overall_level === 'mixed_signals'
+                        ? 'Mixed Signals'
+                        : 'Clean / Low Signals'}
+                      )
+                    </span>
+                  )}
+                  {activeMetricHelp === 'flagged_sentences' && (
+                    <span>
+                      {result.flagged_sentences_count} / {result.total_sentences} sentences
+                    </span>
+                  )}
+                  {activeMetricHelp === 'avg_length' && (
+                    <span>{result.readability_metrics.average_sentence_length} words / sentence</span>
+                  )}
+                  {activeMetricHelp === 'cadence_burstiness' && (
+                    <span>
+                      {result.readability_metrics.sentence_burstiness_index}{' '}
+                      <span className="text-xs font-medium text-stone-500">
+                        ({result.readability_metrics.burstiness_qualitative_tag || 'Standard'})
+                      </span>
+                    </span>
+                  )}
+                </span>
+              </div>
+
+              {/* What It Measures */}
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-stone-600 mb-1">
+                  What It Measures
+                </h3>
+                <p className="text-stone-700 leading-relaxed text-xs">
+                  {METRIC_GUIDES[activeMetricHelp].whatItIs}
+                </p>
+              </div>
+
+              {/* How It Works */}
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-stone-600 mb-1">
+                  How It Works
+                </h3>
+                <p className="text-stone-700 leading-relaxed text-xs">
+                  {METRIC_GUIDES[activeMetricHelp].howItWorks}
+                </p>
+              </div>
+
+              {/* Benchmarks */}
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-stone-600 mb-2">
+                  Benchmarks
+                </h3>
+                <div className="space-y-1.5">
+                  {METRIC_GUIDES[activeMetricHelp].benchmarks.map((b, i) => (
+                    <div
+                      key={i}
+                      className="flex items-center gap-2.5 p-2 rounded border border-stone-200/80 bg-white text-xs"
+                    >
+                      <span className={`px-2 py-0.5 rounded font-semibold border shrink-0 ${b.badgeClass}`}>
+                        {b.range}
+                      </span>
+                      <span className="text-stone-600">{b.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Disclaimer */}
+              <div className="pt-2 border-t border-stone-100 text-[11px] text-stone-400 space-y-1">
+                <p>Describes writing style and pacing only; does not determine authorship.</p>
+                {result.total_sentences < 15 && (
+                  <p className="text-amber-800 font-medium">
+                    Note: Analysis is based on a short sample ({result.total_sentences} sentences). Scores are indicative.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="flex justify-end border-t border-stone-200 px-6 py-3 bg-stone-50">
+              <button
+                type="button"
+                onClick={() => setActiveMetricHelp(null)}
+                className="py-1.5 px-4 rounded bg-stone-900 text-white text-xs font-semibold uppercase tracking-wider hover:bg-stone-800 transition"
+              >
+                Got It / Close
+              </button>
             </div>
           </div>
         </div>
@@ -245,10 +623,12 @@ export default function Heatmap(): ReactElement {
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-stone-200/70 text-stone-700 font-mono">
                         CV: {para.paragraph_burstiness_cv}
                       </span>
-                      {para.primary_issue && (
-                        <span className="text-[10px] text-amber-800 font-medium">
-                          • {para.primary_issue}
-                        </span>
+                      {(para.paragraph_signals?.length ? para.paragraph_signals : para.primary_issue ? [para.primary_issue] : []).map(
+                        (signal) => (
+                          <span key={signal} className="text-[10px] text-amber-800 font-medium">
+                            • {signal}
+                          </span>
+                        ),
                       )}
                     </div>
                     <button
@@ -331,7 +711,7 @@ export default function Heatmap(): ReactElement {
                       }`}
                     >
                       {selectedSentence.level === 'elevated'
-                        ? 'Elevated Repetition'
+                        ? 'Formulaic'
                         : selectedSentence.level === 'moderate'
                         ? 'Moderate Pattern'
                         : 'Clean Cadence'}
@@ -410,7 +790,7 @@ export default function Heatmap(): ReactElement {
 
                     <div>
                       <div className="flex justify-between text-stone-600 mb-0.5">
-                        <span>Lexical Clichés & Repetition:</span>
+                        <span>Formulaic Phrasing:</span>
                         <span className="font-semibold text-stone-900">
                           {Math.round(selectedSentence.feature_scores.lexical_repetition * 100)}%
                         </span>

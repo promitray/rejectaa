@@ -43,3 +43,8 @@ memory.md
 *.tsbuildinfo
 
 
+
+# Scoring evaluation: licensed PDFs, cached lookups and run outputs stay local
+rejecta-api/eval/papers/
+rejecta-api/eval/cache/
+rejecta-api/eval/runs/

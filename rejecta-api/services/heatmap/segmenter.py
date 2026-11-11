@@ -50,9 +50,13 @@ class DocumentSegmenter:
 
     # Sentence boundary regex recognizing end of sentence followed by space and capital letter or bracket
     # Handles common abbreviations: e.g., i.e., et al., Fig., Eq., Dr., Prof., vs., Ref.
-    _ABBREVIATIONS = (
-        r"\b(?:e\.g\.|i\.e\.|et\s+al\.|fig\.|eq\.|dr\.|prof\.|vs\.|ref\.|no\.|dept\.|vol\.|pp\.)"
+    _ABBREVIATIONS = re.compile(
+        r"\b(?:e\.g|i\.e|et\s+al|figs?|eqs?|dr|prof|vs|refs?|no|dept|vol|pp|ca|approx|cf|resp|sect|ch|st|mr|ms)\.$",
+        re.IGNORECASE,
     )
+    # End of a sentence: . ! ? optionally followed by a citation number printed after it ("delivery.3 In"),
+    # then space and the start of the next sentence.
+    _SENTENCE_END = re.compile(r"[.!?](\d{1,3}[a-z]?(?:[,\u2013\-]\d{1,3}[a-z]?)*)?(?=\s+[A-Z0-9\"'(\[])")
 
     @classmethod
     def segment(cls, text: str) -> List[ParagraphSpan]:
@@ -115,6 +119,28 @@ class DocumentSegmenter:
         return paragraphs
 
     @classmethod
+    def _split_sentences(cls, text: str) -> List[str]:
+        """Sentences of a paragraph.
+
+        A full stop after an abbreviation (Fig., e.g., et al.) does not end a sentence. A citation number glued
+        after the full stop stays with its sentence; it counts as one only when a word or a bracket comes before
+        the full stop, so a decimal such as "pH 7.4" is never taken for a citation.
+        """
+        parts: List[str] = []
+        start = 0
+        for match in cls._SENTENCE_END.finditer(text):
+            stop = match.start()
+            before = text[stop - 1] if stop > 0 else ""
+            if match.group(1) and not (before.isalpha() or before in ")]"):
+                continue
+            if text[stop] == "." and cls._ABBREVIATIONS.search(text[max(0, stop - 12) : stop + 1]):
+                continue
+            parts.append(text[start : match.end()])
+            start = match.end()
+        parts.append(text[start:])
+        return [part for part in parts if part.strip()]
+
+    @classmethod
     def _segment_sentences(
         cls,
         full_text: str,
@@ -123,59 +149,21 @@ class DocumentSegmenter:
     ) -> List[SentenceSpan]:
         """Segment a paragraph into clean sentences while computing exact UTF-16 offsets relative to full_text."""
         sentences: List[SentenceSpan] = []
-
-        # Placeholder replacement for abbreviations to avoid false splits
-        protected_text = paragraph_clean_text
-        abbrev_matches = list(re.finditer(cls._ABBREVIATIONS, paragraph_clean_text, flags=re.IGNORECASE))
-        abbrev_vault = {}
-        for idx, match in enumerate(abbrev_matches):
-            placeholder = f"__ABBR_{idx:03d}__"
-            abbrev_vault[placeholder] = match.group(0)
-            protected_text = (
-                protected_text[: match.start()] + placeholder + protected_text[match.end() :]
-            )
-
-        # Regex split on sentence boundary: [.!?] followed by whitespace and a potential quote or capital letter
-        split_pattern = r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])"
-        parts = re.split(split_pattern, protected_text)
-
         search_pos = 0
-        s_index = 0
-
-        for part in parts:
-            if not part.strip():
-                continue
-
-            # Restore abbreviations
-            restored_part = part
-            for ph, original in abbrev_vault.items():
-                restored_part = restored_part.replace(ph, original)
-
-            # Find exact position in paragraph_clean_text
-            start_in_p = paragraph_clean_text.find(restored_part, search_pos)
+        for s_index, part in enumerate(cls._split_sentences(paragraph_clean_text)):
+            text = part.strip()
+            start_in_p = paragraph_clean_text.find(text, search_pos)
             if start_in_p == -1:
                 start_in_p = search_pos
-
-            end_in_p = start_in_p + len(restored_part)
+            end_in_p = start_in_p + len(text)
             search_pos = end_in_p
-
-            global_start_char = paragraph_char_offset + start_in_p
-            global_end_char = paragraph_char_offset + end_in_p
-
-            start_utf16 = _char_idx_to_utf16_offset(full_text, global_start_char)
-            end_utf16 = _char_idx_to_utf16_offset(full_text, global_end_char)
-
-            words = len(restored_part.split())
-
             sentences.append(
                 SentenceSpan(
                     index=s_index,
-                    text=restored_part,
-                    start_utf16=start_utf16,
-                    end_utf16=end_utf16,
-                    word_count=words,
+                    text=text,
+                    start_utf16=_char_idx_to_utf16_offset(full_text, paragraph_char_offset + start_in_p),
+                    end_utf16=_char_idx_to_utf16_offset(full_text, paragraph_char_offset + end_in_p),
+                    word_count=len(text.split()),
                 )
             )
-            s_index += 1
-
         return sentences

@@ -16,16 +16,11 @@ export default function Forge(): ReactElement {
     field?: string
   } | null
 
-  const [abstractDraft, setAbstractDraft] = useState<string>(
-    state?.text ??
-      'In this paper, we basically propose SpikeQ, an adaptive post-training quantization method for spiking neural networks. We evaluated our model across 6 image classification benchmarks. Mean energy consumption per inference dropped from 1.84 mJ to 1.21 mJ, while top-1 accuracy remained 92.4% (p < 0.001; 95% CI [-0.5, 0.1]). Our optimization minimizes spike-error variance directly.'
-  )
-  const [methodology, setMethodology] = useState<string>(
-    state?.methodology ??
-      'Spiking neural networks (SNNs) implemented on neuromorphic hardware under event-driven temporal dynamics. Evaluated on ImageNet and neuromorphic CIFAR10-DVS.'
-  )
-  const [journal, setJournal] = useState<string>(state?.journal ?? 'Nature Machine Intelligence')
-  const [field, setField] = useState<string>(state?.field ?? 'Computer Science & Machine Learning')
+  const [abstractDraft, setAbstractDraft] = useState<string>(state?.text ?? '')
+  const [methodology, setMethodology] = useState<string>(state?.methodology ?? '')
+  const [journal, setJournal] = useState<string>(state?.journal ?? '')
+  const [field, setField] = useState<string>(state?.field ?? '')
+  const [maxWords, setMaxWords] = useState<string>('')
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<AbstractForgeResponse | null>(null)
@@ -41,9 +36,10 @@ export default function Forge(): ReactElement {
     try {
       const res = await forgeAbstract({
         abstract_draft: abstractDraft,
-        methodology_context: methodology,
-        journal,
-        field,
+        ...(methodology.trim() ? { methodology_context: methodology } : {}),
+        ...(journal.trim() ? { journal: journal.trim() } : {}),
+        ...(field.trim() ? { field: field.trim() } : {}),
+        ...(Number(maxWords) >= 30 && Number(maxWords) <= 600 ? { max_words: Number(maxWords) } : {}),
       })
       setResult(res)
     } catch (err: unknown) {
@@ -110,6 +106,7 @@ export default function Forge(): ReactElement {
             type="text"
             value={journal}
             onChange={(e) => setJournal(e.target.value)}
+            placeholder="e.g. Polymer Chemistry"
             className="w-full text-sm px-3 py-2 border border-stone-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-stone-900"
           />
         </div>
@@ -122,6 +119,22 @@ export default function Forge(): ReactElement {
             type="text"
             value={field}
             onChange={(e) => setField(e.target.value)}
+            placeholder="e.g. Polymer chemistry"
+            className="w-full text-sm px-3 py-2 border border-stone-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-stone-900"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs font-semibold uppercase tracking-wider text-stone-600 mb-1">
+            Max words <span className="normal-case font-normal text-stone-400">(journal limit, optional)</span>
+          </label>
+          <input
+            type="number"
+            min={30}
+            max={600}
+            value={maxWords}
+            onChange={(e) => setMaxWords(e.target.value)}
+            placeholder="e.g. 150"
             className="w-full text-sm px-3 py-2 border border-stone-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-stone-900"
           />
         </div>
@@ -257,18 +270,18 @@ export default function Forge(): ReactElement {
                         {v.readiness_index?.overall_readiness_score ?? v.predicted_acceptance_score}
                       </div>
                       <div className="text-[9px] uppercase tracking-wider text-stone-500 mt-0.5 font-semibold">
-                        Readiness Index
+                        Faithfulness
                       </div>
                       <div className="hidden group-hover:block absolute right-0 top-full mt-1.5 w-60 p-2.5 bg-stone-900 text-stone-100 text-[10.5px] rounded shadow-xl z-20 text-left">
-                        <div className="font-semibold text-white mb-1">Editorial Readiness Breakdown:</div>
+                        <div className="font-semibold text-white mb-1">Checked against your draft:</div>
                         <div className="space-y-0.5 text-stone-300">
-                          <div>• Empirical Anchoring: {v.readiness_index?.empirical_anchoring ?? 88}%</div>
-                          <div>• Comparison Grounding: {v.readiness_index?.comparison_grounding ?? 85}%</div>
-                          <div>• Trade-off Retention: {v.readiness_index?.tradeoff_retention ?? 85}%</div>
-                          <div>• Narrative Discipline: {v.readiness_index?.narrative_discipline ?? 86}%</div>
+                          <div>• Facts kept: {v.readiness_index?.empirical_anchoring ?? '–'}%</div>
+                          <div>• Claims not strengthened: {v.readiness_index?.comparison_grounding ?? '–'}%</div>
+                          <div>• Limitations & qualifiers kept: {v.readiness_index?.tradeoff_retention ?? '–'}%</div>
+                          <div>• Nothing added, within length: {v.readiness_index?.narrative_discipline ?? '–'}%</div>
                         </div>
                         <div className="text-[9.5px] text-stone-400 mt-1 pt-1 border-t border-stone-800">
-                          Structural quality index (does not guarantee journal acceptance).
+                          Computed from checks of this version against your draft. It does not predict acceptance.
                         </div>
                       </div>
                     </div>
@@ -288,8 +301,24 @@ export default function Forge(): ReactElement {
 
                   {/* Rendered Abstract Text with LaTeX support */}
                   <div className="p-3.5 bg-stone-50 rounded-lg border border-stone-200/80 text-[13.5px] leading-relaxed text-stone-900 font-sans tracking-[0.01em] min-h-[190px]">
-                    <FormattedMathText text={v.abstract_text} />
+                    {v.blocked ? (
+                      <div className="text-rose-800 text-[12.5px]">
+                        <p className="font-semibold">Not shown: this version lost a protected value.</p>
+                        {(v.block_reasons ?? []).map((reason) => (
+                          <p key={reason} className="mt-1">{reason}</p>
+                        ))}
+                      </div>
+                    ) : (
+                      <FormattedMathText text={v.abstract_text} />
+                    )}
                   </div>
+                  {v.warnings && v.warnings.length > 0 && (
+                    <ul className="mt-2 space-y-1 rounded border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-900">
+                      {v.warnings.map((w) => (
+                        <li key={w}>⚠ {w}</li>
+                      ))}
+                    </ul>
+                  )}
 
                   {/* Claim & Limitation Audit Badge */}
                   {v.claim_audit && (
@@ -300,7 +329,7 @@ export default function Forge(): ReactElement {
                           v.claim_audit.is_faithful ? 'text-emerald-700' : 'text-amber-800'
                         }`}
                       >
-                        {v.claim_audit.is_faithful ? '✓ Faithful to Source' : '⚠ Overclaim Caution'}
+                        {v.claim_audit.is_faithful ? '✓ No change of meaning found' : '⚠ Meaning changed: read the notes'}
                       </span>
                     </div>
                   )}
@@ -309,7 +338,7 @@ export default function Forge(): ReactElement {
                   {v.seo_keywords && v.seo_keywords.length > 0 && (
                     <div className="mt-3 p-2.5 bg-sky-50/50 rounded border border-sky-100">
                       <span className="text-[10px] uppercase font-bold tracking-wider text-sky-900 block mb-1">
-                        Indexing Keywords (PubMed & Scholar):
+                        Indexing Keywords:
                       </span>
                       <div className="flex flex-wrap gap-1">
                         {v.seo_keywords.map((kw, i) => (
@@ -335,8 +364,9 @@ export default function Forge(): ReactElement {
                 <div className="mt-5 pt-3 border-t border-stone-200 space-y-2">
                   <button
                     type="button"
+                    disabled={v.blocked}
                     onClick={() => handleCopy(v.abstract_text, idx)}
-                    className="w-full py-2 px-3 rounded bg-stone-900 text-white text-xs font-semibold uppercase tracking-wider hover:bg-stone-800 transition"
+                    className="disabled:opacity-40 w-full py-2 px-3 rounded bg-stone-900 text-white text-xs font-semibold uppercase tracking-wider hover:bg-stone-800 transition"
                   >
                     {copiedIndex === idx ? '✓ Copied to Clipboard' : 'Copy This Abstract'}
                   </button>

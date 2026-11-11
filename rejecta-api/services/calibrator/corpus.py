@@ -40,6 +40,15 @@ TIER1_STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
         ],
         "target_cadence": "Logical deduction chains, step-by-step mechanistic assertions."
     },
+    "chemistry": {
+        "voice": "precise and impersonal; first-person plural for the authors' own work ('we synthesized'), passive for standard procedures",
+        "intro_pattern": "Application context, the chemical problem or gap, then the approach of this work",
+        "hedging_level": "evidence-tied (claims follow from the characterization data shown; mechanisms stated as proposed unless proven)",
+        "banned_synthetic_markers": [
+            "delve", "testament", "paramount", "underscores", "tapestry", "invaluable", "pivotal", "game-changer"
+        ],
+        "target_cadence": "Compact, information-dense sentences; compound labels and units exactly as defined."
+    },
     "default": {
         "voice": "rigorous academic, clear agent attribution, crisp empirical rhythm",
         "intro_pattern": "Gap-first argument structure with explicit contribution boundaries",
@@ -50,6 +59,13 @@ TIER1_STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
         "target_cadence": "Crisp academic cadence without corporate marketing filler."
     }
 }
+
+
+# Parts of journal names from the chemistry publishers (RSC, ACS, Wiley-VCH, Elsevier chemistry titles)
+CHEMISTRY_JOURNAL_HINTS = (
+    "chem", "polym", "macromol", "langmuir", "rsc", "acs ", "angew", "dalton", "organometallic",
+    "catal", "inorg", "biomacromolecules", "adv. mater", "advanced materials", "materials horizons",
+)
 
 
 class JournalCorpusService:
@@ -66,8 +82,12 @@ class JournalCorpusService:
             profile = TIER1_STYLE_PRESETS["ieee"].copy()
         elif any(v in normalized for v in ["cell", "lancet", "nejm", "immunity", "neuron"]):
             profile = TIER1_STYLE_PRESETS["cell"].copy()
+        elif any(v in normalized for v in CHEMISTRY_JOURNAL_HINTS):
+            profile = TIER1_STYLE_PRESETS["chemistry"].copy()
         else:
             profile = TIER1_STYLE_PRESETS["default"].copy()
+            profile["recognised"] = False
 
+        profile.setdefault("recognised", True)
         profile["target_journal"] = journal_name
         return profile

@@ -63,7 +63,7 @@ async def security_checks() -> None:
             """,
             APP_SCHEMA,
         )
-        check(len(tables) == 13, f"13 app tables exist (found {len(tables)})")
+        check(len(tables) == 14, f"14 app tables exist (found {len(tables)})")
         no_rls = [t["relname"] for t in tables if not t["relrowsecurity"]]
         check(not no_rls, f"RLS enabled on every table {no_rls or ''}")
 

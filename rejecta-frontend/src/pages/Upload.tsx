@@ -66,6 +66,7 @@ export default function Upload(): ReactElement {
   const [file, setFile] = useState<File | null>(null)
   const [journal, setJournal] = useState('')
   const [articleType, setArticleType] = useState<ArticleType | 'auto'>('auto')
+  const [keepCopy, setKeepCopy] = useState(true)
   const [email, setEmail] = useState('')
   const [dragging, setDragging] = useState(false)
   const [fileError, setFileError] = useState<string | null>(null)
@@ -143,7 +144,10 @@ export default function Upload(): ReactElement {
     setError(null)
     setLoading(true)
 
-    const request = submitPaper(selected, journal.trim(), selectedMode, email.trim(), articleType)
+    useRejectaStore.getState().setLastSubmission({
+      file: selected, journal: journal.trim(), mode: selectedMode, email: email.trim(), articleType, keepCopy,
+    })
+    const request = submitPaper(selected, journal.trim(), selectedMode, email.trim(), articleType, keepCopy)
     navigate('/processing')
 
     request
@@ -321,10 +325,27 @@ export default function Upload(): ReactElement {
           <option value="perspective">Perspective</option>
           <option value="review">Review article</option>
           <option value="mini_review">Mini-review</option>
+          <option value="editorial">Editorial / foreword</option>
         </select>
         <p className="mt-1 text-xs text-gray-500">
           The type decides which sections are expected, so a short communication is not marked down for sections it does not have.
         </p>
+
+        <label className="mt-5 flex items-start gap-2 text-sm text-gray-800">
+          <input
+            type="checkbox"
+            checked={keepCopy}
+            onChange={(event) => setKeepCopy(event.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Keep an editable copy for 24 hours
+            <span className="block text-xs text-gray-500">
+              Lets you apply calibrated sections to your paper and download it as Word. The copy is stored on our
+              server and deleted after 24 hours, or earlier if you delete it. Without this, nothing is stored.
+            </span>
+          </span>
+        </label>
 
         <label className="mt-5 block text-sm font-medium text-gray-800" htmlFor="email">
           Email <span className="font-normal text-gray-500">(optional)</span>

@@ -56,6 +56,15 @@ class ScientificVault:
         r"(\[\s*\d+(?:[\–\-,]\s*\d+)*\s*\]|\(\s*[A-Z][A-Za-z\-]*(?:\s+et\s+al\.)?,\s*(?:19|20)\d{2}[a-z]?\s*\))"
     )
 
+    # 2b. Superscript citation numbers that a PDF or plain text glues to a word: "materials1", "imaging,2",
+    # "delivery.3", "mechano-5", "pyrene10b", "polymers.13,14". Only after three lowercase letters (optionally
+    # followed by one punctuation mark), so "P1", "S2", "C60" or "H2O" are never taken for citations.
+    _CITATION_MARKER_PATTERN = re.compile(
+        r"(?:(?<=[a-z]{3})|(?<=[a-z]{3}[.,;:)\-])|(?<=[A-Za-z0-9]\)[.,;:]))"
+        r"(\d{1,3}[a-z]?(?:\s?[,–\-]\s?\d{1,3}[a-z]?)*)"
+        r"(?=[\s.,;:)\]]|$)"
+    )
+
     # 3. Statistical Assertions, Inter-Quartile Ranges, Confidence Intervals, and p-values:
     # e.g.: p < 0.05, p = 0.001, t(24) = 3.12, 95% CI [-7.8 to -2.4], 95% CI [0.12, 0.45], IQR, 12–27, n = 1,420, AUROC = 0.941
     _STAT_PATTERN = re.compile(
@@ -105,6 +114,10 @@ class ScientificVault:
         # Standard Citations
         for m in cls._STANDARD_CITATION_PATTERN.finditer(text):
             candidates.append((m.start(), m.end(), m.group(0), "citation"))
+
+        # Citation numbers glued to a word (superscripts in the original)
+        for m in cls._CITATION_MARKER_PATTERN.finditer(text):
+            candidates.append((m.start(1), m.end(1), m.group(1), "citation_marker"))
 
         # Stats
         for m in cls._STAT_PATTERN.finditer(text):
@@ -185,6 +198,11 @@ class ScientificVault:
         cat_counts: Dict[str, int] = {}
         for r in records:
             cat_counts[r.category] = cat_counts.get(r.category, 0) + 1
+
+        # A citation marker belongs to the word before it: "materials __REJ_INV_0001__" goes back to "materials1".
+        for r in records:
+            if r.category == "citation_marker":
+                restored = re.sub(r"[ \t]+(?=" + re.escape(r.token_id) + ")", "", restored)
 
         restored_count = 0
         for token_id, original in vault.items():

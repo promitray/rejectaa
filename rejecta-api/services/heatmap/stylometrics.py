@@ -10,7 +10,10 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Dict, List, Set, Tuple
+
+from services.heatmap.patterns import find_phrases
 
 
 @dataclass(frozen=True)
@@ -30,17 +33,17 @@ TRANSITION_PATTERNS = [
     r"\badditionally\b",
     r"\bconsequently\b",
     r"\bnotably\b",
-    r"\bsignificantly\b",
     r"\bimportantly\b",
     r"\bto\s+this\s+end\b",
     r"\bin\s+this\s+regard\b",
     r"\bit\s+is\s+worth\s+noting\b",
     r"\bit\s+is\s+important\s+to\s+(?:note|remember|highlight)\b",
-    r"\bas\s+a\s+result\b",
     r"\bhenceforth\b",
-    r"\bthus\b",
-    r"\btherefore\b",
 ]
+# Words that start many ordinary sentences; a repeated one of these is not a pattern.
+COMMON_OPENERS = frozenset(
+    "the a an this these that those it its we our in for to of on at by with as after before here there".split()
+)
 
 # Common passive voice indicator patterns (auxiliary + past participle)
 PASSIVE_VOICE_PATTERNS = [
@@ -151,22 +154,16 @@ class StylometricAnalyzer:
 
     @classmethod
     def compute_template_similarity(cls, s1_body: str, s2_body: str) -> float:
-        """Calculate structural token overlap (Jaccard similarity on word n-grams / tokens)
+        """How alike two sentence bodies are as ordered word sequences (0..1).
 
-        between stripped sentence bodies.
-        High similarity (> 0.60) indicates repeated sentence templating despite changing transition words.
+        Word order matters, so two sentences that share topic words in a different structure score low,
+        while "the proposed framework provides a robust ... X" written twice scores high.
         """
-        tokens1 = [w.lower() for w in re.findall(r"\b[a-z]{3,}\b", s1_body)]
-        tokens2 = [w.lower() for w in re.findall(r"\b[a-z]{3,}\b", s2_body)]
-
-        if not tokens1 or not tokens2:
+        tokens1 = re.findall(r"[a-z0-9]+", s1_body.lower())
+        tokens2 = re.findall(r"[a-z0-9]+", s2_body.lower())
+        if len(tokens1) < 5 or len(tokens2) < 5:
             return 0.0
-
-        set1 = set(tokens1)
-        set2 = set(tokens2)
-        intersection = set1.intersection(set2)
-        union = set1.union(set2)
-        return len(intersection) / max(len(union), 1)
+        return SequenceMatcher(None, tokens1, tokens2, autojunk=False).ratio()
 
     @classmethod
     def compute_transition_repetition(
@@ -195,11 +192,15 @@ class StylometricAnalyzer:
             words_curr = current_stem.split()
             for past_stem in recent_openers[-3:]:
                 words_past = past_stem.split()
-                if words_curr and words_past:
-                    if words_curr[0] == words_past[0]:
-                        stem_repeated = True
-                        evidence_spans.append(f"Repeated opener structure '{words_curr[0]}'")
-                        break
+                if not words_curr or not words_past:
+                    continue
+                same_two = len(words_curr) >= 2 and len(words_past) >= 2 and words_curr[:2] == words_past[:2]
+                same_rare_first = words_curr[0] == words_past[0] and words_curr[0] not in COMMON_OPENERS
+                if same_two or same_rare_first:
+                    stem_repeated = True
+                    opener = " ".join(words_curr[:2]) if same_two else words_curr[0]
+                    evidence_spans.append(f"Repeated opener structure '{opener}'")
+                    break
 
         # 3. Check for repeated sentence templates (e.g. changing 'Moreover' -> 'Furthermore' with identical body)
         current_stripped = cls.strip_leading_transition(sentence_text)
@@ -214,24 +215,24 @@ class StylometricAnalyzer:
                     w_curr = current_stripped.split()[:5]
                     shared_template_excerpt = " ".join(w_curr)
 
-        template_repeated = max_template_sim >= 0.58
+        template_repeated = max_template_sim >= 0.70
         if template_repeated:
             evidence_spans.append(f"Repeated sentence template ('{shared_template_excerpt}...')")
 
         # Dynamic score calculation based on actual evidence
-        score = 0.05
+        score = 0.0
         diagnostics: List[str] = []
 
         if template_repeated:
             # Substantial template repetition adds direct evidence-based score
-            score += 0.40
+            score += 0.50
             diagnostics.append(f"Repeated sentence template structure: '{shared_template_excerpt}...' (template similarity {max_template_sim:.2f})")
 
         if len(matched_transitions) >= 2:
             score += 0.45
             diagnostics.append(f"Clustered transition openers: {', '.join(matched_transitions)}")
         elif len(matched_transitions) == 1:
-            score += 0.25
+            score += 0.15
             repeats_recent_transition = any(t in recent_transitions for t in matched_transitions)
             if repeats_recent_transition:
                 score += 0.15
@@ -243,7 +244,7 @@ class StylometricAnalyzer:
             score += 0.20
             diagnostics.append("Repeated opening subject/stem across consecutive sentences")
 
-        final_score = round(max(0.05, min(0.95, score)), 3)
+        final_score = round(max(0.0, min(0.95, score)), 3)
         summary = "; ".join(diagnostics) if diagnostics else "Direct sentence opening without formulaic transition repetition."
 
         return FeatureExtractionResult(
@@ -258,6 +259,7 @@ class StylometricAnalyzer:
     def compute_passive_construction_ratio(
         cls,
         sentence_text: str,
+        passive_is_normal: bool = False,
     ) -> FeatureExtractionResult:
         """Detect passive voice auxiliary chains without clear empirical agency."""
         text_lower = sentence_text.lower()
@@ -283,8 +285,11 @@ class StylometricAnalyzer:
             score = 0.25
             summary = "Balanced passive clause anchored by active empirical findings."
         else:
-            score = 0.05
+            score = 0.0
             summary = "Active declarative sentence structure."
+        if passive_is_normal and passive_count:
+            score = round(score * 0.5, 3)
+            summary += " (passive is usual in this field, so it counts for less)"
 
         return FeatureExtractionResult(
             feature_name="passive_construction_ratio",
@@ -300,40 +305,32 @@ class StylometricAnalyzer:
         sentence_text: str,
         paragraph_tokens: List[str],
     ) -> FeatureExtractionResult:
-        """Detect repetition of formulaic qualitative modifiers and low lexical diversity."""
-        text_lower = sentence_text.lower()
-        words = re.findall(r"\b[a-z]{3,}\b", text_lower)
+        """Formulaic phrasing: stock phrases, inflated verbs, hype words, template structures, empty conclusions.
 
-        # Check for known clichés
-        cliches_found: List[str] = []
-        for pat in CLICHE_MODIFIERS:
-            for m in re.finditer(pat, text_lower):
-                cliches_found.append(m.group(0))
+        One match is common in human writing; two or more in one sentence is what reads as formulaic.
+        """
+        matches = find_phrases(sentence_text)
+        count = len(matches)
+        score = 0.0 if count == 0 else 0.45 if count == 1 else 0.70 if count == 2 else 0.90
 
-        # Check Type-Token Ratio (TTR) in the sentence
-        if len(words) >= 8:
-            unique_ratio = len(set(words)) / len(words)
-        else:
-            unique_ratio = 1.0
-
-        score = 0.10
+        words = re.findall(r"\b[a-z]{3,}\b", sentence_text.lower())
+        unique_ratio = len(set(words)) / len(words) if len(words) >= 12 else 1.0
         summary_points: List[str] = []
-
-        if cliches_found:
-            score += min(0.60, len(cliches_found) * 0.30)
-            summary_points.append(f"Clustered qualitative qualifiers: {', '.join(cliches_found)}")
-
-        if unique_ratio < 0.65 and len(words) >= 12:
-            score += 0.25
-            summary_points.append(f"Low lexical diversity (Type-Token Ratio {unique_ratio:.2f})")
-
-        normalized_score = max(0.05, min(0.95, score))
-        summary = "; ".join(summary_points) if summary_points else "Diverse, non-repetitive vocabulary."
+        if matches:
+            groups: Dict[str, List[str]] = {}
+            for m in matches:
+                groups.setdefault(m.group, []).append(m.text)
+            summary_points.append(
+                "Formulaic phrasing: " + "; ".join(f"{g} ({', '.join(t)})" for g, t in groups.items())
+            )
+        if unique_ratio < 0.60:
+            score = min(0.95, score + 0.10)
+            summary_points.append(f"Repeated words within the sentence (type-token ratio {unique_ratio:.2f})")
 
         return FeatureExtractionResult(
             feature_name="lexical_repetition",
-            raw_value=round(unique_ratio, 3),
-            normalized_score=round(normalized_score, 3),
-            evidence_spans=cliches_found,
-            diagnostic_summary=summary,
+            raw_value=float(count),
+            normalized_score=round(score, 3),
+            evidence_spans=[m.text for m in matches],
+            diagnostic_summary="; ".join(summary_points) if summary_points else "No formulaic phrasing found.",
         )

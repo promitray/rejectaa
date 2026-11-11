@@ -16,7 +16,9 @@ COMMUNICATION = "communication"
 PERSPECTIVE = "perspective"
 REVIEW = "review"
 MINI_REVIEW = "mini_review"
-ARTICLE_TYPES = (RESEARCH_ARTICLE, COMMUNICATION, PERSPECTIVE, REVIEW, MINI_REVIEW)
+EDITORIAL = "editorial"  # editorials, forewords, themed-collection introductions: invited, not research
+ARTICLE_TYPES = (RESEARCH_ARTICLE, COMMUNICATION, PERSPECTIVE, REVIEW, MINI_REVIEW, EDITORIAL)
+NON_RESEARCH_TYPES = (EDITORIAL,)  # never judged for novelty or rigor, never desk-rejected
 THEMATIC_TYPES = (PERSPECTIVE, REVIEW, MINI_REVIEW)  # body is split by topic, not Results/Methods
 
 # Section roles the analysis understands. A "thematic" section is any topic heading of a review.
@@ -45,6 +47,12 @@ _REVIEW_CRITERIA: tuple[tuple[str, float], ...] = (
     ("clarity", 15),
     ("journal_fit", 10),
 )
+_EDITORIAL_CRITERIA: tuple[tuple[str, float], ...] = (
+    ("purpose", 35),
+    ("context_accuracy", 25),
+    ("clarity", 20),
+    ("journal_fit", 10),
+)
 CITATION_WEIGHT = 10.0
 
 CRITERION_HELP = {
@@ -56,6 +64,8 @@ CRITERION_HELP = {
     "coverage_balance": "breadth and balance of the literature covered",
     "critical_synthesis": "whether the paper compares and judges work instead of listing it",
     "outlook": "whether open questions and future directions are concrete",
+    "purpose": "how well the piece does what it is for (introducing a collection, an issue or a topic, marking an occasion)",
+    "context_accuracy": "whether the background and history it gives are accurate and properly sourced",
 }
 
 
@@ -101,6 +111,12 @@ PROFILES: dict[str, Profile] = {
         not_expected=(ROLE_RESULTS, ROLE_METHODS),
         criteria=_REVIEW_CRITERIA,
     ),
+    EDITORIAL: Profile(
+        EDITORIAL, "Editorial",
+        expected=(),
+        not_expected=(ROLE_METHODS, ROLE_RESULTS, ROLE_THEMATIC),
+        criteria=_EDITORIAL_CRITERIA,
+    ),
     # Type not known: judge by the research criteria, expect nothing in particular.
     UNKNOWN: Profile(UNKNOWN, "Type not determined", expected=(), not_expected=(), criteria=_RESEARCH_CRITERIA),
 }
@@ -120,6 +136,7 @@ def coerce_article_type(value: object) -> str | None:
         "original_research": RESEARCH_ARTICLE, "paper": RESEARCH_ARTICLE,
         "letter": COMMUNICATION, "letters": COMMUNICATION, "communications": COMMUNICATION,
         "minireview": MINI_REVIEW, "mini": MINI_REVIEW, "review_article": REVIEW,
+        "foreword": EDITORIAL, "preface": EDITORIAL, "editorial_note": EDITORIAL,
     }
     key = aliases.get(key, key)
     return key if key in ARTICLE_TYPES else None
@@ -135,13 +152,17 @@ _LABELS: dict[str, str] = {
     "PERSPECTIVE": PERSPECTIVE, "PERSPECTIVES": PERSPECTIVE,
     "REVIEW": REVIEW, "REVIEW ARTICLE": REVIEW, "TUTORIAL REVIEW": REVIEW, "CRITICAL REVIEW": REVIEW,
     "MINI-REVIEW": MINI_REVIEW, "MINIREVIEW": MINI_REVIEW, "MINI REVIEW": MINI_REVIEW,
+    "EDITORIAL": EDITORIAL, "GUEST EDITORIAL": EDITORIAL, "FOREWORD": EDITORIAL, "PREFACE": EDITORIAL,
 }
 _LABEL_SCAN_LINES = 60
+_LABEL_SCAN_TAIL_LINES = 15  # RSC and others put the banner ("EDITORIAL", "COMMUNICATION") last in the page text
 
 
 def detect_article_type(first_page_lines: list[str]) -> str | None:
-    """The article type named by a label line near the top of the first page, if there is one."""
-    for line in first_page_lines[:_LABEL_SCAN_LINES]:
+    """The article type named by a label line at the top (or in the banner) of the first page, if there is one."""
+    head = first_page_lines[:_LABEL_SCAN_LINES]
+    tail = first_page_lines[_LABEL_SCAN_LINES:][-_LABEL_SCAN_TAIL_LINES:]
+    for line in head + tail:
         text = re.sub(r"\s+", " ", line).strip().rstrip(":.").upper()
         if 3 <= len(text) <= 24 and text in _LABELS:
             return _LABELS[text]
@@ -160,6 +181,71 @@ def refers_to_si(text: str) -> bool:
     return bool(_SI_REFERENCE.search(text))
 
 
+# Section names for a paper without usable headings. The model only says where each one starts; the names
+# come from this fixed list, so the same paper (or its revision) always gets the same sections.
+_DERIVED_RESEARCH = (
+    ("Introduction", ROLE_INTRODUCTION),
+    ("Experimental", ROLE_METHODS),
+    ("Results and discussion", ROLE_RESULTS),
+    ("Conclusion", ROLE_DISCUSSION),
+)
+_DERIVED_REVIEW = (
+    ("Introduction", ROLE_INTRODUCTION),
+    ("Main text", ROLE_THEMATIC),
+    ("Outlook", ROLE_DISCUSSION),
+    ("Conclusion", ROLE_DISCUSSION),
+)
+_DERIVED_EDITORIAL = (
+    ("Introduction", ROLE_INTRODUCTION),
+    ("Main text", "other"),
+    ("Conclusion", ROLE_DISCUSSION),
+)
+
+
+def derived_section_names(article_type: str | None) -> tuple[tuple[str, str], ...]:
+    """(name, role) of the sections a paper without headings is divided into, in reading order."""
+    if article_type in THEMATIC_TYPES:
+        return _DERIVED_REVIEW
+    if article_type == EDITORIAL:
+        return _DERIVED_EDITORIAL
+    return _DERIVED_RESEARCH
+
+
+_NAME_HINTS = (
+    ("intro", ROLE_INTRODUCTION),
+    ("background", ROLE_INTRODUCTION),
+    ("experiment", ROLE_METHODS),
+    ("method", ROLE_METHODS),
+    ("material", ROLE_METHODS),
+    ("procedure", ROLE_METHODS),
+    ("conclu", ROLE_DISCUSSION),
+    ("summary", ROLE_DISCUSSION),
+    ("outlook", ROLE_DISCUSSION),
+    ("perspective", ROLE_DISCUSSION),
+    ("future", ROLE_DISCUSSION),
+)
+
+
+def canonical_section_name(name: str, role: str, article_type: str | None) -> tuple[str, str]:
+    """The fixed name (and its role) a section the model found in a paper without headings is filed under."""
+    names = derived_section_names(article_type)
+    wanted = re.sub(r"[^a-z]+", " ", name.lower()).strip()
+    for fixed, fixed_role in names:
+        if wanted == fixed.lower():
+            return fixed, fixed_role
+    hinted = next((r for hint, r in _NAME_HINTS if hint in wanted), None)
+    if hinted == ROLE_DISCUSSION and any(n == "Outlook" for n, _ in names) and any(
+        h in wanted for h in ("outlook", "perspective", "future")
+    ):
+        return "Outlook", ROLE_DISCUSSION
+    target_role = hinted or role
+    for fixed, fixed_role in names:
+        if fixed_role == target_role:
+            return fixed, fixed_role
+    body = next(((n, r) for n, r in names if n in ("Results and discussion", "Main text")), names[0])
+    return body
+
+
 def assess_structure(
     section_roles: dict[str, str], section_chars: int, body_chars: int, article_type: str | None
 ) -> tuple[str, float]:
@@ -172,7 +258,8 @@ def assess_structure(
     if article_type in THEMATIC_TYPES:
         ok = ROLE_INTRODUCTION in found and thematic >= 2
     else:
-        ok = len(found & set(CANONICAL_ROLES)) >= 3
+        # standard IMRaD headings, or numbered topic headings after an Introduction (a review not labelled as one)
+        ok = len(found & set(CANONICAL_ROLES)) >= 3 or (ROLE_INTRODUCTION in found and thematic >= 2)
     if ok and coverage >= 0.6:
         return "detected", coverage
     return "partial", coverage

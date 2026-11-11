@@ -12,7 +12,7 @@ export default function Footer(): ReactElement {
           </p>
           <p className="mt-2 max-w-md">
             A pre-submission desk review. Not a peer review, not a journal decision, and not a
-            grammar checker. Manuscripts are parsed in memory and are not stored.
+            grammar checker. An editable copy of your manuscript is kept for 24 hours so you can apply changes, then deleted. Untick it on the upload form to store nothing.
           </p>
         </div>
         <div className="flex gap-4">

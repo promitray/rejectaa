@@ -35,16 +35,16 @@ DATACITE_DOI_URL = "https://api.datacite.org/dois"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 OPENALEX_USER_AGENT = "Rejecta/1.0 (mailto:hello@rejecta.ai)"
 REQUEST_TIMEOUT = 8.0
-MAX_REFERENCES = 60
+MAX_REFERENCES = 150  # parser reads up to 300; checking more than this takes too long per analysis
 LOOKUP_CONCURRENCY = 8
 CROSSREF_MAILTO = "hello@rejecta.ai"
 CROSSREF_SELECT = (
     "DOI,title,published,issued,published-print,published-online,author,score,type,"
-    "container-title,short-container-title,publisher,volume,page"
+    "container-title,short-container-title,publisher,volume,page,article-number"
 )
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 # One paper must not hold the request open forever; whatever is unfinished is reported as "not checked".
-TOTAL_BUDGET_SECONDS = 45.0
+TOTAL_BUDGET_SECONDS = 60.0
 VERIFIED_TTL_SECONDS = 24 * 3600.0
 NOT_FOUND_TTL_SECONDS = 3600.0
 _cache = TTLCache()
