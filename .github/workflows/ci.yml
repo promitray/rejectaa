@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code & Test Fixtures
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
           lfs: true
@@ -29,7 +29,7 @@ jobs:
 
       - name: Install Python Dependencies
         run: |
-          cd rejectaa/rejecta-api
+          cd rejecta-api
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install langwatch-scenario pytest-html pytest-asyncio
@@ -37,7 +37,7 @@ jobs:
       # Stage 1: Deterministic Fast Unit Tests (0 API Cost)
       - name: Run Core Unit & Guard Tests
         run: |
-          cd rejectaa/rejecta-api
+          cd rejecta-api
           pytest tests/test_documents.py tests/test_analysis_guard.py tests/test_parser_docx.py tests/test_paper_structure.py tests/test_scoring_accuracy_step1.py -v --junitxml=junit-unit.xml
 
       # Stage 2: LangWatch Scenario Paper Pipeline E2E Evaluation
@@ -46,9 +46,9 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           LANGWATCH_API_KEY: ${{ secrets.LANGWATCH_API_KEY }}
-          TEST_PAPERS_DIR: ${{ github.workspace }}/rejectaa/rejecta-api/eval/papers
+          TEST_PAPERS_DIR: ${{ github.workspace }}/rejecta-api/eval/papers
         run: |
-          cd rejectaa/rejecta-api
+          cd rejecta-api
           pytest scenarios/test_scenario_paper_analysis.py -v --html=evaluation_report.html --self-contained-html
 
       # Stage 3: Publish Interactive HTML Report as Artifact
@@ -57,7 +57,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rejecta-paper-analysis-evaluation-report
-          path: rejectaa/rejecta-api/evaluation_report.html
+          path: rejecta-api/evaluation_report.html
 
       # Stage 4: Post Evaluation Summary to GitHub Action Summary
       - name: Publish Step Summary
@@ -65,8 +65,7 @@ jobs:
         run: |
           echo "## 📄 Rejecta Paper Analysis Pipeline Evaluation" >> $GITHUB_STEP_SUMMARY
           echo "### 🚀 CI Evaluation Status" >> $GITHUB_STEP_SUMMARY
-          echo "- **Unit Tests**: Passed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unit Tests**: Executed" >> $GITHUB_STEP_SUMMARY
           echo "- **Scenario E2E Evaluations**: Executed via LangWatch Scenario" >> $GITHUB_STEP_SUMMARY
           echo "- **Quote Grounding & Integrity**: Verified against paper manuscripts" >> $GITHUB_STEP_SUMMARY
           echo "Download the \`rejecta-paper-analysis-evaluation-report\` artifact to view full interactive traces." >> $GITHUB_STEP_SUMMARY
-

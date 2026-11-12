@@ -8,6 +8,7 @@ zero-hallucination quote grounding checks.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,8 @@ async def test_scenario_published_paper_review(test_papers_dir: Path):
       - Ghost citation count is 0
       - Scenario JudgeAgent verifies academic tone and constructive feedback
     """
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY secret is required for live Scenario evaluation")
     paper_path = _find_paper(test_papers_dir, "published", "Automatic_materials") or \
                  _find_paper(test_papers_dir, "published", "Radical_ligand") or \
                  _find_paper(test_papers_dir, "published", "")
@@ -131,6 +134,8 @@ async def test_scenario_retracted_paper_autopsy(test_papers_dir: Path):
     Tests that papers known to be retracted are caught by the integrity check,
     receive an explicit integrity alert, and score below 40.
     """
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY secret is required for live Scenario evaluation")
     paper_path = _find_paper(test_papers_dir, "retracted", "RETRACTED") or \
                  _find_paper(test_papers_dir, "retracted", "Anticancer") or \
                  _find_paper(test_papers_dir, "retracted", "")
@@ -195,6 +200,8 @@ async def test_scenario_preprint_paper_evaluation(test_papers_dir: Path):
     Tests unpublished preprints (e.g. ChemRxiv, arXiv) for method completeness,
     section extraction accuracy, and objective scoring.
     """
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY secret is required for live Scenario evaluation")
     paper_path = _find_paper(test_papers_dir, "preprint_unpublished", "Conditional_VAE") or \
                  _find_paper(test_papers_dir, "preprint_unpublished", "")
 
