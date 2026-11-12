@@ -118,9 +118,28 @@ def parse_paper(paper: dict[str, Any]):
     return parsed, info
 
 
+def section_summary(result) -> dict[str, Any]:
+    """What the section analysis gave, for the section metrics: scores, which sections the review reached, how
+    many of its quotations are really in the paper (checked again here, not trusted), and the checklists."""
+    from services.analysis_guard import alnum
+
+    corpus = result.context.corpus
+    sections = result.analysis.sections
+    points = [q for s in sections.values() for q in [*(f.quote for f in s.findings), *(t.quote for t in s.strengths)]]
+    return {
+        "section_scores": {name: s.score for name, s in sections.items()},
+        "section_reviewed": {name: s.llm_score is not None for name, s in sections.items()},
+        "section_findings": {name: len(s.findings) for name, s in sections.items()},
+        "section_points": len(points),
+        "section_points_grounded": sum(1 for quote in points if len(alnum(quote)) >= 20 and alnum(quote) in corpus),
+        "section_checks": {name: sorted(f"{c.key}:{c.status}" for c in s.checks) for name, s in sections.items()},
+    }
+
+
 def run_summary(result) -> dict[str, Any]:
     analysis = result.analysis
     return {
+        **section_summary(result),
         "score": analysis.mood_score,
         "mood": analysis.mood.value if hasattr(analysis.mood, "value") else str(analysis.mood),
         "desk_reject": any(r.severity == Severity.desk_reject for r in analysis.rejection_reasons),
@@ -134,6 +153,7 @@ def run_summary(result) -> dict[str, Any]:
         "total": result.citations.total,
         "journal_name": result.journal.openalex_name if result.journal.found else None,
         "verdict": analysis.verdict,
+        "integrity_status": result.integrity.status if result.integrity else None,
     }
 
 
@@ -156,8 +176,14 @@ async def evaluate_paper(paper, runs: int, mode: str, lookups, gate: asyncio.Sem
     return record
 
 
-def parser_only_record(paper: dict[str, Any]) -> dict[str, Any]:
-    _, info = parse_paper(paper)
+async def parser_only_record(paper: dict[str, Any], integrity: bool = False) -> dict[str, Any]:
+    parsed, info = parse_paper(paper)
+    if integrity:  # the publication-status gate: Crossref and OpenAlex, no model
+        from services.integrity import check_publication
+
+        status = await check_publication(parsed)
+        info["integrity_status"] = status.status
+        info["integrity_doi"] = status.doi
     record = eval_metrics.paper_record(paper, info, [])
     record["parser"] = info
     return record
@@ -224,6 +250,8 @@ async def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8")  # the Windows console defaults to cp1252
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     cli.add_argument("--parser-only", action="store_true", help="check parsing only: no model, no network")
+    cli.add_argument("--integrity", action="store_true",
+                     help="with --parser-only: also check the publication status (Crossref/OpenAlex, no model)")
     cli.add_argument("--runs", type=int, default=3, help="analyses per paper (default 3)")
     cli.add_argument("--concurrency", type=int, default=4, help="analyses in flight at once (default 4)")
     cli.add_argument("--mode", default="a", choices=["a", "b"])
@@ -246,7 +274,7 @@ async def main() -> int:
         return 1
 
     if args.parser_only:
-        records = [parser_only_record(p) for p in papers]
+        records = [await parser_only_record(p, args.integrity) for p in papers]
         runs = 0
     else:
         gate = asyncio.Semaphore(args.concurrency)

@@ -102,3 +102,41 @@ def test_section_name_stability_is_the_mean_overlap_between_runs():
     rec = m.paper_record(_paper("p", m.STRONG), {}, runs)
     assert round(rec["section_stability"], 3) == round((1 + 1 / 3 + 1 / 3) / 3, 3)
     assert m.summarize([rec])["section_name_stability"] == rec["section_stability"]
+
+
+# ------------------------------------------------------------------ section metrics
+
+def _run(scores, checks=None, reviewed=True, points=4, grounded=4, findings=2):
+    return {
+        "score": 70,
+        "section_scores": scores,
+        "section_reviewed": {n: reviewed for n in scores},
+        "section_findings": {n: findings for n in scores},
+        "section_points": points,
+        "section_points_grounded": grounded,
+        "section_checks": checks or {n: ["seed:missing"] for n in scores},
+    }
+
+
+def test_section_metrics_over_runs() -> None:
+    runs = [_run({"intro": 80, "methods": 70}), _run({"intro": 82, "methods": 75})]
+    out = m.section_metrics(runs)
+    assert out["section_spread"] == 5 and out["checklist_stable"] is True
+    assert out["section_review_coverage"] == 1.0 and out["section_grounded"] == 1.0 and out["findings_per_section"] == 2
+
+
+def test_a_checklist_that_changes_between_runs_is_not_stable() -> None:
+    runs = [_run({"a": 80}, {"a": ["seed:missing"]}), _run({"a": 80}, {"a": ["seed:met"]})]
+    assert m.section_metrics(runs)["checklist_stable"] is False
+
+
+def test_ungrounded_points_and_unreviewed_sections_lower_their_metrics() -> None:
+    out = m.section_metrics([_run({"a": 80, "b": 70}, points=4, grounded=3, reviewed=False)])
+    assert out["section_grounded"] == 0.75 and out["section_review_coverage"] == 0.0
+    assert "section_spread" not in out  # one run: no spread
+
+
+def test_runs_without_section_data_give_no_section_metrics() -> None:
+    assert m.section_metrics([{"score": 70}]) == {}
+    summary = m.summarize([{"id": "x", "label": "strong", "median_score": 70, "desk_reject": False}])
+    assert summary["section_findings_grounded"] is None and summary["checklist_determinism"] is None

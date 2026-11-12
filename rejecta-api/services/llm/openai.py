@@ -45,6 +45,7 @@ class OpenAIProvider(AbstractAnalysisProvider):
             model=self.model,
             max_tokens=MAX_TOKENS,
             temperature=temperature,
+            seed=ANALYSIS_SEED,  # the consistency and evidence checks use this too: same input, same answer
             response_format={"type": JSON_OBJECT_TYPE},
             messages=[
                 {"role": ROLE_SYSTEM, "content": system_prompt},

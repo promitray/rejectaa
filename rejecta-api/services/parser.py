@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import logging
 import re
 import zipfile
 from collections import Counter, defaultdict
+from contextvars import ContextVar
+from typing import NamedTuple
 
 import fitz
 from docx import Document as open_docx
 
-from models import ParsedDocument
+from models import FileMark, ParsedDocument
 from services import paper_profile
 from services.citation_refs import trim_after_citation
+from services.citations import trim_doi
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,10 @@ SECTION_TITLES: dict[str, tuple[str, ...]] = {
         "summary", "conclusion and perspectives", "conclusions and perspectives", "perspectives",
     ),
 }
+# Headings of parts of the paper that have no standard role but are still read by the model.
+KEPT_OTHER_TITLES = frozenset({
+    "background", "related work", "literature review", "limitations", "future work",
+})
 # Headings that end a section without being one we keep.
 OTHER_TITLES = (
     "abstract", "background", "related work", "literature review",
@@ -71,25 +80,36 @@ OTHER_TITLES = (
     "declaration of competing interest", "data availability", "data availability statement",
     "funding", "author information", "associated content", "abbreviations", "notes",
     "credit authorship contribution statement",
+    # licence, rights and journal notes printed after the paper
+    "licence and permissions", "license and permissions", "licence", "license", "permissions",
+    "rights and permissions", "reprints and permissions", "open access", "copyright",
+    "additional information", "ethics declarations", "code availability", "peer review information",
+    "publisher's note", "extended data", "source data", "competing financial interests",
+    "disclosure", "disclosures", "declaration of interests", "declarations of interest", "financial disclosure",
+    "conflict of interest statement", "conflicts of interest statement", "competing interest", "funding information",
+    "funding sources", "financial support", "declarations",
 )
 REFERENCE_TITLES = (
     "references", "bibliography", "literature cited", "notes and references", "references and notes",
     "cited references", "works cited",
 )
-MAX_THEMATIC_SECTIONS = 8
+MAX_THEMATIC_SECTIONS = 12
 BODY_FALLBACK_MIN_SECTION_CHARS = 200
 
 _TITLE_TO_SECTION = {t: name for name, titles in SECTION_TITLES.items() for t in titles}
 _KNOWN_TITLES = set(_TITLE_TO_SECTION) | set(OTHER_TITLES) | set(REFERENCE_TITLES)
-# Optional heading prefix: "2.", "II)", or a letter with punctuation ("D. References", "A) Methods")
-_HEADING_NUMBER = r"(?:(?:(?:\d{1,2}|[IVX]{1,4})[\.\)]?|[A-Z][\.\)])\s+)?"
+# Optional heading prefix: "2.", "2.1", "II)", "(3)" or a letter with punctuation ("D. References", "A) Methods")
+_HEADING_NUMBER = (
+    r"(?:(?:(?:\d{1,2}(?:\.\d{1,2}){0,2}|[IVX]{1,4})\s+|(?:\d{1,2}(?:\.\d{1,2}){0,2}|[IVX]{1,4})[\.\)]\s*"
+    r"|\(\d{1,2}\)\s*|[A-Z][\.\)]\s+))?"
+)
 _NUMBER_ONLY = re.compile(r"^\d{1,2}$")
 _GENERIC_TITLE = re.compile(r"^[A-Z][A-Za-z\-, ]{2,45}$")
 _EMAIL = re.compile(r"\S+@\S+\.\S+")
 REF_SPLIT_PATTERN_A = r"\n(?=\[\d{1,3}\])"
 REF_SPLIT_PATTERN_B = r"\n(?=\d{1,3}[\.\)]\s+[A-Z])"
 REF_SPLIT_PATTERN_C = r"\n\n+"
-REFERENCE_PREFIX_PATTERN = r"^\s*(?:\[\d{1,3}\]|\d{1,3}[\.\)])\s*"
+REFERENCE_PREFIX_PATTERN = r"^\s*(?:\[\d{1,3}\]|\(\d{1,3}\)|\d{1,3}[\.\)])\s*"
 _REF_END_YEAR = re.compile(r"\b(?:19|20)\d{2}[a-z]?\.$")
 
 # Upload formats. The format is decided from the file's content, not its name.
@@ -259,6 +279,278 @@ def _abstract_by_style(page: "fitz.Page") -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- headings from the layout of the file
+
+MIN_LAYOUT_HEADINGS = 3  # a heading style repeats; a title or a label appears once
+MAX_LAYOUT_HEADINGS = 40  # more than this is not a list of section headings
+_CAPTION_START = re.compile(r"(?i)^(?:fig(?:ure)?s?|table|scheme|chart|box|equation|plate|panel|note|supplementary)\b")
+_BOLD_FONT = re.compile(r"(?i)bold|black|heavy|demi|semibold|extrabold")
+_HEADING_LIKE_SHARE = 0.85  # share of a line's letters that must be set like a heading
+_BOLD_FLAG = 16
+_SIZE_STEP = 0.8  # points larger than the body text that make a line a heading by size alone
+
+
+def _layout_heading_shape_ok(text: str) -> bool:
+    """A heading is short, is not a sentence or a caption, and is not an address, a number or a reference."""
+    if not (3 <= len(text) <= MAX_LAYOUT_HEADING_CHARS):
+        return False
+    words = text.split()
+    letters = sum(c.isalpha() for c in text)
+    if len(words) > MAX_LAYOUT_HEADING_WORDS or letters < 3 or letters < 0.6 * len(text.replace(" ", "")):
+        return False
+    if text.endswith((",", "-")) or _CAPTION_START.match(text) or _EMAIL.search(text) or "http" in text.lower():
+        return False
+    return text[:1].isupper() or text[:1].isdigit()
+
+
+def _group_layout_headings(
+    lines: list[tuple[int, int, int, tuple[float, bool], str]]
+) -> tuple[tuple[str, ...], ...]:
+    """Headings set apart by their typeface, as tuples of the lines each is printed on.
+
+    `lines` are the lines that look like headings: (page, block, line in block, style, text). The headings of a paper
+    share one typeface and repeat (Introduction, Methods, ...), so the highest style that occurs at least
+    MIN_LAYOUT_HEADINGS times is taken; a title, or a label that appears once, never is.
+    """
+    # lines of one heading that wrapped: same page, same block, same style
+    groups: list[tuple[tuple[float, bool], list[str]]] = []
+    last: tuple[int, int, int, tuple[float, bool]] | None = None
+    for page, block, position, style, text in lines:
+        # the next line of the same block, in the same style, continues a heading that did not end
+        continues = (
+            groups and last is not None and last[:2] == (page, block) and last[2] + 1 == position and last[3] == style
+            and not groups[-1][1][-1].endswith((".", "?", ":", "!")) and _heading_title(groups[-1][1][-1]) is None
+        )
+        if continues:
+            groups[-1][1].append(text)
+        else:
+            groups.append((style, [text]))
+        last = (page, block, position, style)
+    by_style: dict[tuple[float, bool], list[list[str]]] = defaultdict(list)
+    for style, parts in groups:
+        by_style[style].append(parts)
+    repeating = [
+        style for style, found in by_style.items() if MIN_LAYOUT_HEADINGS <= len(found) <= MAX_LAYOUT_HEADINGS
+    ]
+    if not repeating:
+        return ()
+    top = max(repeating, key=lambda s: (s[0], s[1], len(by_style[s])))
+    return tuple(tuple(parts) for parts in by_style[top])
+
+
+def _layout_headings_pdf(document: "fitz.Document", first_page: int) -> tuple[tuple[str, ...], ...]:
+    """Section headings of a PDF, found from its typography (larger or bold type than the body text)."""
+    weight: Counter[tuple[float, bool]] = Counter()
+    raw: list[tuple[int, int, int, list[tuple[int, float, bool]], str]] = []
+    for page_number in range(first_page, len(document)):
+        for block_number, block in enumerate(document[page_number].get_text("dict").get("blocks", [])):
+            if block.get("type") != 0:
+                continue
+            for line_number, line in enumerate(block.get("lines", [])):
+                spans = [s for s in line.get("spans", []) if str(s.get("text", "")).strip()]
+                if not spans:
+                    continue
+                measured = [
+                    (
+                        len(s["text"].strip()),
+                        round(float(s.get("size", 0)) * 2) / 2,
+                        bool(int(s.get("flags", 0)) & _BOLD_FLAG) or bool(_BOLD_FONT.search(str(s.get("font", "")))),
+                    )
+                    for s in spans
+                ]
+                text = re.sub(r"\s+", " ", "".join(s["text"] for s in spans)).strip()
+                for letters, size, bold in measured:
+                    weight[(size, bold)] += letters
+                raw.append((page_number, block_number, line_number, measured, text))
+    if not raw or not weight:
+        return ()
+    body_size, body_bold = weight.most_common(1)[0][0]
+
+    running_pages: dict[str, set[int]] = defaultdict(set)
+    for page_number, _, _, _, text in raw:
+        running_pages[re.sub(r"\d+", "#", _layout_key(text))].add(page_number)
+
+    candidates: list[tuple[int, int, int, tuple[float, bool], str]] = []
+    for page_number, block_number, line_number, measured, text in raw:
+        if len(running_pages[re.sub(r"\d+", "#", _layout_key(text))]) >= 3:
+            continue  # a running header or footer
+        total = sum(letters for letters, _, _ in measured)
+        marked = sum(
+            letters for letters, size, bold in measured
+            if size >= body_size + _SIZE_STEP or (bold and not body_bold and size >= body_size - 1.0)
+        )
+        if not total or marked / total < _HEADING_LIKE_SHARE:
+            continue
+        cleaned = _clean_heading_text(text)
+        if not _layout_heading_shape_ok(cleaned) or _NUMBER_ONLY.match(cleaned):
+            continue
+        dominant = max(measured, key=lambda m: m[0])
+        candidates.append((page_number, block_number, line_number, (dominant[1], dominant[2]), text))
+    return _group_layout_headings(candidates)
+
+
+def _merge_layout_headings(
+    lines: list[str], headings: tuple[tuple[str, ...], ...]
+) -> tuple[list[str], frozenset[str]]:
+    """The lines with each wrapped layout heading joined onto one line, and the keys of all layout headings."""
+    keys: set[str] = set()
+    wrapped: dict[str, list[tuple[str, ...]]] = defaultdict(list)
+    for parts in headings:
+        keys.add(_layout_key(" ".join(parts)))
+        if len(parts) > 1:
+            wrapped[_layout_key(parts[0])].append(tuple(_layout_key(p) for p in parts))
+    if not wrapped:
+        return lines, frozenset(keys)
+    merged: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = None
+        for candidate in sorted(wrapped.get(_layout_key(lines[index]), ()), key=len, reverse=True):
+            tail = lines[index : index + len(candidate)]
+            if len(tail) == len(candidate) and all(_layout_key(t) == k for t, k in zip(tail, candidate)):
+                match = candidate
+                break
+        if match is None:
+            merged.append(lines[index])
+            index += 1
+        else:
+            merged.append(" ".join(t.strip() for t in lines[index : index + len(match)]))
+            index += len(match)
+    return merged, frozenset(keys)
+
+
+# ---------------------------------------------------------------- what the file says about its own status
+
+# Words a publisher prints on a retracted or flagged article. Only the first page, or a watermark repeated on at
+# least half of the pages, counts: a paper ABOUT retractions, or a reference to a "Retraction Note", does not.
+_FILE_MARKS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("retracted", re.compile(r"\bRETRACTED ARTICLE\b")),
+    ("retracted", re.compile(r"(?m)^[ \t]*RETRACTED[ \t]*:")),
+    ("retracted", re.compile(r"(?i)\bthis article has been retracted\b")),
+    ("retracted", re.compile(r"(?i)\bnotice of retraction\b")),
+    ("expression_of_concern", re.compile(r"\bEXPRESSION OF CONCERN\b")),
+    ("expression_of_concern", re.compile(r"(?im)^[ \t]*expression of concern[ \t]*:")),
+    ("withdrawn", re.compile(r"(?m)^[ \t]*WITHDRAWN[ \t]*:")),
+)
+MARK_SHARE_OF_PAGES = 0.5
+# The paper's own DOI is printed after "doi" or in a doi.org link, in the header or footer of its pages.
+_OWN_DOI = re.compile(r"(?i)(?:\bdoi\s*:?\s*|doi\.org/)(10\.\d{4,9}/[^\s,\]\"']+)")
+_ANY_DOI = re.compile(r"10\.\d{4,9}/[^\s,\]\"'<>]+")  # metadata is XML: a tag ends the DOI
+MAX_DOI_CANDIDATES = 3
+MAX_TITLE_CHARS = 300
+_FILENAME_TITLE = re.compile(r"(?i)\.(?:docx?|pdf|tex)\b|microsoft word|untitled|^[\w\-]+$")
+
+
+def _file_marks(page_texts: list[str]) -> list[FileMark]:
+    """Status words printed in the file: on its first page, or as a watermark on at least half of its pages."""
+    found: dict[tuple[str, str], FileMark] = {}
+    for kind, pattern in _FILE_MARKS:
+        pages = [number for number, text in enumerate(page_texts) if pattern.search(text)]
+        if not pages:
+            continue
+        if pages[0] == 0 or len(pages) >= max(2, MARK_SHARE_OF_PAGES * len(page_texts)):
+            words = re.sub(r"\s+", " ", pattern.search(page_texts[pages[0]]).group(0)).strip(" :")  # type: ignore[union-attr]
+            key = (kind, words.lower())
+            if key not in found:
+                found[key] = FileMark(kind=kind, text=words, pages=len(pages))
+    return list(found.values())
+
+
+def _doi_candidates(page_texts: list[str], metadata_texts: list[str]) -> list[str]:
+    """The paper's own DOI, most likely first: from the file's metadata, then a DOI printed on several pages
+    (a running header or footer), then one on the first page. A DOI cited once in the references is not one."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        doi = trim_doi(raw)
+        if doi and doi.lower() not in seen:
+            seen.add(doi.lower())
+            ordered.append(doi)
+
+    for text in metadata_texts:
+        for match in _ANY_DOI.finditer(text or ""):
+            add(match.group(0))
+    pages_with: Counter[str] = Counter()
+    spelled: dict[str, str] = {}
+    on_first_page: set[str] = set()
+    for number, text in enumerate(page_texts):
+        here = {trim_doi(m.group(1)) for m in _OWN_DOI.finditer(text)}
+        for doi in here:
+            if not doi:
+                continue
+            pages_with[doi.lower()] += 1
+            spelled.setdefault(doi.lower(), doi)
+            if number == 0:
+                on_first_page.add(doi.lower())
+    for key, count in sorted(pages_with.items(), key=lambda item: (-item[1], item[0])):
+        if count >= 2 or key in on_first_page:
+            add(spelled[key])
+    return ordered[:MAX_DOI_CANDIDATES]
+
+
+def _usable_title(text: str | None) -> str:
+    title = re.sub(r"\s+", " ", text or "").strip()
+    if len(title.split()) < 3 or _FILENAME_TITLE.search(title):
+        return ""
+    return title[:MAX_TITLE_CHARS]
+
+
+def _title_by_size(page: "fitz.Page") -> str:
+    """The title of a PDF: the lines in the largest type on the first page that read like words."""
+    lines: list[tuple[float, int, str]] = []
+    for number, block in enumerate(page.get_text("dict").get("blocks", [])):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = [s for s in line.get("spans", []) if str(s.get("text", "")).strip()]
+            if not spans:
+                continue
+            size = round(max(float(s.get("size", 0)) for s in spans), 1)
+            lines.append((size, number, re.sub(r"\s+", " ", "".join(s["text"] for s in spans)).strip()))
+    wordy = [item for item in lines if sum(c.isalpha() for c in item[2]) >= 10]
+    if not wordy:
+        return ""
+    top = max(size for size, _, _ in wordy)
+    block = next(number for size, number, _ in wordy if size == top)
+    return _usable_title(" ".join(text for size, number, text in wordy if size == top and number == block))
+
+
+_ABSTRACT_LABEL = re.compile(r"(?i)^\s*abstract[\s\.:\-—]*")
+MIN_BLOCK_ABSTRACT_WORDS = 25
+
+
+def _block_lines(block: dict) -> list[str]:
+    texts = ["".join(s.get("text", "") for s in line.get("spans", [])).strip() for line in block.get("lines", [])]
+    return [t for t in texts if t]
+
+
+def _abstract_by_block(page: "fitz.Page") -> str | None:
+    """The abstract as the PDF lays it out: the block that starts with the "Abstract" label, to its end."""
+    blocks = [b for b in page.get_text("dict").get("blocks", []) if b.get("type") == 0]
+    for number, block in enumerate(blocks):
+        texts = _block_lines(block)
+        for position, text in enumerate(texts):
+            if not _ABSTRACT_LABEL.match(text):
+                continue
+            rest = [_ABSTRACT_LABEL.sub("", text, count=1)] + texts[position + 1 :]
+            if not rest[0].strip():
+                rest = rest[1:]
+                if not rest and number + 1 < len(blocks):  # the label is a block of its own
+                    rest = _block_lines(blocks[number + 1])
+            kept: list[str] = []
+            for line in rest:
+                if re.match(r"(?i)^\s*(?:keywords?|index terms)\b", line) or re.match(r"^\s*[∗†‡*]", line):
+                    break
+                kept.append(line)
+            joined = _normalize_pdf_text(re.sub(r"\s+", " ", " ".join(t for t in kept if t))).strip()
+            joined = re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "-", joined)
+            if len(kept) >= 2 and len(joined.split()) >= MIN_BLOCK_ABSTRACT_WORDS:
+                return joined
+            return None
+    return None
+
+
 def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocument:
     """Parse a PDF academic paper and extract structured content.
 
@@ -276,14 +568,38 @@ def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocum
     document: fitz.Document | None = None
     style_abstract: str | None = None
     first_page_lines: list[str] = []
+    layout_headings: tuple[tuple[str, ...], ...] = ()
+    block_abstract: str | None = None
+    marks: list[FileMark] = []
+    dois: list[str] = []
+    title = ""
+    front_text = ""
     try:
         document = fitz.open(stream=file_bytes, filetype="pdf")
         page_texts = [page.get_text() for page in document]
         skip = _leading_cover_pages(page_texts)
         try:
+            # read before running headers are removed: a watermark IS a running line
+            metadata = [str(v) for v in (document.metadata or {}).values() if v]
+            metadata.append(document.get_xml_metadata() or "")
+            marks = _file_marks(page_texts[skip:])
+            dois = _doi_candidates(page_texts[skip:], metadata)
+            title = _usable_title((document.metadata or {}).get("title")) or _title_by_size(document[skip])
+            front_text = _normalize_pdf_text(page_texts[skip]) if skip < len(page_texts) else ""
+        except Exception:  # identity and status are checked without them
+            logger.debug("Reading the file's status marks failed", exc_info=True)
+        try:
             style_abstract = _abstract_by_style(document[skip])
         except Exception:  # an odd layout must never stop the upload
             logger.debug("Style-based abstract detection failed", exc_info=True)
+        try:
+            block_abstract = _abstract_by_block(document[skip])
+        except Exception:  # an odd layout must never stop the upload
+            logger.debug("Block-based abstract detection failed", exc_info=True)
+        try:
+            layout_headings = _layout_headings_pdf(document, skip)
+        except Exception:  # the known headings still work without the typography
+            logger.debug("Layout heading detection failed", exc_info=True)
         page_texts = page_texts[skip:]
         # The "COMMUNICATION" label is also a running header on later pages, so it is read from the
         # first page before running lines are removed.
@@ -305,6 +621,12 @@ def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocum
         reflow=True,
         style_abstract=style_abstract,
         label_lines=first_page_lines,
+        layout_headings=layout_headings,
+        block_abstract=block_abstract,
+        integrity_marks=marks,
+        doi_candidates=dois,
+        title=title,
+        front_text=front_text,
     )
 
 
@@ -318,13 +640,29 @@ def parse_docx(file_bytes: bytes, article_type: str | None = None) -> ParsedDocu
     Raises:
         ValueError: If the file cannot be opened, is too large when unpacked, or has no text.
     """
-    paragraphs = _docx_paragraphs(file_bytes)
+    paragraphs, marks, core = _docx_paragraphs_marked(file_bytes)
     full_text = "\n".join(paragraphs).strip()
     if not full_text:
         raise ValueError("No readable text found in this Word file")
     logger.debug("Extracted %d paragraphs from docx", len(paragraphs))
+    layout_headings: tuple[tuple[str, ...], ...] = ()
+    try:
+        layout_headings = _layout_headings_docx(paragraphs, marks)
+    except Exception:  # the known headings still work without the styles
+        logger.debug("Layout heading detection failed", exc_info=True)
+    head = "\n".join(paragraphs[:DOCX_FRONT_PARAGRAPHS])
+    rest = "\n".join(paragraphs[DOCX_FRONT_PARAGRAPHS:])
     # In Word every reference is its own paragraph, and automatic list numbers are not text.
-    return _build_document(full_text, one_reference_per_line=True, article_type_hint=article_type)
+    return _build_document(
+        full_text,
+        one_reference_per_line=True,
+        article_type_hint=article_type,
+        layout_headings=layout_headings,
+        integrity_marks=_file_marks([head, rest]),
+        doi_candidates=_doi_candidates([head], list(core.values())),
+        title=_usable_title(core.get("title")) or (_usable_title(paragraphs[0]) if paragraphs else ""),
+        front_text=head,
+    )
 
 
 _SHORT_LINE_WORDS = 2
@@ -375,6 +713,8 @@ BACK_MATTER_TITLES = frozenset({
     "conflicts of interest", "conflict of interest", "competing interests", "declaration of competing interest",
     "author contributions", "data availability", "data availability statement", "funding",
     "credit authorship contribution statement", "author information", "associated content",
+    "licence and permissions", "license and permissions", "rights and permissions", "reprints and permissions",
+    "ethics declarations", "code availability", "peer review information", "publisher's note",
 })
 
 
@@ -434,6 +774,71 @@ def _body_text(lines: list[str], per_line: bool = False) -> str:
     return _paragraph_text(kept, per_line)
 
 
+class _Reading(NamedTuple):
+    """One way of reading a file's structure: which lines, with which layout headings, and what came out."""
+
+    lines: list[str]
+    layout: frozenset[str]
+    ref_blocks: list[list[str]]
+    abstract: str
+    sections: dict[str, str]
+    roles: dict[str, str]
+    covered: int
+    body: str
+    structure: str
+    coverage: float
+    titles: dict[str, str]
+
+
+_STRUCTURE_RANK = {"detected": 2, "partial": 1, "none": 0}
+
+
+def _front_lines(lines: list[str], reflow: bool) -> list[str]:
+    """The body lines with only the known headings, for reading the label on the first page."""
+    body_lines, _ = _split_reference_blocks(lines)
+    return _reflow_lines(body_lines) if reflow else body_lines
+
+
+def _read_structure(
+    lines: list[str],
+    layout: frozenset[str],
+    reflow: bool,
+    style_abstract: str | None,
+    article_type: str | None,
+    numbered_topics: bool = False,
+    block_abstract: str | None = None,
+) -> _Reading:
+    """Split a file's lines into references, abstract and sections, with `layout` as its marked headings."""
+    token = _LAYOUT_HEADINGS.set(layout)
+    try:
+        body_lines, ref_blocks = _split_reference_blocks(lines)
+        if reflow:
+            body_lines = _reflow_lines(body_lines)
+        abstract = _extract_abstract(body_lines, style_abstract, block_abstract, paragraphs=not reflow)
+        # the paragraphs after an abstract that was read from the file make up an introduction without a heading
+        read_from_file = abstract != "Abstract not found." and (
+            any(_ABSTRACT_LABEL.match(line) and line.strip() for line in body_lines[:200])
+            or bool(style_abstract and abstract.startswith(style_abstract[:60]))
+        )
+        titles: dict[str, str] = {}
+        sections, roles, covered = _extract_sections_detailed(
+            body_lines, article_type, per_line=not reflow, numbered_topics=numbered_topics,
+            abstract=abstract if read_from_file else "", titles_out=titles,
+        )
+        body = _body_text(body_lines, per_line=not reflow)
+        structure, coverage = paper_profile.assess_structure(roles, covered, len(body), article_type)
+    finally:
+        _LAYOUT_HEADINGS.reset(token)
+    titles = {key: title for key, title in titles.items() if key in sections}
+    return _Reading(lines, layout, ref_blocks, abstract, sections, roles, covered, body, structure, coverage, titles)
+
+
+def _structure_signature(sections: dict[str, str], roles: dict[str, str]) -> str:
+    """A short fingerprint of the section names and roles, in order: equal for equal structures."""
+    payload = json.dumps([[name, roles.get(name, "")] for name in sections], ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _build_document(
     full_text: str,
     one_reference_per_line: bool,
@@ -441,32 +846,50 @@ def _build_document(
     reflow: bool = False,
     style_abstract: str | None = None,
     label_lines: list[str] | None = None,
+    layout_headings: tuple[tuple[str, ...], ...] = (),
+    block_abstract: str | None = None,
+    integrity_marks: list[FileMark] | None = None,
+    doi_candidates: list[str] | None = None,
+    title: str = "",
+    front_text: str = "",
 ) -> ParsedDocument:
-    """Shared text-to-structure step for every input format."""
+    """Shared text-to-structure step for every input format.
+
+    `layout_headings` are the headings the file's own layout marks (bold or larger type, Word heading styles),
+    each as the lines it is printed on. The file is read first with the known headings alone; only when that
+    does not find the paper's structure is it read again with the layout headings, and the better reading is
+    kept. Every step is a pure function of the file, so the same file always gives the same sections.
+    """
     lines = full_text.split("\n")
-    body_lines, ref_blocks = _split_reference_blocks(lines)
-    if reflow:
-        body_lines = _reflow_lines(body_lines)
 
     user_type = paper_profile.coerce_article_type(article_type_hint)
-    label_type = paper_profile.detect_article_type(label_lines if label_lines else body_lines[:60])
+    label_type = paper_profile.detect_article_type(label_lines if label_lines else _front_lines(lines, reflow)[:60])
     article_type = user_type or label_type
     type_source = "user" if user_type else ("label" if label_type else "none")
 
-    abstract = _extract_abstract(body_lines, style_abstract)
-    sections, roles, covered_chars = _extract_sections_detailed(body_lines, article_type, per_line=not reflow)
-    body = _body_text(body_lines, per_line=not reflow)
-    structure, coverage = paper_profile.assess_structure(roles, covered_chars, len(body), article_type)
-    if structure != "detected" and article_type is None:
+    reading = _read_structure(
+        lines, frozenset(), reflow, style_abstract, article_type, block_abstract=block_abstract
+    )
+    if reading.structure != "detected" and layout_headings:
+        merged, keys = _merge_layout_headings(lines, layout_headings)
+        with_layout = _read_structure(
+            merged, keys, reflow, style_abstract, article_type, block_abstract=block_abstract
+        )
+        if (_STRUCTURE_RANK[with_layout.structure], with_layout.coverage) > (
+            _STRUCTURE_RANK[reading.structure], reading.coverage
+        ):
+            reading = with_layout
+    if reading.structure != "detected" and article_type is None:
         # Numbered headings ("1. Introduction", "2. Ring-opening polymerization", ...) name the sections of
         # many papers whose type is not printed on them (often reviews in an author's own layout). Taken from the file, they stay the same between runs.
-        numbered = _extract_sections_detailed(body_lines, article_type, per_line=not reflow, numbered_topics=True)
-        numbered_structure, numbered_coverage = paper_profile.assess_structure(
-            numbered[1], numbered[2], len(body), article_type
+        numbered = _read_structure(
+            reading.lines, reading.layout, reflow, style_abstract, article_type,
+            numbered_topics=True, block_abstract=block_abstract,
         )
-        if numbered_structure == "detected":
-            sections, roles, covered_chars = numbered
-            structure, coverage = numbered_structure, numbered_coverage
+        if numbered.structure == "detected":
+            reading = numbered
+    abstract, sections, roles, body = reading.abstract, reading.sections, reading.roles, reading.body
+    structure, coverage, ref_blocks = reading.structure, reading.coverage, reading.ref_blocks
     references: list[str] = []
     numbered_total = 0
     for position, block in enumerate(ref_blocks):
@@ -494,13 +917,130 @@ def _build_document(
         coverage=round(coverage, 3),
         refers_to_si=paper_profile.refers_to_si(full_text),
         section_roles=roles,
+        section_titles=dict(reading.titles),
         body=body,
         parse_warnings=warnings,
+        structure_signature=_structure_signature(sections, roles),
+        integrity_marks=list(integrity_marks or []),
+        doi_candidates=list(doi_candidates or []),
+        title=title,
+        front_text=front_text or "\n".join(lines[:80]),
     )
+
+
+class _DocxMark(NamedTuple):
+    """How a Word paragraph is set: its heading level (1 = highest) from its style, and whether it is all bold."""
+
+    level: int | None
+    bold: bool
+    size: float
+
+
+_HEADING_STYLE_NAME = re.compile(r"(?i)^(?:heading|berschrift|titre|t[ií]tulo|rubrik)\s*(\d)$")
+
+
+def _docx_heading_levels(document) -> dict[str, int]:
+    """Style id -> heading level, for the styles that are headings by name ("Heading 2") or outline level."""
+    levels: dict[str, int] = {}
+    for style in document.styles.element.iterchildren(_W + "style"):
+        style_id = style.get(_W + "styleId")
+        name_element = style.find(_W + "name")
+        name = (name_element.get(_W + "val") if name_element is not None else "") or ""
+        named = _HEADING_STYLE_NAME.match(name.strip())
+        outline = style.find(f"{_W}pPr/{_W}outlineLvl")
+        if style_id and named:
+            levels[style_id] = int(named.group(1))
+        elif style_id and outline is not None and name.strip().lower() != "title":
+            try:
+                levels[style_id] = int(outline.get(_W + "val", "")) + 1
+            except ValueError:
+                continue
+    return levels
+
+
+def _docx_mark(paragraph, levels: dict[str, int]) -> _DocxMark:
+    properties = paragraph.find(_W + "pPr")
+    level: int | None = None
+    if properties is not None:
+        style = properties.find(_W + "pStyle")
+        if style is not None:
+            level = levels.get(style.get(_W + "val", ""))
+        outline = properties.find(_W + "outlineLvl")
+        if level is None and outline is not None:
+            try:
+                level = int(outline.get(_W + "val", "")) + 1
+            except ValueError:
+                level = None
+    runs = [r for r in paragraph.iter(_W + "r") if "".join(t.text or "" for t in r.iter(_W + "t")).strip()]
+    bold = bool(runs)
+    size = 0.0
+    for run in runs:
+        run_properties = run.find(_W + "rPr")
+        flag = run_properties.find(_W + "b") if run_properties is not None else None
+        if flag is None or flag.get(_W + "val", "true").lower() in ("0", "false", "off"):
+            bold = False
+        if not size and run_properties is not None:
+            run_size = run_properties.find(_W + "sz")
+            if run_size is not None:
+                try:
+                    size = int(run_size.get(_W + "val", "0")) / 2
+                except ValueError:
+                    size = 0.0
+    return _DocxMark(level, bold, size)
+
+
+def _layout_headings_docx(
+    paragraphs: list[str], marks: list[_DocxMark | None]
+) -> tuple[tuple[str, ...], ...]:
+    """Section headings of a Word file: its Heading styles, or else the repeating bold short paragraphs.
+
+    The headings of a paper share one level and repeat, so the highest level that occurs at least
+    MIN_LAYOUT_HEADINGS times is taken; a title (Heading 1 used once) is skipped by that.
+    """
+    styled: dict[int, list[str]] = defaultdict(list)
+    bold: dict[float, list[str]] = defaultdict(list)
+    for text, mark in zip(paragraphs, marks):
+        if mark is None:
+            continue
+        cleaned = _clean_heading_text(text)
+        if not _layout_heading_shape_ok(cleaned) or _NUMBER_ONLY.match(cleaned):
+            continue
+        if mark.level is not None:
+            styled[mark.level].append(text)
+        elif mark.bold:
+            bold[mark.size].append(text)
+    for level in sorted(styled):
+        if MIN_LAYOUT_HEADINGS <= len(styled[level]) <= MAX_LAYOUT_HEADINGS:
+            return tuple((t,) for t in styled[level])
+    for size in sorted(bold, reverse=True):
+        if MIN_LAYOUT_HEADINGS <= len(bold[size]) <= MAX_LAYOUT_HEADINGS:
+            return tuple((t,) for t in bold[size])
+    return ()
+
+
+DOCX_FRONT_PARAGRAPHS = 40  # the "first page" of a Word file, for its status marks and its DOI
 
 
 def _docx_paragraphs(file_bytes: bytes) -> list[str]:
     """Body text of a .docx as a list of non-empty paragraph strings, in reading order."""
+    return _docx_paragraphs_marked(file_bytes)[0]
+
+
+def _docx_core(document) -> dict[str, str]:
+    """The file's own properties (title, subject, keywords, identifier) that can name the paper or its DOI."""
+    try:
+        props = document.core_properties
+        values = {
+            "title": props.title, "subject": props.subject, "keywords": props.keywords,
+            "identifier": props.identifier, "comments": props.comments,
+        }
+    except Exception:  # a file without core properties
+        return {}
+    return {key: str(value) for key, value in values.items() if value}
+
+
+def _docx_paragraphs_marked(file_bytes: bytes) -> tuple[list[str], list[_DocxMark | None], dict[str, str]]:
+    """The paragraphs of a .docx, for each how it is set (None for a table row), and the file's properties."""
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
             entries = archive.infolist()
@@ -515,18 +1055,30 @@ def _docx_paragraphs(file_bytes: bytes) -> list[str]:
         ) from exc
 
     lines: list[str] = []
-    _collect_docx_blocks(document.element.body, lines)
-    return lines
+    marks: list[_DocxMark | None] = []
+    try:
+        levels = _docx_heading_levels(document)
+    except Exception:  # a file without usable styles still has its text
+        levels = {}
+    _collect_docx_blocks(document.element.body, lines, marks, levels)
+    return lines, marks, _docx_core(document)
 
 
-def _collect_docx_blocks(parent, lines: list[str]) -> None:
-    """Append the text of paragraphs, tables and content controls under `parent`, in order."""
+def _collect_docx_blocks(
+    parent, lines: list[str], marks: list[_DocxMark | None] | None = None, levels: dict[str, int] | None = None
+) -> None:
+    """Append the text of paragraphs, tables and content controls under `parent`, in order.
+
+    When `marks` is given, one entry per appended line says how that paragraph is set.
+    """
     for child in parent.iterchildren():
         tag = child.tag
         if tag == _W + "p":
             text = _docx_paragraph_text(child)
             if text:
                 lines.append(text)
+                if marks is not None:
+                    marks.append(_docx_mark(child, levels or {}))
         elif tag == _W + "tbl":
             for row in child.iterchildren(_W + "tr"):
                 cells: list[str] = []
@@ -537,10 +1089,12 @@ def _collect_docx_blocks(parent, lines: list[str]) -> None:
                         cells.append(" ".join(inner))
                 if cells:
                     lines.append(" | ".join(cells))
+                    if marks is not None:
+                        marks.append(None)
         elif tag == _W + "sdt":  # content control (cover pages, tables of contents)
             content = child.find(_W + "sdtContent")
             if content is not None:
-                _collect_docx_blocks(content, lines)
+                _collect_docx_blocks(content, lines, marks, levels)
 
 
 def _docx_paragraph_text(paragraph) -> str:
@@ -565,12 +1119,69 @@ def _collect_docx_text(element, parts: list[str]) -> None:
             _collect_docx_text(child, parts)
 
 
-def _heading_title(line: str) -> str | None:
-    """Return the lowercase heading title if the line is a heading, else None."""
-    stripped = line.strip().rstrip(".:").strip()
-    if not stripped or len(stripped) > 60:
+# ---------------------------------------------------------------- headings
+#
+# A line is a heading when (1) its title is a known one, (2) the file's own layout says so (bold or larger
+# type in a PDF, a Heading style in Word), or (3) it is numbered or in capitals and names a part of a paper
+# ("3. EXPERIMENTAL RESULTS AND ANALYSIS"). Everything here is a pure function of the file's content, so the
+# same file always gives the same sections.
+
+# Marks a journal prints in front of a heading ("■ REFERENCES") are not part of its title.
+# Whatever symbol a journal puts before its headings (■ ▪ • ·, or a private-use character from a symbol font)
+# comes out of a PDF as a different character every time, so every leading character that is not a letter, a
+# digit or an opening bracket is dropped.
+_LEADING_ORNAMENTS = re.compile(r"^[^\w(\[]+")
+MAX_KNOWN_HEADING_CHARS = 60
+MAX_LAYOUT_HEADING_CHARS = 110
+MAX_LAYOUT_HEADING_WORDS = 16
+MAX_KEYWORD_HEADING_WORDS = 8
+_FUNCTION_WORDS = frozenset({"of", "the", "and", "in", "for", "with", "to", "a", "an", "on", "by", "or", "at", "as"})
+
+# Words that say which part of a paper a heading is. Results come first so "Experimental Results" is
+# Results, not Methods. Used only for papers that are not reviews or perspectives (their headings are topics).
+_ROLE_WORDS: tuple[tuple[str, frozenset[str]], ...] = (
+    (paper_profile.ROLE_RESULTS, frozenset({"result", "results", "finding", "findings", "evaluation", "experiments"})),
+    (paper_profile.ROLE_METHODS, frozenset({
+        "method", "methods", "methodology", "materials", "experimental", "procedure", "procedures",
+        "protocol", "protocols", "approach", "setup", "implementation",
+    })),
+    (paper_profile.ROLE_DISCUSSION, frozenset({
+        "discussion", "conclusion", "conclusions", "outlook", "summary", "perspective", "perspectives",
+        "implications", "concluding",
+    })),
+    (paper_profile.ROLE_INTRODUCTION, frozenset({"introduction", "background", "preliminaries"})),
+)
+
+
+def _clean_heading_text(line: str) -> str:
+    """The line without leading marks, ligatures, "&" and trailing punctuation: "■ MATERIALS & METHODS:" -> "MATERIALS and METHODS"."""
+    text = _LEADING_ORNAMENTS.sub("", line.strip().translate(_LIGATURE_TABLE))
+    text = text.replace("&", " and ")
+    return re.sub(r"\s+", " ", text).strip().rstrip(".:;").strip()
+
+
+def _layout_key(text: str) -> str:
+    return _clean_heading_text(text).casefold()
+
+
+# Heading lines that the layout of the file marks (a set of _layout_key values), for the file being read.
+_LAYOUT_HEADINGS: ContextVar[frozenset[str]] = ContextVar("layout_headings", default=frozenset())
+
+
+def _keyword_role(title: str) -> str | None:
+    words = set(re.findall(r"[a-z]+", title.lower()))
+    for role, vocabulary in _ROLE_WORDS:
+        if words & vocabulary:
+            return role
+    return None
+
+
+def _heading_parts(line: str) -> tuple[str, str] | None:
+    """(lowercase title, title as it is shown) when the line is a heading, else None."""
+    text = _clean_heading_text(line)
+    if not text or len(text) > MAX_LAYOUT_HEADING_CHARS:
         return None
-    match = re.fullmatch(_HEADING_NUMBER + r"(.+)", stripped)
+    match = re.fullmatch(_HEADING_NUMBER + r"(.+)", text)
     if not match:
         return None
     raw_title = match.group(1).strip()
@@ -579,7 +1190,30 @@ def _heading_title(line: str) -> str | None:
     if not raw_title[:1].isupper():
         return None
     title = raw_title.lower()
-    return title if title in _KNOWN_TITLES else None
+    shown = raw_title.capitalize() if _is_caps_heading_text(raw_title) else raw_title
+    words = title.split()
+    if len(text) <= MAX_KNOWN_HEADING_CHARS and title in _KNOWN_TITLES:
+        return title, shown
+    if len(words) > MAX_LAYOUT_HEADING_WORDS:
+        return None
+    if _layout_key(line) in _LAYOUT_HEADINGS.get():
+        return title, shown
+    numbered = match.start(1) > 0
+    if (
+        (numbered or _is_caps_heading_text(raw_title))
+        and len(text) <= MAX_KNOWN_HEADING_CHARS
+        and len(words) <= MAX_KEYWORD_HEADING_WORDS
+        and words[-1] not in _FUNCTION_WORDS
+        and _keyword_role(title) is not None
+    ):
+        return title, shown
+    return None
+
+
+def _heading_title(line: str) -> str | None:
+    """Return the lowercase heading title if the line is a heading, else None."""
+    parts = _heading_parts(line)
+    return parts[0] if parts else None
 
 
 def _is_generic_heading(lines: list[str], index: int) -> bool:
@@ -645,7 +1279,16 @@ def _parse_warnings(blocks: list[list[str]], references: list[str], numbered_tot
     return warnings
 
 
-def _extract_abstract(lines: list[str], style_abstract: str | None = None) -> str:
+MIN_ABSTRACT_WORDS_BEFORE_BODY = 120  # an abstract this long is complete; a long paragraph after it is the body
+MIN_BODY_PARAGRAPH_WORDS = 60
+
+
+def _extract_abstract(
+    lines: list[str],
+    style_abstract: str | None = None,
+    block_abstract: str | None = None,
+    paragraphs: bool = False,
+) -> str:
     """Take the text between the Abstract heading and the next heading.
 
     Without an Abstract heading (Communications, Letters) use the abstract found by its typeface,
@@ -664,6 +1307,13 @@ def _extract_abstract(lines: list[str], style_abstract: str | None = None) -> st
             inline = match.group(1)
             break
 
+    if start is not None and block_abstract:
+        # The PDF keeps the abstract in a block of its own. It ends where the block ends, even when the
+        # next paragraph is set in the same typeface (no heading follows an abstract in many journals).
+        first_words = inline or (lines[start].strip() if start < len(lines) else "")
+        if first_words and _alnum(block_abstract).startswith(_alnum(first_words)[:25]):
+            return block_abstract[:MAX_ABSTRACT_CHARS].strip()
+
     if start is not None:
         collected = [inline] if inline else []
         for index in range(start, len(lines)):
@@ -673,6 +1323,12 @@ def _extract_abstract(lines: list[str], style_abstract: str | None = None) -> st
                 break
             if re.match(r"^\s*[∗†‡*]", lines[index]):  # author footnotes
                 break
+            if (
+                paragraphs
+                and sum(len(c.split()) for c in collected) >= MIN_ABSTRACT_WORDS_BEFORE_BODY
+                and len(lines[index].split()) >= MIN_BODY_PARAGRAPH_WORDS
+            ):
+                break  # a Word file has one paragraph per line: a long one after a full abstract is the introduction
             collected.append(lines[index])
         text = re.sub(r"\s+", " ", " ".join(collected)).strip()
         if len(text) >= 100:
@@ -688,6 +1344,56 @@ def _extract_abstract(lines: list[str], style_abstract: str | None = None) -> st
 
 
 _LEADING_NUMBER = re.compile(r"^\s*(\d{1,2})[\.\)]?\s+(\S.*)$")
+# IEEE and many conference layouts number their headings with Roman numerals: "IV. IDENTIFIED GAPS", "IX.REFERENCES"
+_ROMAN_LEADING = re.compile(r"^\s*([IVX]{1,4})[\.\)]\s*([A-Z]\S.*)$")
+_ROMAN_VALUES = {"I": 1, "V": 5, "X": 10}
+MAX_WRAPPED_HEADING_WORDS = 4
+
+
+def _roman_value(numeral: str) -> int:
+    total = 0
+    for char, following in zip(numeral, numeral[1:] + " "):
+        value = _ROMAN_VALUES[char]
+        total += -value if following != " " and _ROMAN_VALUES.get(following, 0) > value else value
+    return total
+
+
+def _is_caps_heading_text(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    return len(letters) >= 3 and all(c.isupper() for c in letters)
+
+
+def _wrapped_heading(lines: list[str], index: int, title: str) -> tuple[str, int]:
+    """(title, index of its last line). An all-capitals heading that wraps ("... IN EXISTING" / "RESEARCH") is one heading."""
+    following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+    short_caps = (
+        _is_caps_heading_text(title) and _is_caps_heading_text(following)
+        and len(following.split()) <= MAX_WRAPPED_HEADING_WORDS and not following.endswith(".")
+        and not _ROMAN_LEADING.match(following) and _heading_title(following) is None
+    )
+    long_title = (
+        len(lines[index].strip()) > 60 and following and len(following) <= 40 and following[:1].isupper()
+        and not following.endswith(".") and _heading_title(following) is None
+    )
+    if short_caps or long_title:
+        return f"{title} {following}", index + 1
+    return title, index
+
+
+def _roman_topic(line: str, wanted_number: int) -> str | None:
+    """Title of a Roman-numbered top-level heading ("V. PROPOSED SYSTEM") that is the next one in sequence."""
+    match = _ROMAN_LEADING.match(line)
+    if not match or _roman_value(match.group(1)) != wanted_number:
+        return None
+    title = match.group(2).strip().rstrip(":")
+    if not (3 <= len(title) <= 90) or title.endswith("."):
+        return None
+    return title
+
+
+def _is_roman_caps_heading(line: str) -> bool:
+    match = _ROMAN_LEADING.match(line)
+    return bool(match) and _is_caps_heading_text(match.group(2)) and len(match.group(2)) <= 90
 
 
 def _topic_heading(line: str, wanted_number: int) -> str | None:
@@ -707,42 +1413,157 @@ def _topic_heading(line: str, wanted_number: int) -> str | None:
     return title
 
 
+MIN_OPENING_CHARS = 600  # shorter than this, the text before the first heading is front matter, not an introduction
+_OPENING_SKIP = re.compile(r"(?i)^\s*(?:keywords?|index terms)\b|@|doi\s*:|©|\breceived\b|\baccepted\b")
+
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _opening_text(lines: list[str], abstract: str, per_line: bool) -> str:
+    """The introduction that has no heading: the prose between the end of the abstract and the first heading.
+
+    The end of the abstract is its last line found in the abstract text, so nothing is taken when the
+    abstract was not read from the file itself.
+    """
+    abstract_key = _alnum(abstract)
+    last_abstract_line = -1
+    for index, line in enumerate(lines):
+        key = _alnum(line)
+        if len(key) >= 15 and key in abstract_key:
+            last_abstract_line = index
+    if last_abstract_line < 0:
+        return ""
+    kept = [
+        line for line in lines[last_abstract_line + 1 :]
+        if len(line.split()) >= 6 and not _OPENING_SKIP.search(line) and _heading_title(line) is None
+        and not _FURNITURE_LINE.match(line) and not _META_LINE.search(line)
+    ]
+    text = _paragraph_text(kept, per_line)
+    return text if len(text) >= MIN_OPENING_CHARS else ""
+
+
+TABLE_HEADER_CELLS = 3  # short lines after a heading word before it counts as a table's column header
+MAX_TABLE_CELL_WORDS = 4
+TABLE_NUMERIC_SHARE = 0.35  # share of numbers and table signs in the lines after it
+
+
+def _is_table_header(
+    lines: list[str], index: int, role: str, boundaries: list[tuple[int, str | None, str | None]]
+) -> bool:
+    """A standard heading word that is really a table's first column header ("Method", "Results").
+
+    It repeats a section the paper already has, and the lines after it are table cells (short, no prose),
+    where a real heading is followed by prose or by a numbered sub-heading and then prose.
+    """
+    if not any(r == role for _, r, _ in boundaries):
+        return False
+    following = [line.strip() for line in lines[index + 1 : index + 12] if line.strip()][:TABLE_HEADER_CELLS]
+    if len(following) < TABLE_HEADER_CELLS:
+        return False
+    cells = all(
+        len(cell.split()) <= MAX_TABLE_CELL_WORDS and not cell.rstrip().endswith(".") and _heading_title(cell) is None
+        for cell in following
+    )
+    # rows read as one line: mostly numbers and table signs ("4.52 4.30 0.948 N/A", "0.84 ± 1.45")
+    tokens = " ".join(following).split()
+    numeric = sum(1 for t in tokens if re.search(r"\d|^(?:N/A|NA|n\.d\.|[±=%<>–—-])$", t))
+    return cells or (len(tokens) >= 6 and numeric / len(tokens) >= TABLE_NUMERIC_SHARE)
+
+
 def _extract_sections_detailed(
-    lines: list[str], article_type: str | None = None, per_line: bool = False, numbered_topics: bool = False
+    lines: list[str],
+    article_type: str | None = None,
+    per_line: bool = False,
+    numbered_topics: bool = False,
+    abstract: str = "",
+    titles_out: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str], int]:
     """Sections under real headings: (sections, role of each, characters they cover).
 
     Standard headings map to introduction / methods / results / discussion. For perspectives and
     reviews every numbered top-level heading between them is a "thematic" section named by its title.
+    `titles_out`, when given, receives each section's heading as the paper prints it ("Methodology",
+    "Conclusion"), so a report can name the section as the author did while the key stays stable.
     """
     thematic_paper = numbered_topics or article_type in paper_profile.THEMATIC_TYPES
     boundaries: list[tuple[int, str | None, str | None]] = []  # (line, role, key)
+    shown_at: dict[int, str] = {}  # boundary line -> heading as printed
     next_number = 1
     for index, line in enumerate(lines):
-        title = _heading_title(line)
-        if title is not None:
-            role = _TITLE_TO_SECTION.get(title)
+        parts_of_heading = _heading_parts(line)
+        if parts_of_heading is not None:
+            title, shown = parts_of_heading
             number = _LEADING_NUMBER.match(line)
+            roman = _ROMAN_LEADING.match(line)
             if number and int(number.group(1)) == next_number:
                 next_number += 1
-            boundaries.append((index, role, role))
+            elif roman and _roman_value(roman.group(1)) == next_number:
+                next_number += 1
+            if title in _TITLE_TO_SECTION and _is_table_header(lines, index, _TITLE_TO_SECTION[title], boundaries):
+                continue  # "Method" over a results table's columns, not a second Methods section
+            if title in _TITLE_TO_SECTION or index not in shown_at:
+                shown_at[index] = shown
+            if title in _TITLE_TO_SECTION:
+                role = _TITLE_TO_SECTION[title]
+                boundaries.append((index, role, role))
+            elif title in KEPT_OTHER_TITLES:
+                boundaries.append((index, paper_profile.ROLE_OTHER, title))
+            elif title in _KNOWN_TITLES:  # Acknowledgements, Supporting Information...: ends a section, is none
+                boundaries.append((index, None, None))
+            else:
+                # a heading the file's layout (or its numbering) shows. In a paper with the usual parts it is
+                # one of them when it says so ("Experimental Results and Analysis"); otherwise it is a section
+                # named by its own title, so its text reaches the model instead of being glued to the one before.
+                role = None if thematic_paper else _keyword_role(title)
+                if role is not None:
+                    boundaries.append((index, role, role))
+                else:
+                    boundaries.append((index, paper_profile.ROLE_THEMATIC, shown))
         elif _is_generic_heading(lines, index):
+            following = _heading_title(lines[index + 1]) if index + 1 < len(lines) else None
+            if following in _TITLE_TO_SECTION and _is_table_header(
+                lines, index + 1, _TITLE_TO_SECTION[following], boundaries
+            ):
+                continue  # a page number above a table whose first column is headed "Method"
             boundaries.append((index, None, None))
         elif thematic_paper:
-            topic = _topic_heading(line, next_number)
+            topic = _topic_heading(line, next_number) or _roman_topic(line, next_number)
             if topic is not None:
                 next_number += 1
-                following = lines[index + 1].strip() if index + 1 < len(lines) else ""
-                if len(line.strip()) > 60 and following and len(following) <= 40 and following[:1].isupper() \
-                        and not following.endswith(".") and _heading_title(following) is None:
-                    topic = f"{topic} {following}"  # a long heading wrapped onto a second line
-                    index += 1
-                boundaries.append((index, paper_profile.ROLE_THEMATIC, topic))
+                topic, last = _wrapped_heading(lines, index, topic)  # a long heading wrapped onto a second line
+                if topic.isupper():
+                    topic = topic.capitalize()
+                boundaries.append((last, paper_profile.ROLE_THEMATIC, topic))
+        elif _is_roman_caps_heading(line):
+            # "IV. IDENTIFIED GAPS IN EXISTING RESEARCH": a heading of the paper itself. It is a section named by
+            # its own title, so its text reaches the model instead of being glued to the section before it.
+            topic = _roman_topic(line, next_number)
+            if topic is not None:
+                next_number += 1
+                topic, last = _wrapped_heading(lines, index, topic)
+                boundaries.append((last, paper_profile.ROLE_OTHER, topic.capitalize() if topic.isupper() else topic))
+            else:
+                _, last = _wrapped_heading(lines, index, _ROMAN_LEADING.match(line).group(2))  # type: ignore[union-attr]
+                boundaries.append((last, None, None))
 
     parts: dict[str, list[str]] = {}
     roles: dict[str, str] = {}
     covered = 0
     left_out = False
+    first_real = next((start for start, role, _ in boundaries if role is not None), None)
+    if (
+        abstract
+        and first_real is not None
+        and not any(role == paper_profile.ROLE_INTRODUCTION for _, role, _ in boundaries)
+    ):
+        # Many papers start straight after the abstract, with no "Introduction" heading above the first paragraphs.
+        opening = _opening_text(lines[:first_real], abstract, per_line)
+        if opening:
+            parts["introduction"] = [opening]
+            roles["introduction"] = paper_profile.ROLE_INTRODUCTION
+            covered += len(opening)
     for position, (start, role, key) in enumerate(boundaries):
         if role is None or key is None:
             continue
@@ -761,6 +1582,15 @@ def _extract_sections_detailed(
         parts.setdefault(key, []).append(text)
         roles[key] = role
         covered += len(text)
+        if titles_out is not None and start in shown_at:
+            printed = titles_out.get(key, "")
+            heading = shown_at[start]
+            if not printed:
+                titles_out[key] = heading
+            elif heading.lower() in _TITLE_TO_SECTION and heading.lower() not in printed.lower().split(" / "):
+                # two standard headings under one key ("Discussion", then "Conclusion"); a sub-heading the
+                # layout or a keyword made a section ("MI-centric Training Protocol") is part of it, not a name
+                titles_out[key] = f"{printed} / {heading}"
 
     extracted = {
         name: " ".join(chunks)[:MAX_SECTION_CHARS].strip()
@@ -807,7 +1637,7 @@ def _extract_references_counted(
         chunks = _strip_list_numbers(chunks)
     else:
         kept = [line for line in ref_lines if not _NUMBER_ONLY.match(line.strip())]
-        reference_section = "\n".join(kept).strip()
+        reference_section = re.sub(r"(?m)^([ \t]*\[\d{1,3}\])[ \t]*\n[ \t]*", r"\1 ", "\n".join(kept)).strip()
         if not reference_section:
             return [], 0
         starts = _numbered_starts(reference_section, first_number)
@@ -909,7 +1739,7 @@ def _trim_after_reference(chunk: str) -> str:
 # followed by an author, or by a sub-reference marker such as "(a)".
 # A title may itself start with a number ("3 125 Years IACS: ..."), so a number then a capitalised word counts too.
 _NUMBERED_START = re.compile(
-    r"(?m)^[ \t]*\[?(\d{1,3})[\.\)\]]?[ \t]+(?=(?:\([a-z]\)\s*)?[\[A-Z]|\d{1,4}[ \t]+[A-Z][a-z])"
+    r"(?m)^[ \t]*[\[\(]?(\d{1,3})[\.\)\]]?[ \t]+(?=(?:\([a-z]\)\s*)?[\[A-Z]|\d{1,4}[ \t]+[A-Z][a-z])"
 )
 MAX_NUMBER_JUMP = 2  # tolerate an entry the PDF extraction lost
 MIN_NUMBERED_ENTRIES = 3

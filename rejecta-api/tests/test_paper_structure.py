@@ -187,9 +187,9 @@ def test_the_same_text_as_a_research_article_does_not_invent_topic_sections() ->
     assert parsed.structure != "detected"
 
 
-def test_no_more_than_eight_topic_sections_are_kept() -> None:
+def test_no_more_than_the_maximum_of_topic_sections_are_kept() -> None:
     topics = []
-    for n in range(2, 14):
+    for n in range(2, parser.MAX_THEMATIC_SECTIONS + 5):
         topics += [f"{n} Topic number {n}", f"Text about topic {n}. " * 8]
     text = "\n".join(["Title", "1 Introduction", "Intro text here. " * 8, *topics, "References", "1. A. Author, Nature, 2001, 1, 100-110."])
     parsed = _build_document(text, one_reference_per_line=True, article_type_hint="review")

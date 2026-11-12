@@ -42,12 +42,67 @@ export interface CitationSummary {
 
 export type ArticleType = 'research_article' | 'communication' | 'perspective' | 'review' | 'mini_review' | 'editorial'
 
+/** One step of a section's fix plan: what is wrong, the words it is about, and what to do. */
+export interface FixStep {
+  step: number
+  severity: 'major' | 'minor'
+  problem: string
+  /** The words of the paper the step is about; empty when something is missing. */
+  quote: string
+  action: string
+  /** "review": the section review (quoted from the paper). "checklist": decided by code. */
+  source: 'review' | 'checklist'
+  /** False when the words the step is about are in a part of the section that Calibrate does not receive. */
+  in_calibrate_text?: boolean
+  /** "add": something the section lacks (a placeholder goes where it belongs). "change": words to rewrite. */
+  kind?: 'add' | 'change'
+}
+
+/** A problem from the section review. `quote` was found in the paper by the server. */
+export interface SectionFinding {
+  severity: 'major' | 'minor'
+  problem: string
+  quote: string
+  fix: string
+}
+
+export interface SectionStrength {
+  point: string
+  quote: string
+}
+
+/** One checklist item decided by code from the paper's text; every quote is copied from the paper. */
+export interface SectionCheck {
+  key: string
+  label: string
+  /** met: the paper does it. missing: it should and does not. issue: something in the text is wrong. info: a fact. */
+  status: 'met' | 'missing' | 'issue' | 'info'
+  severity?: 'major' | 'minor' | null
+  detail: string
+  quote: string
+  fix: string
+}
+
 export interface SectionScore {
   score: number
   issue?: string
   fix?: string
   strength?: string
   weakness?: string
+  /** The heading as the paper prints it ("Conclusion"), when it differs from the section's key ("discussion"). */
+  title?: string | null
+  role?: string | null
+  checks?: SectionCheck[]
+  /** The section review: a summary, up to two strengths and up to four findings, each quoted from the paper. */
+  summary?: string | null
+  strengths?: SectionStrength[]
+  findings?: SectionFinding[]
+  /** What to change, most important first (verified findings and checklist problems). Empty when nothing needs fixing. */
+  fix_plan?: FixStep[]
+  /** The model's own number, kept when `score` was computed in code from the findings and the checklist. */
+  llm_score?: number | null
+  /** The steps of the computed score ("Start at 85 ...", "−10 major finding: ..."). */
+  score_basis?: string[]
   /** "detected": a heading in the file. "derived": found from the content, starting at `anchor`. */
   source?: 'detected' | 'derived' | null
   anchor?: string | null
@@ -70,6 +125,12 @@ export interface CriterionScore {
   weight: number
   /** True when the score was computed from the reference check, not by the model. */
   computed: boolean
+  /** Citation integrity only: share of references whose status could be settled (verified or ghost). */
+  coverage?: number | null
+  /** The model's score before code applied its limits. */
+  raw_score?: number | null
+  /** The limits code applied, in words (e.g. "Capped at 60: 2 major inconsistencies ..."). */
+  adjustments?: string[]
 }
 
 export interface RejectionReason {
@@ -90,6 +151,12 @@ export interface RejectionReason {
   /** The paragraphs around the evidence, prepared by the server for "Fix with Calibrator". */
   tool_text?: string | null
   tool_notes?: string[]
+  /** Who raised it: the model, or code (publication record, consistency check). */
+  origin?: 'model' | 'publication_record' | 'consistency'
+  /** The scored criterion this concern bears on. */
+  criterion?: string
+  /** For an unverified concern: why it could not be tied to the paper. */
+  unverified_reason?: string
 }
 
 export interface AnalysisResult {
@@ -112,6 +179,73 @@ export interface AnalysisResult {
   not_assessed?: string[]
   /** Claims in the report that were removed or flagged because the manuscript does not support them. */
   grounding_notes?: string[]
+  /** Concerns the model raised that could not be tied to words in the paper. Shown apart, never scored. */
+  unverified_concerns?: RejectionReason[]
+}
+
+export interface IntegrityNotice {
+  type: string
+  label?: string
+  doi?: string | null
+  date?: string | null
+  source?: string
+}
+
+/** Whether the paper is already published, and whether it was retracted or put under concern. */
+export interface PublicationStatus {
+  status: 'retracted' | 'expression_of_concern' | 'corrected' | 'published' | 'not_found' | 'not_checked'
+  doi?: string | null
+  doi_source?: string | null
+  title?: string | null
+  journal?: string | null
+  publisher?: string | null
+  year?: number | null
+  notices?: IntegrityNotice[]
+  file_marks?: { kind: string; text: string; pages: number }[]
+  is_notice?: boolean
+  journal_abbreviation?: string | null
+  /** Published in the very journal the author is targeting. */
+  at_target_journal?: boolean | null
+  sources?: string[]
+  notes?: string[]
+}
+
+export interface ConsistencyQuote {
+  quote: string
+  section: string
+  values: string
+}
+
+export interface ConsistencyFinding {
+  kind: string
+  severity: 'major' | 'minor'
+  message: string
+  quotes: ConsistencyQuote[]
+}
+
+export interface CellLineCheck {
+  name: string
+  status: 'problematic' | 'no_known_problem' | 'not_found' | 'not_checked'
+  accession?: string | null
+  note?: string
+  quote?: string
+}
+
+/** The paper's own values, compounds and cell lines, compared by code. */
+export interface ConsistencyReport {
+  status: 'checked' | 'not_checked' | 'not_applicable'
+  findings: ConsistencyFinding[]
+  facts_checked: number
+  cell_lines: CellLineCheck[]
+  note?: string
+}
+
+/** Competing-interest and funding statements as the paper prints them. Context, never a fault. */
+export interface Disclosures {
+  competing_interests?: string | null
+  funding?: string | null
+  declares_none: boolean
+  interests: string[]
 }
 
 export interface ScoreChange {
@@ -211,6 +345,10 @@ export interface AnalysisPaperResponse {
   document_note?: string | null
   /** Set when this paper is a version of one the account analysed before. */
   revision?: RevisionComparison | null
+  /** Published / retracted / under concern, checked before the paper is scored. */
+  integrity?: PublicationStatus | null
+  consistency?: ConsistencyReport | null
+  disclosures?: Disclosures | null
   meta: {
     word_count: number
     sections_found: string[]

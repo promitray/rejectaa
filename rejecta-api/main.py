@@ -445,6 +445,9 @@ async def analyse_paper(
             document=document_info,
             document_note=document_note,
             revision=result.revision,
+            integrity=result.integrity,
+            consistency=result.consistency,
+            disclosures=result.disclosures,
             meta=PaperMeta(
                 word_count=parsed.word_count,
                 sections_found=(
