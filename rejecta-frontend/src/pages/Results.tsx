@@ -7,11 +7,16 @@ import { useRejectaStore } from '../store'
 import type {
   CitationResult,
   CitationStatus,
+  ConsistencyReport,
+  Disclosures,
   DocumentInfo,
   Mood,
+  PublicationStatus,
   RejectionReason,
   RevisionComparison,
   ScoreChange,
+  FixStep,
+  SectionCheck,
   SectionScore,
 } from '../types'
 
@@ -178,6 +183,13 @@ export default function Results(): ReactElement {
   const notAssessed = analysis.not_assessed ?? []
   const groundingNotes = analysis.grounding_notes ?? []
   const derivedSections = result.meta.structure_mode === 'derived'
+  const integrity = result.integrity ?? null
+  const retracted = integrity?.status === 'retracted'
+  // A published paper passed peer review: what the report raises are reviewer concerns, not rejection reasons.
+  const published = integrity?.status === 'published' || integrity?.status === 'corrected'
+  const consistencyReport = result.consistency ?? null
+  const disclosures = result.disclosures ?? null
+  const unverifiedConcerns = analysis.unverified_concerns ?? []
   const paperCopy = result.document ?? null
   // section name in the report -> section of the working copy, when it was found there
   const copySections = new Map((paperCopy?.sections ?? []).filter((s) => s.mapped).map((s) => [s.name, s.id]))
@@ -193,7 +205,9 @@ export default function Results(): ReactElement {
               <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${mood.pill}`}>
                 {mood.label}
               </span>
-              <span className="text-sm text-gray-700">{mood.description}</span>
+              <span className="text-sm text-gray-700">
+                {retracted ? 'Retracted — no recommendation' : mood.description}
+              </span>
               {typeLabel ? <Chip className="bg-stone-100 text-stone-700">{typeLabel}</Chip> : null}
             </div>
             <p className="mt-2 text-sm italic text-gray-500">{analysis.verdict}</p>
@@ -223,6 +237,8 @@ export default function Results(): ReactElement {
         ) : null}
         {rerunError ? <p className="mt-2 text-xs text-red-700">{rerunError}</p> : null}
       </section>
+
+      {integrity ? <IntegrityBanner integrity={integrity} /> : null}
 
       {result.revision ? <RevisionPanel revision={result.revision} /> : null}
 
@@ -301,6 +317,17 @@ export default function Results(): ReactElement {
                       </div>
                       <span className="w-8 text-right text-sm text-gray-700">{item.score}</span>
                     </div>
+                    {(item.adjustments ?? []).map((note) => (
+                      <p key={note} className="mt-1 text-xs text-amber-800 sm:pl-[9.75rem]">
+                        {note}
+                        {typeof item.raw_score === 'number' ? ` (the model gave ${item.raw_score})` : ''}
+                      </p>
+                    ))}
+                    {typeof item.coverage === 'number' ? (
+                      <p className="mt-1 text-xs text-gray-500 sm:pl-[9.75rem]">
+                        Coverage {Math.round(item.coverage * 100)}% of references settled
+                      </p>
+                    ) : null}
                     {item.reason ? (
                       <p className="mt-1 text-xs text-gray-500 sm:pl-[9.75rem]">
                         {item.computed ? 'Computed from the reference check. ' : ''}
@@ -311,6 +338,8 @@ export default function Results(): ReactElement {
                 ))}
                 <p className="text-xs text-gray-400">
                   The overall score is the weighted mean of these criteria, so it stays comparable between papers.
+                  Limits applied by code (publication record, inconsistencies in the paper, verified concerns) are
+                  shown under each criterion.
                 </p>
               </div>
             ) : null}
@@ -396,12 +425,19 @@ export default function Results(): ReactElement {
           )}
         </Panel>
 
-        <Panel title="Rejection reasons" badge="pro" icon="!">
+        <Panel title={published ? 'Reviewer concerns' : 'Rejection reasons'} badge="pro" icon="!">
+          {published ? (
+            <p className="mb-3 text-xs text-gray-500">
+              This paper is already published, so these are points a reviewer could raise, not reasons it would be rejected.
+            </p>
+          ) : null}
           {analysis.rejection_reasons.length === 0 ? (
             <p className="text-sm text-gray-500">
-              {groundingNotes.some((note) => note.includes('rejection reason'))
-                ? 'The reasons the model proposed could not be tied to any text in your manuscript, so none are shown.'
-                : 'No major rejection risks identified'}
+              {unverifiedConcerns.length > 0
+                ? 'No concern could be tied to a passage of your manuscript. The ones raised are listed below as unverified.'
+                : published
+                  ? 'No concrete concerns identified'
+                  : 'No major rejection risks identified'}
             </p>
           ) : (
             <div className="space-y-2">
@@ -422,6 +458,40 @@ export default function Results(): ReactElement {
             </div>
           )}
         </Panel>
+
+        {consistencyReport && consistencyReport.status !== 'not_applicable' ? (
+          <Panel title="Consistency check" badge="pro" icon="≠">
+            <ConsistencyPanel report={consistencyReport} />
+          </Panel>
+        ) : null}
+
+        {disclosures && (disclosures.competing_interests || disclosures.funding) ? (
+          <Panel title="Disclosures" badge="pro" icon="§">
+            <DisclosuresPanel disclosures={disclosures} />
+          </Panel>
+        ) : null}
+
+        {unverifiedConcerns.length > 0 ? (
+          <Panel title="Unverified concerns" badge="pro" icon="?">
+            <p className="mb-3 text-xs text-gray-500">
+              Raised by the model but not tied to any passage of your manuscript. They are not counted as rejection
+              reasons and do not affect the score. Check each one against your paper before acting on it.
+            </p>
+            <ul className="space-y-2">
+              {unverifiedConcerns.map((item, index) => (
+                <li key={`unverified-${index}`} className="rounded-lg border border-dashed border-gray-300 bg-white p-3">
+                  <p className="text-sm text-gray-800">{item.problem || item.reason}</p>
+                  {item.unverified_reason ? (
+                    <p className="mt-1 text-xs text-amber-800">{item.unverified_reason}</p>
+                  ) : null}
+                  {item.solution || item.fix ? (
+                    <p className="mt-1 text-xs text-gray-500">Suggested: {item.solution || item.fix}</p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        ) : null}
 
         <Panel title="Novelty assessment" badge="pro" icon="✦">
           <p className="text-sm leading-6 text-gray-800">{analysis.novelty_assessment}</p>
@@ -737,6 +807,143 @@ function CitationTable({
   )
 }
 
+/** A section's fix plan: numbered steps, most important first, each with the words it is about and what to do. */
+function FixPlan({ plan }: { plan: FixStep[] }): ReactElement {
+  return (
+    <ol className="mt-2 w-full space-y-2">
+      {plan.map((item) => (
+        <li
+          key={item.step}
+          className={`rounded-md border-l-2 px-3 py-2 text-sm ${item.severity === 'major' ? 'border-red-400 bg-red-50/50' : 'border-amber-300 bg-amber-50/40'}`}
+        >
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+            Step {item.step} · {item.severity}
+            {item.source === 'checklist' ? ' · found by code' : ''}
+          </p>
+          <p className="text-gray-800">{item.problem}</p>
+          {item.quote ? (
+            <blockquote className="mt-1 border-l-2 border-gray-200 pl-2 text-xs italic text-gray-500">“{item.quote}”</blockquote>
+          ) : null}
+          <p className="mt-1 text-sky-700">→ {item.action}</p>
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+/** The section review: what the section does, what is good, and the problems, each with the words it is about. */
+function SectionReviewBlock({ section }: { section: SectionScore }): ReactElement {
+  const strengths = section.strengths ?? []
+  const findings = section.findings ?? []
+  const basis = section.score_basis ?? []
+  const [showBasis, setShowBasis] = useState(false)
+  return (
+    <div className="mt-2 space-y-2 sm:pl-[7.5rem]">
+      {section.summary ? <p className="text-sm text-gray-700">{section.summary}</p> : null}
+      {basis.length > 0 ? (
+        <div className="text-xs">
+          <button
+            type="button"
+            onClick={() => setShowBasis((value) => !value)}
+            aria-expanded={showBasis}
+            className="text-stone-500 underline hover:text-stone-800"
+          >
+            {showBasis ? 'Hide how this score was set ▴' : 'How this score was set ▾'}
+          </button>
+          {showBasis ? (
+            <ul className="mt-1 space-y-0.5 text-gray-500">
+              {basis.map((step, index) => (
+                <li key={index}>{step}</li>
+              ))}
+              <li className="pt-0.5 text-gray-400">
+                Computed from the findings and checklist below, so the same findings always give the same score.
+              </li>
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+      {strengths.map((item, index) => (
+        <div key={`s-${index}`} className="text-sm">
+          <p className="text-green-700">✓ {item.point}</p>
+          {item.quote ? (
+            <blockquote className="ml-4 mt-0.5 border-l-2 border-green-100 pl-2 text-xs italic text-gray-500">“{item.quote}”</blockquote>
+          ) : null}
+        </div>
+      ))}
+      {findings.map((item, index) => (
+        <div
+          key={`f-${index}`}
+          className={`rounded-md border-l-2 px-3 py-2 text-sm ${item.severity === 'major' ? 'border-red-400 bg-red-50/50' : 'border-amber-300 bg-amber-50/40'}`}
+        >
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">{item.severity}</p>
+          <p className="text-gray-800">{item.problem}</p>
+          <blockquote className="mt-1 border-l-2 border-gray-200 pl-2 text-xs italic text-gray-500">“{item.quote}”</blockquote>
+          <p className="mt-1 text-sky-700">→ {item.fix}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+const CHECK_MARK: Record<SectionCheck['status'], { mark: string; tone: string }> = {
+  met: { mark: '✓', tone: 'text-green-700' },
+  missing: { mark: '✗', tone: 'text-red-700' },
+  issue: { mark: '!', tone: 'text-amber-700' },
+  info: { mark: 'i', tone: 'text-gray-500' },
+}
+
+/** The section's checklist, decided by code from the text: problems first, then what the paper does, then facts. */
+function SectionChecklist({ checks }: { checks: SectionCheck[] }): ReactElement {
+  const rank = (c: SectionCheck): number =>
+    c.status === 'met' ? 3 : c.status === 'info' ? 4 : c.severity === 'major' ? 0 : c.status === 'missing' ? 1 : 2
+  const ordered = [...checks].sort((a, b) => rank(a) - rank(b))
+  const problems = checks.filter((c) => c.status === 'missing' || c.status === 'issue').length
+  const [open, setOpen] = useState<number | null>(null)
+  return (
+    <div className="mt-2 sm:pl-[7.5rem]">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+        Checklist · {problems === 0 ? 'no problems found' : `${problems} to check`}
+        <span className="font-normal normal-case tracking-normal"> · read by code from your text</span>
+      </p>
+      <ul className="mt-1 space-y-1">
+        {ordered.map((check, index) => {
+          const { mark, tone } = CHECK_MARK[check.status]
+          const expandable = Boolean(check.quote || check.detail || check.fix)
+          return (
+            <li key={`${check.key}-${index}`} className="text-sm">
+              <button
+                type="button"
+                disabled={!expandable}
+                onClick={() => setOpen(open === index ? null : index)}
+                aria-expanded={open === index}
+                className="flex w-full items-start gap-2 text-left disabled:cursor-default"
+              >
+                <span className={`w-3 shrink-0 text-center font-semibold ${tone}`} aria-hidden="true">{mark}</span>
+                <span className="flex-1 text-gray-700">
+                  {check.label}
+                  {check.severity === 'major' ? (
+                    <span className="ml-2 rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-red-700">major</span>
+                  ) : null}
+                </span>
+                {expandable ? <span className="text-xs text-gray-400">{open === index ? '▴' : '▾'}</span> : null}
+              </button>
+              {open === index ? (
+                <div className="ml-5 mt-1 space-y-1 text-xs">
+                  {check.detail ? <p className="text-gray-600">{check.detail}</p> : null}
+                  {check.quote ? (
+                    <blockquote className="border-l-2 border-gray-200 pl-2 italic text-gray-500">“{check.quote}”</blockquote>
+                  ) : null}
+                  {check.fix ? <p className="text-sky-700">→ {check.fix}</p> : null}
+                </div>
+              ) : null}
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
 function SectionRow({
   name,
   section,
@@ -757,6 +964,7 @@ function SectionRow({
   const width = Math.min(100, Math.max(0, section.score))
   const [showFix, setShowFix] = useState(false)
   const [showContent, setShowContent] = useState(false)
+  const plan = section.fix_plan ?? []
 
   // The section text for the tools is prepared by the server (captions left out, length limited) and passed on as it is.
   const handleCalibrateSection = (): void => {
@@ -767,9 +975,11 @@ function SectionRow({
           journal: targetJournal,
           ...(field ? { field } : {}),
           focus: {
-            section: sectionLabel(name),
+            section: section.title || sectionLabel(name),
             issue: section.issue ?? section.weakness ?? '',
             fix: section.fix ?? '',
+            // every issue of the section with how to fix it: the Calibrator resolves each one
+            ...(plan.length > 0 ? { steps: plan } : {}),
           },
           notes: section.tool_notes ?? [],
           ...(copy ? { document: copy } : {}),
@@ -809,7 +1019,7 @@ function SectionRow({
   return (
     <div>
       <div className="flex items-center gap-3">
-        <p className="w-28 shrink-0 break-words text-sm font-medium capitalize">{sectionLabel(name)}</p>
+        <p className="w-28 shrink-0 break-words text-sm font-medium">{section.title || sectionLabel(name)}</p>
         <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-gray-100">
           <div className={`h-full ${barClass(section.score)}`} style={{ width: `${width}%` }} />
         </div>
@@ -823,12 +1033,12 @@ function SectionRow({
       ) : (
         <div className="mt-1 space-y-1 sm:pl-[7.5rem]">
           {section.strength ? <p className="text-sm text-green-700">✓ {section.strength}</p> : null}
-          {section.issue ? (
+          {section.issue && !section.summary ? (
             <p className="text-sm text-gray-500">
               {section.score < SUGGESTION_SCORE ? '⚠' : '•'} {section.issue}
             </p>
           ) : null}
-          {section.fix ? (
+          {section.fix || plan.length > 0 ? (
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <button
                 type="button"
@@ -866,11 +1076,16 @@ function SectionRow({
               >
                 <span>✨ Calibrate {sectionLabel(name)}</span>
               </button>
-              {showFix ? <p className="w-full mt-1 text-sm text-sky-700">→ {section.fix}</p> : null}
+              {showFix && plan.length > 0 ? <FixPlan plan={plan} /> : null}
+              {showFix && plan.length === 0 && section.fix ? (
+                <p className="w-full mt-1 text-sm text-sky-700">→ {section.fix}</p>
+              ) : null}
             </div>
           ) : null}
         </div>
       )}
+      {section.summary || section.strengths?.length || section.findings?.length ? <SectionReviewBlock section={section} /> : null}
+      {section.checks && section.checks.length > 0 ? <SectionChecklist checks={section.checks} /> : null}
       {section.content ? (
         <div className="mt-1.5 sm:pl-[7.5rem]">
           <button
@@ -998,6 +1213,211 @@ function RevisionPanel({ revision }: { revision: RevisionComparison }): ReactEle
   )
 }
 
+const SECTION_NAME: Record<string, string> = {
+  abstract: 'Abstract',
+  introduction: 'Introduction',
+  methods: 'Methods',
+  results: 'Results',
+  discussion: 'Discussion',
+}
+
+const CELL_LINE_STATUS: Record<string, { label: string; className: string }> = {
+  problematic: { label: 'problematic', className: 'bg-red-50 text-red-700' },
+  no_known_problem: { label: 'no known problem', className: 'bg-green-50 text-green-700' },
+  not_found: { label: 'no exact record', className: 'bg-gray-100 text-gray-600' },
+  not_checked: { label: 'not checked', className: 'bg-gray-100 text-gray-600' },
+}
+
+/** What code found by comparing the paper's own values, and the cell lines looked up in Cellosaurus. */
+function ConsistencyPanel({ report }: { report: ConsistencyReport }): ReactElement {
+  if (report.status === 'not_checked') {
+    return <p className="text-sm text-gray-500">{report.note || 'The consistency check could not be completed this time.'}</p>
+  }
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-gray-500">
+        {report.facts_checked} values were read from your manuscript and compared across its sections by code. Every
+        item below quotes the passages it rests on.
+      </p>
+      {report.findings.length === 0 ? (
+        <p className="text-sm text-gray-700">No inconsistencies found between the values the paper gives.</p>
+      ) : (
+        <ul className="space-y-2">
+          {report.findings.map((finding) => (
+            <li
+              key={finding.message}
+              className={`rounded-lg border p-3 ${finding.severity === 'major' ? 'border-amber-200 bg-amber-50' : 'border-gray-200 bg-gray-50'}`}
+            >
+              <p className="text-sm text-gray-900">{finding.message}</p>
+              <ul className="mt-2 space-y-1">
+                {finding.quotes.map((quote) => (
+                  <li key={`${quote.section}-${quote.quote}`} className="text-xs text-gray-600">
+                    <span className="font-medium">{SECTION_NAME[quote.section] ?? (quote.section || 'Text')}:</span>{' '}
+                    “{quote.quote}”
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      )}
+      {report.cell_lines.length > 0 ? (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Cell lines (Cellosaurus)</p>
+          <ul className="mt-1 space-y-1">
+            {report.cell_lines.map((line) => {
+              const status = CELL_LINE_STATUS[line.status] ?? CELL_LINE_STATUS.not_checked
+              return (
+                <li key={line.name} className="text-xs text-gray-700">
+                  <span className="font-medium">{line.name}</span>{' '}
+                  <Chip className={status.className}>{status.label}</Chip>
+                  {line.accession ? (
+                    <a
+                      className="ml-1 underline"
+                      href={`https://www.cellosaurus.org/${line.accession}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {line.accession}
+                    </a>
+                  ) : null}
+                  {line.note ? <span className="block text-red-700">{line.note}</span> : null}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** The paper's own competing-interest and funding statements: context for the reader, never a fault. */
+function DisclosuresPanel({ disclosures }: { disclosures: Disclosures }): ReactElement {
+  return (
+    <div className="space-y-2 text-sm text-gray-800">
+      {disclosures.interests.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {disclosures.interests.map((kind) => (
+            <Chip key={kind} className="bg-sky-50 text-sky-800">{kind}</Chip>
+          ))}
+        </div>
+      ) : disclosures.declares_none ? (
+        <p className="text-xs text-gray-500">The authors declare no competing interests.</p>
+      ) : null}
+      {disclosures.competing_interests ? (
+        <p><span className="font-medium">Competing interests:</span> {disclosures.competing_interests}</p>
+      ) : null}
+      {disclosures.funding ? (
+        <p><span className="font-medium">Funding:</span> {disclosures.funding}</p>
+      ) : null}
+      <p className="text-xs text-gray-500">
+        Quoted from the paper. A disclosed interest is context for weighing the claims, not a sign of misconduct, and
+        it does not change the score.
+      </p>
+    </div>
+  )
+}
+
+const NOTICE_SOURCE: Record<string, string> = {
+  publisher: 'publisher',
+  'retraction-watch': 'Retraction Watch',
+}
+
+/** The publication record, shown above everything else: it decides what the score cannot. */
+function IntegrityBanner({ integrity }: { integrity: PublicationStatus }): ReactElement | null {
+  const where = [integrity.journal, integrity.year ? `(${integrity.year})` : ''].filter(Boolean).join(' ')
+  const doiLink = integrity.doi ? (
+    <a className="underline" href={`https://doi.org/${integrity.doi}`} target="_blank" rel="noreferrer">
+      {integrity.doi}
+    </a>
+  ) : null
+  const notices = (integrity.notices ?? []).filter((n) => n.type !== 'correction' || integrity.status === 'corrected')
+  const noticeList =
+    notices.length > 0 ? (
+      <ul className="mt-2 space-y-1">
+        {notices.map((notice) => (
+          <li key={`${notice.type}-${notice.doi ?? ''}`} className="text-xs">
+            {notice.label || notice.type}
+            {notice.date ? ` · ${notice.date}` : ''}
+            {notice.source
+              ? ` · ${notice.source.split(', ').map((s) => NOTICE_SOURCE[s] ?? s).join(' and ')}`
+              : ''}
+            {notice.doi ? (
+              <>
+                {' · '}
+                <a className="underline" href={`https://doi.org/${notice.doi}`} target="_blank" rel="noreferrer">
+                  read the notice
+                </a>
+              </>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    ) : null
+  const marks = (integrity.file_marks ?? []).map((m) => `"${m.text}"`).join(', ')
+  const notes = (integrity.notes ?? []).map((note) => (
+    <p key={note} className="mt-1 text-xs opacity-80">{note}</p>
+  ))
+
+  if (integrity.status === 'retracted') {
+    return (
+      <section className="mt-4 rounded-xl border-2 border-red-300 bg-red-50 p-4 text-red-900">
+        <p className="text-sm font-semibold">
+          {integrity.is_notice ? 'This file is a retraction notice' : 'This article has been retracted'}
+        </p>
+        <p className="mt-1 text-sm">
+          {where ? `Published in ${where}` : 'The publication record'}
+          {doiLink ? <> · {doiLink}</> : null}
+          {marks ? ` · the file is marked ${marks}` : ''}. Its findings should not be relied on or cited as valid,
+          and no recommendation is made. The analysis below describes the text only.
+        </p>
+        {noticeList}
+        {notes}
+      </section>
+    )
+  }
+  if (integrity.status === 'expression_of_concern') {
+    return (
+      <section className="mt-4 rounded-xl border-2 border-amber-300 bg-amber-50 p-4 text-amber-900">
+        <p className="text-sm font-semibold">The publisher has issued an expression of concern</p>
+        <p className="mt-1 text-sm">
+          {where ? `Published in ${where}` : 'The publication record'}
+          {doiLink ? <> · {doiLink}</> : null}. The score is capped until the concern is resolved.
+        </p>
+        {noticeList}
+        {notes}
+      </section>
+    )
+  }
+  if (integrity.status === 'published' || integrity.status === 'corrected') {
+    return (
+      <section className="mt-4 rounded-xl border border-sky-200 bg-sky-50 p-4 text-sky-900">
+        <p className="text-sm font-semibold">
+          Already published{where ? ` in ${where}` : ''}
+          {integrity.status === 'corrected' ? ', with a correction' : ''}
+        </p>
+        <p className="mt-1 text-sm">
+          {doiLink ? <>DOI {doiLink}. </> : null}
+          {integrity.at_target_journal
+            ? 'It passed peer review in this journal, so nothing in it is treated as a desk rejection here.'
+            : 'It passed peer review there. Your target journal is a different one, so scope and level are judged for it.'}
+        </p>
+        {integrity.status === 'corrected' ? noticeList : null}
+        {notes}
+      </section>
+    )
+  }
+  if (integrity.status === 'not_checked' && (integrity.notes ?? []).length > 0) {
+    return (
+      <section className="mt-4 rounded-xl border border-gray-200 bg-gray-50 p-3 text-gray-700">
+        <p className="text-xs">Publication status not checked: {(integrity.notes ?? []).join(' ')}</p>
+      </section>
+    )
+  }
+  return null
+}
+
 function ReasonCard({
   item,
   targetJournal,
@@ -1051,7 +1471,14 @@ function ReasonCard({
   return (
     <article className={`rounded-lg border border-gray-200 border-l-4 p-3.5 ${style.border}`}>
       <div className="flex items-center justify-between">
-        <p className={`text-[10px] font-bold uppercase tracking-wide ${style.label}`}>{style.name}</p>
+        <p className={`text-[10px] font-bold uppercase tracking-wide ${style.label}`}>
+          {style.name}
+          {item.origin && item.origin !== 'model' ? (
+            <span className="ml-2 rounded bg-white/70 px-1.5 py-0.5 text-[9px] font-semibold normal-case tracking-normal text-gray-600">
+              {item.origin === 'publication_record' ? 'from the publication record' : 'found by comparing the paper’s own values'}
+            </span>
+          ) : null}
+        </p>
         <div className="flex items-center gap-2">
           <button
             type="button"

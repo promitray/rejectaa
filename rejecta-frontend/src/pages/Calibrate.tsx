@@ -5,11 +5,11 @@ import ReactMarkdown from 'react-markdown'
 import { applyProposal, calibrateDocumentSection, calibrateVoice, downloadDocument, rejectProposal, undoDocument } from '../api'
 import { ToolWait } from '../components/Loaders'
 import { useRejectaStore } from '../store'
-import type { ApplyResult, DocumentProposal, VoiceCalibrateResponse } from '../types'
+import { MAX_FOCUS_CHARS, buildSectionFocus } from '../focus'
+import type { ApplyResult, DocumentProposal, FixStep, VoiceCalibrateResponse } from '../types'
 import FormattedMathText from '../components/FormattedMathText'
 
-// The API accepts a focus note of up to 700 characters.
-const MAX_FOCUS_CHARS = 700
+// The API accepts a focus note of up to MAX_FOCUS_CHARS characters (a section's issues and how to fix each).
 
 export default function Calibrate(): ReactElement {
   const location = useLocation()
@@ -18,7 +18,7 @@ export default function Calibrate(): ReactElement {
     journal?: string
     field?: string
     /** Set when the text is a section of the analysed paper: the review's issue and fix for it. */
-    focus?: { section: string; issue: string; fix: string }
+    focus?: { section: string; issue: string; fix: string; steps?: FixStep[] }
     /** What the server left out of or cut from the section text. */
     notes?: string[]
     /** Set when the paper has a working copy: the server calibrates its own text and can write it back. */
@@ -27,8 +27,12 @@ export default function Calibrate(): ReactElement {
     evidence?: string
   } | null
   const paperCopy = state?.document
+  // A section from the report: every issue found in it with its fix, as a numbered list. Anything else: one issue and fix.
+  const sectionFocus = state?.focus?.steps?.length ? buildSectionFocus(state.focus.section, state.focus.steps) : null
   const focusNote = state?.focus
-    ? `${state.focus.section}. Issue: ${state.focus.issue} Fix: ${state.focus.fix}`.slice(0, MAX_FOCUS_CHARS)
+    ? sectionFocus
+      ? sectionFocus.note
+      : `${state.focus.section}. Issue: ${state.focus.issue} Fix: ${state.focus.fix}`.slice(0, MAX_FOCUS_CHARS)
     : undefined
 
   const [text, setText] = useState<string>(state?.text ?? '')
@@ -245,8 +249,35 @@ export default function Calibrate(): ReactElement {
       {state?.focus ? (
         <div className="mb-6 rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-700">
           <p className="font-semibold uppercase tracking-wider text-stone-900">Calibrating: {state.focus.section}</p>
-          {state.focus.issue ? <p className="mt-1">Issue: {state.focus.issue}</p> : null}
-          {state.focus.fix ? <p className="mt-1">Fix: {state.focus.fix}</p> : null}
+          {sectionFocus ? (
+            <>
+              <p className="mt-1 text-stone-500">
+                {sectionFocus.used.length} issue(s) in this section go to the Calibrator with how to fix each; it reports what it did for each one.
+              </p>
+              <ol className="mt-1 space-y-1.5">
+                {sectionFocus.used.map((step, index) => (
+                  <li key={step.step} className="rounded border border-stone-200 bg-white px-2 py-1.5">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
+                      Issue {index + 1} · {step.severity}
+                      {step.source === 'checklist' ? ' · found by code' : ''}
+                    </p>
+                    <p className="text-stone-800">{step.problem}</p>
+                    <p className="mt-0.5 text-sky-700">→ {step.action}</p>
+                  </li>
+                ))}
+              </ol>
+              {sectionFocus.left.length > 0 ? (
+                <p className="mt-1 text-amber-800">
+                  {sectionFocus.left.length} more issue(s) are about a later part of this section that is not in this text; calibrate that part next.
+                </p>
+              ) : null}
+            </>
+          ) : (
+            <>
+              {state.focus.issue ? <p className="mt-1">Issue: {state.focus.issue}</p> : null}
+              {state.focus.fix ? <p className="mt-1">Fix: {state.focus.fix}</p> : null}
+            </>
+          )}
           <p className="mt-1 text-stone-500">
             Content the section needs but does not have is marked [AUTHOR TO ADD: ...] instead of being invented.
           </p>

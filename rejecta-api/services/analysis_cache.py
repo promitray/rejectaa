@@ -13,16 +13,21 @@ from collections import OrderedDict
 
 from models import AnalysisPaperResponse
 from services.documents.store import Owner
+from services.consistency import EXTRACTION_PROMPT_VERSION
+from services.evidence_check import SUPPORT_PROMPT_VERSION
 from services.llm.base import PROMPT_VERSION
+from services.section_review import SECTION_REVIEW_PROMPT_VERSION
 
 CACHE_TTL_SECONDS = 7 * 24 * 3600.0
 MAX_ENTRIES = 200
+# every prompt whose answer is part of the report: a change to any of them must not serve an older report
+REPORT_VERSION = "|".join((PROMPT_VERSION, EXTRACTION_PROMPT_VERSION, SUPPORT_PROMPT_VERSION, SECTION_REVIEW_PROMPT_VERSION))
 
 _entries: OrderedDict[str, tuple[float, AnalysisPaperResponse]] = OrderedDict()
 
 
 def cache_key(owner: Owner, file_sha256: str, journal: str, mode: str, article_type: str | None, model: str) -> str:
-    parts = [owner.kind, str(owner.id), file_sha256, journal.strip().lower(), mode, article_type or "auto", PROMPT_VERSION, model]
+    parts = [owner.kind, str(owner.id), file_sha256, journal.strip().lower(), mode, article_type or "auto", REPORT_VERSION, model]
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 

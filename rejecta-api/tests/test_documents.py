@@ -11,16 +11,25 @@ from contextlib import asynccontextmanager
 from collections import Counter
 from typing import Any
 
+import fitz
 import pytest
 from docx import Document
+from docx.oxml import OxmlElement, parse_xml
+from docx.shared import Pt
 from fastapi.testclient import TestClient
 
 from auth.errors import ApiError
 from models import DocumentCalibrateRequest
 from services.documents import docx_ops, service
-from services.documents.pdf_to_docx import _add_text_paragraph
+from services.documents.pdf_to_docx import (
+    _add_text_paragraph,
+    _split_heading_breaks,
+    build_working_copy,
+    figure_images,
+)
 from services.documents.store import MemoryDocumentStore, Owner
 from services.llm.base import AbstractAnalysisProvider
+from services.parser import parse_pdf
 
 OWNER = Owner("user", uuid.UUID("11111111-1111-1111-1111-111111111111"))
 OTHER = Owner("user", uuid.UUID("22222222-2222-2222-2222-222222222222"))
@@ -335,3 +344,177 @@ def test_evidence_that_is_not_in_the_section_starts_at_its_beginning() -> None:
     document_id = uuid.UUID(new_copy(store))
     proposal = run(service.calibrate_section(store, OWNER, document_id, "s2", request(evidence="words that appear nowhere in this paper at all"), FakeLLM()))
     assert proposal.original_text.startswith(RESULTS_1[:30])
+
+
+# ------------------------------------------------------------------ Option B (pdf2docx) & formatting preservation
+
+def _sample_pdf_bytes() -> bytes:
+    pdf = fitz.open()
+    page = pdf.new_page()
+    page.insert_text((72, 72), "1. Introduction", fontsize=12, fontname="hebo")
+    page.insert_text(
+        (72, 92),
+        "Self-reporting systems are used in medical materials and in polymer chemistry today.",
+        fontsize=10,
+        fontname="helv",
+    )
+    # Embed a raster figure image and draw a bordered 2x2 table plus caption on the page.
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 30), False)
+    pix.set_rect(pix.irect, (180, 200, 230))
+    page.insert_image(fitz.Rect(72, 130, 260, 220), stream=pix.tobytes("png"))
+    page.insert_text((72, 238), "Fig. 1 Schematic diagram of the setup.", fontsize=9, fontname="helv")
+    # 2x2 lattice table
+    for y in (270, 290, 310):
+        page.draw_line((72, y), (272, y))
+    for x in (72, 172, 272):
+        page.draw_line((x, 270), (x, 310))
+    page.insert_text((80, 284), "Sample", fontsize=9, fontname="hebo")
+    page.insert_text((180, 284), "Yield", fontsize=9, fontname="hebo")
+    page.insert_text((80, 304), "P1", fontsize=9, fontname="helv")
+    page.insert_text((180, 304), "92%", fontsize=9, fontname="helv")
+    page.insert_text((295, 780), "1", fontsize=9, fontname="helv")
+    data = pdf.tobytes()
+    pdf.close()
+    return data
+
+
+def test_pdf2docx_working_copy_preserves_tables_drawings_and_splits_heading_breaks() -> None:
+    pdf_bytes = _sample_pdf_bytes()
+    parsed = parse_pdf(pdf_bytes)
+    docx_bytes = build_working_copy(pdf_bytes, parsed)
+    doc = Document(io.BytesIO(docx_bytes))
+
+    assert len(doc.tables) == 1
+    assert len(doc.inline_shapes) >= 1
+    table_text = " | ".join(cell.text.strip() for row in doc.tables[0].rows for cell in row.cells)
+    assert "Sample" in table_text and "92%" in table_text
+    texts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    assert any(t.startswith("1. Introduction") for t in texts)
+    # Heading must not remain glued to the body paragraph via <w:br/>
+    assert not any(t.startswith("1. Introduction") and "Self-reporting systems" in t for t in texts)
+
+
+def test_split_heading_breaks_separates_bold_heading_and_keeps_sect_pr_on_body() -> None:
+    doc = Document()
+    p = doc.add_paragraph()
+    r1 = p.add_run("2.1. Polycondensation ")
+    r1.bold = True
+    br_run = p.add_run()
+    br_run.add_break()
+    p.add_run("The seminal synthesis of a polythioester was reported in 1951 by Marvel.")
+    ppr = p._element.get_or_add_pPr()
+    ppr.append(OxmlElement("w:sectPr"))
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    split_doc = Document(io.BytesIO(_split_heading_breaks(buf.getvalue())))
+    paras = [para for para in split_doc.paragraphs if para.text.strip()]
+    assert [para.text.strip() for para in paras] == [
+        "2.1. Polycondensation",
+        "The seminal synthesis of a polythioester was reported in 1951 by Marvel.",
+    ]
+    assert paras[0]._element.find(docx_ops.W_PPR + "/" + docx_ops.W_SECT_PR) is None
+    assert paras[1]._element.find(docx_ops.W_PPR + "/" + docx_ops.W_SECT_PR) is not None
+
+
+def test_toggle_off_bold_italic_runs_are_not_tokenized_but_small_scripts_are_kept() -> None:
+    p = parse_xml(
+        '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '  <w:r><w:rPr><w:b w:val="0"/><w:i w:val="0"/><w:sz w:val="24"/></w:rPr><w:t xml:space="preserve">The polymer </w:t></w:r>'
+        '  <w:r><w:rPr><w:b w:val="0"/><w:i w:val="0"/><w:sz w:val="24"/></w:rPr><w:t xml:space="preserve">and </w:t></w:r>'
+        '  <w:r><w:rPr><w:b w:val="0"/><w:i w:val="0"/><w:sz w:val="14"/></w:rPr><w:t>1,2</w:t></w:r>'
+        '  <w:r><w:rPr><w:b w:val="0"/><w:i w:val="0"/><w:sz w:val="24"/></w:rPr><w:t xml:space="preserve"> in CO</w:t></w:r>'
+        '  <w:r><w:rPr><w:b w:val="0"/><w:i w:val="0"/><w:sz w:val="14"/></w:rPr><w:t>2</w:t></w:r>'
+        '</w:p>'
+    )
+    sel = docx_ops.tokenize([p])
+    # "and " (with explicit b=0, i=0) must NOT be tokenized, while sz=14 scripts ("1,2", "2") ARE preserved.
+    assert list(sel.token_text.values()) == ["1,2", "2"]
+    assert "The polymer and __REJ_INV_5000__ in CO__REJ_INV_5001__" == sel.masked_text
+
+
+def test_per_paragraph_formatting_and_sect_pr_survive_multi_paragraph_apply() -> None:
+    doc = Document()
+    doc.add_heading("Introduction", level=1)
+    p1 = doc.add_paragraph()
+    p1.paragraph_format.left_indent = Pt(18)
+    r1 = p1.add_run("First body paragraph has its own indentation and font size.")
+    r1.font.size = Pt(11)
+
+    p2 = doc.add_paragraph()
+    p2.paragraph_format.left_indent = Pt(36)
+    r2 = p2.add_run("Second body paragraph has wider indentation and smaller font.")
+    r2.font.size = Pt(9.5)
+    p2._element.get_or_add_pPr().append(OxmlElement("w:sectPr"))
+
+    doc.add_heading("References", level=1)
+    doc.add_paragraph("1. A. Author, J. Chem., 2001, 1, 100-110.")
+    buf = io.BytesIO()
+    doc.save(buf)
+
+    store = MemoryDocumentStore()
+    info = run(
+        service.create_working_copy(
+            store,
+            OWNER,
+            buf.getvalue(),
+            "styles.docx",
+            None,
+            [("introduction", p1.text + "\n\n" + p2.text, False)],
+        )
+    )
+    doc_id = uuid.UUID(info.id)
+    llm = FakeLLM(rewrite=lambda t: t.replace("body paragraph", "revised paragraph"))
+    proposal = run(service.calibrate_section(store, OWNER, doc_id, "s1", request(), llm))
+    run(service.apply_proposal(store, OWNER, doc_id, uuid.UUID(proposal.proposal_id)))
+
+    paras = paper_paragraphs(store, info.id)
+    assert paras[1].paragraph_format.left_indent == Pt(18)
+    assert paras[1].runs[0].font.size == Pt(11)
+    assert paras[2].paragraph_format.left_indent == Pt(36)
+    assert paras[2].runs[0].font.size == Pt(9.5)
+    # Section break on paragraph 2 is kept exactly once (on p2, never duplicated onto p1).
+    assert paras[1]._element.find(docx_ops.W_PPR + "/" + docx_ops.W_SECT_PR) is None
+    assert paras[2]._element.find(docx_ops.W_PPR + "/" + docx_ops.W_SECT_PR) is not None
+
+
+def test_page_numbers_and_bold_numbered_headings_are_skipped_by_calibration() -> None:
+    doc = Document()
+    doc.add_heading("Introduction", level=1)
+    h_sub = doc.add_paragraph()
+    r_sub = h_sub.add_run("1.1. Historical Context")
+    r_sub.bold = True
+    body_p = doc.add_paragraph("Self-reporting systems are used in medical materials for clinical imaging.")
+    page_num = doc.add_paragraph("2")
+    assert docx_ops.paragraph_kind(h_sub._element) == "heading"
+    assert docx_ops.paragraph_kind(page_num._element) == "page_number"
+    assert docx_ops.paragraph_kind(body_p._element) == "text"
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    store = MemoryDocumentStore()
+    info = run(
+        service.create_working_copy(
+            store,
+            OWNER,
+            buf.getvalue(),
+            "headings.docx",
+            None,
+            [("introduction", "1.1. Historical Context\n\n" + body_p.text + "\n\n2", False)],
+        )
+    )
+    proposal = run(service.calibrate_section(store, OWNER, uuid.UUID(info.id), "s1", request(), FakeLLM()))
+    assert proposal.original_text == body_p.text
+    assert proposal.notes == ["1 heading(s) in this section are kept exactly as they are."]
+
+
+def test_fallback_figure_images_ignores_empty_whitespace_blocks() -> None:
+    pdf = fitz.open()
+    page = pdf.new_page()
+    page.draw_rect(fitz.Rect(72, 100, 300, 220), color=(0, 0, 0), fill=(0.85, 0.85, 0.85))
+    # PyMuPDF often emits an invisible whitespace-only block right above the caption.
+    page.insert_text((295, 225), "   ", fontsize=10, fontname="helv")
+    page.insert_text((72, 240), "Fig. 1 Vector diagram above a whitespace anchor.", fontsize=10, fontname="helv")
+    images = figure_images(pdf, 0)
+    pdf.close()
+    assert any(k.startswith("fig1vectordiagram") for k in images)

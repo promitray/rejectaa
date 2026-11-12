@@ -27,6 +27,7 @@ ROLE_METHODS = "methods"
 ROLE_RESULTS = "results"
 ROLE_DISCUSSION = "discussion"  # Conclusion / Outlook
 ROLE_THEMATIC = "thematic"
+ROLE_OTHER = "other"
 CANONICAL_ROLES = (ROLE_INTRODUCTION, ROLE_METHODS, ROLE_RESULTS, ROLE_DISCUSSION)
 ALL_ROLES = (*CANONICAL_ROLES, ROLE_THEMATIC, "other")
 
@@ -255,11 +256,14 @@ def assess_structure(
         return "none", 0.0
     found = set(section_roles.values())
     thematic = sum(1 for role in section_roles.values() if role == ROLE_THEMATIC)
+    # A paper whose own headings name three or more parts is read by them even without an Introduction heading
+    # (a Viewpoint or a Perspective with question headings, say).
+    topics_only = thematic >= 3
     if article_type in THEMATIC_TYPES:
-        ok = ROLE_INTRODUCTION in found and thematic >= 2
+        ok = (ROLE_INTRODUCTION in found and thematic >= 2) or topics_only
     else:
         # standard IMRaD headings, or numbered topic headings after an Introduction (a review not labelled as one)
-        ok = len(found & set(CANONICAL_ROLES)) >= 3 or (ROLE_INTRODUCTION in found and thematic >= 2)
+        ok = len(found & set(CANONICAL_ROLES)) >= 3 or (ROLE_INTRODUCTION in found and thematic >= 2) or topics_only
     if ok and coverage >= 0.6:
         return "detected", coverage
     return "partial", coverage

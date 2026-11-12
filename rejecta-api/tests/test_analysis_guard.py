@@ -159,6 +159,19 @@ def test_detected_sections_must_be_ones_the_parser_found() -> None:
     assert out["sections"]["introduction"]["source"] == "detected"
 
 
+def test_detected_sections_follow_the_paper_not_the_order_the_model_listed_them() -> None:
+    names = ["Introduction", "Methods", "Results", "Discussion"]
+    ctx = make_ctx(
+        structure_mode="detected",
+        article_type=pp.RESEARCH_ARTICLE,
+        section_texts={n: n.lower() * 30 for n in names},
+        section_roles={n: n.lower() for n in names},
+    )
+    listed = ["Introduction", "Results", "Discussion", "Methods"]  # as the model listed them in a real run
+    out = run(payload(sections=[{"name": n, "score": 70, "issue": "i", "fix": "f"} for n in listed]), ctx)
+    assert list(out["sections"]) == names
+
+
 def test_section_without_a_score_is_dropped_and_both_shapes_are_accepted() -> None:
     old_shape = {"introduction": {"score": 55, "issue": "i", "fix": "f"}, "methods": {"issue": "no score"}}
     out = run(payload(sections=old_shape), None)
@@ -573,3 +586,37 @@ def test_detected_sections_carry_the_text_the_parser_found_under_the_heading() -
 def test_without_a_body_there_is_no_content() -> None:
     out = run(payload(sections=[derived("Background", "The design and synthesis of self-reporting delivery systems")]), content_ctx(body=""))
     assert out["sections"]["Introduction"].get("content") is None
+
+
+# ------------------------------------------------------------------ Greek letters in quotes
+
+GREEK_PAPER = (
+    "The optimal parameter set ϕ∗ that maximizes the probability of constructing x is given by ϕ∗ = argmax. "
+    "We set β = 0.1 and train the β-VAE for 200 epochs with a learning rate schedule."
+)
+
+
+def greek_reason(evidence: str) -> dict[str, Any]:
+    return {
+        "problem": "The optimisation objective for the parameter set is stated without its constraints.",
+        "evidence": evidence,
+        "impact": "Readers cannot reproduce the optimisation of the parameter set from the text alone.",
+        "solution": "State the constraints of the parameter set optimisation and define every symbol used.",
+        "severity": "major",
+        "impact_area": "scientific_validity",
+    }
+
+
+def test_a_quote_that_spells_a_greek_letter_out_is_still_found_in_the_paper() -> None:
+    ctx = make_ctx(source_text=GREEK_PAPER, body=GREEK_PAPER, numbers_text=GREEK_PAPER)
+    for spelling in ("ϕ∗", "φ*", r"\phi^*", "phi*", r"$\phi^{*}$"):
+        quote = f"The optimal parameter set {spelling} that maximizes the probability of constructing x"
+        out = run(payload(rejection_reasons=[greek_reason(quote)]), ctx)
+        assert len(out["rejection_reasons"]) == 1, spelling
+        assert out["unverified_concerns"] == [], spelling
+
+
+def test_beta_and_its_name_match() -> None:
+    ctx = make_ctx(source_text=GREEK_PAPER, body=GREEK_PAPER, numbers_text=GREEK_PAPER)
+    out = run(payload(rejection_reasons=[greek_reason("We set beta = 0.1 and train the beta-VAE for 200 epochs")]), ctx)
+    assert len(out["rejection_reasons"]) == 1

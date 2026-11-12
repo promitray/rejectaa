@@ -12,7 +12,7 @@ from services import paper_profile as pp
 from services.analysis_guard import AnalysisContext, current_context, finalize_payload
 
 # Bump when the prompt or the scoring changes: it is part of the cache key, so old results are not reused.
-PROMPT_VERSION = "2026-11-10.3"
+PROMPT_VERSION = "2026-11-13.4"  # .4: detected sections listed with the heading the paper prints
 MODE_A = "a"
 MODE_B = "b"
 MESSAGE_OVERHEAD_CHARS = 40_000  # room for the instructions, citation summary and journal data
@@ -117,7 +117,8 @@ The JSON must match this schema EXACTLY. Wrong field names or value types cause 
       "impact_area": "<exactly one of: novelty, scientific_validity, publication_potential>",
       "impact": "<1-2 sentences: how this weakness affects that area for THIS paper, and what a reviewer at the target journal would do about it>",
       "solution": "<the exact change the author should make: name the experiment, measurement, analysis, comparison, rewrite or cut, and what it should show. Not advice that would fit any paper>",
-      "severity": "<exactly one of: desk_reject, major, minor>"
+      "severity": "<exactly one of: desk_reject, major, minor>",
+      "criterion": "<the key of the criterion this concern lowers, exactly as listed in criteria>"
     }
   ],
   "novelty_assessment": "<one paragraph of 3-4 sentences, honest, specific to what this paper actually claims as new>",
@@ -218,6 +219,8 @@ def _profile_block(ctx: AnalysisContext) -> str:
     lines.append(
         "Do not score citation integrity; it is computed from the reference check. The Supporting Information is not provided."
     )
+    lines.extend(publication_lines(ctx))
+    lines.extend(consistency_lines(ctx))
     if ctx.structure_mode == "derived":
         names = pp.derived_section_names(ctx.article_type if ctx.article_type in pp.ARTICLE_TYPES else None)
         listed = ", ".join(f'"{name}" (role {role})' for name, role in names)
@@ -228,11 +231,25 @@ def _profile_block(ctx: AnalysisContext) -> str:
             "names. For each section set source to \"derived\" and copy 8-14 words EXACTLY from the manuscript, "
             "where that section begins, into \"anchor\"."
         )
+        kept = [n for n in ctx.previous_sections if n in {name for name, _ in names}]
+        if kept:
+            lines.append(
+                "The earlier version of this manuscript was divided into these sections: "
+                + ", ".join(f'"{n}"' for n in kept)
+                + ". Divide this version the same way: use exactly these sections, in this order, for as long as "
+                "their content is still in the text. Leave one out only when its content is really gone, and add "
+                "another name from the list above only when the text now has content that none of these can hold."
+            )
     else:
-        names = ", ".join(f'"{name}"' for name in ctx.section_texts)
+        def listed_name(name: str) -> str:
+            printed = ctx.section_titles.get(name, "")
+            return f'"{name}" (headed "{printed}" in the paper)' if printed and printed.lower() != name.lower() else f'"{name}"'
+
+        names = ", ".join(listed_name(name) for name in ctx.section_texts)
         lines.append(
             "Section structure: headings were detected. Score ONLY these sections and use these names exactly "
-            f"as \"name\" (source \"detected\", empty anchor): {names}."
+            f"as \"name\" (source \"detected\", empty anchor): {names}. When you write about a section, call it "
+            "by its heading in the paper."
         )
     return "\n".join(lines)
 
@@ -272,6 +289,56 @@ def journal_standing(journal_data: dict[str, Any]) -> str:
         if citedness >= floor:
             return f"{words} (its articles are cited {citedness:.1f} times each within two years)"
     return ""
+
+
+def publication_lines(ctx: AnalysisContext) -> list[str]:
+    """What the publication record says about this paper, so the model does not review a published or retracted
+    paper as if it were a fresh submission. The decision that follows from it is made by code, not by the model."""
+    pub = ctx.publication
+    if pub is None:
+        return []
+    where = " ".join(part for part in (f"in {pub.journal}" if pub.journal else "", f"({pub.year})" if pub.year else "") if part)
+    if pub.status in ("retracted", "expression_of_concern"):
+        what = "has been retracted" if pub.status == "retracted" else "is under an expression of concern"
+        return [
+            f"Publication record (checked by code, not by you): this article {what}. The recommendation that follows "
+            "from this is set by code. Judge the text on its own merits; do not guess why it was retracted, and do not "
+            "invent problems to explain it."
+        ]
+    if pub.status in ("published", "corrected"):
+        base_line = (
+            f"Publication record (checked by code): this paper is already published {where}".rstrip()
+            + " and passed peer review there. Raise only concrete problems that a quoted passage shows. Use major "
+            "only for a problem a reviewer would require to be fixed; wording and style points are minor. An empty "
+            "rejection_reasons list is a valid answer."
+        )
+        if pub.at_target_journal:
+            return [base_line + " The target journal is the journal that published it: never use severity desk_reject."]
+        return [
+            base_line + " The target journal is a different one: judge scope and level for the target journal, and use "
+            "desk_reject only for scope or level there, never for a flaw in the work itself."
+        ]
+    return []
+
+
+def consistency_lines(ctx: AnalysisContext) -> list[str]:
+    """Facts code established before the review: inconsistencies in the paper's own values, and its disclosures."""
+    lines: list[str] = []
+    report = ctx.consistency
+    if report is not None and report.findings:
+        listed = " ".join(f"({n}) {f.message}" for n, f in enumerate(report.findings, start=1))
+        lines.append(
+            "Consistency check (done by code; every item quotes the manuscript): " + listed + " Weigh these when you "
+            "score rigor and evidence. Do NOT list them in rejection_reasons: code adds them to the report itself."
+        )
+    disclosed = ctx.disclosures
+    if disclosed is not None and disclosed.interests:
+        lines.append(
+            "Disclosed interests (from the paper's own statement): " + ", ".join(disclosed.interests) + ". Where a claim "
+            "about the work's promise or safety rests on few data, say that independent confirmation matters. A "
+            "disclosed interest is not misconduct and is not a rejection reason."
+        )
+    return lines
 
 
 def _criteria_help(criteria: tuple[tuple[str, float], ...]) -> str:
