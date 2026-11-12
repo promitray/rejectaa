@@ -9,6 +9,8 @@ on:
 jobs:
   test-and-evaluate:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/rejecta-api
 
     steps:
       - name: Checkout Code
@@ -32,13 +34,12 @@ jobs:
           cd rejecta-api
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install langwatch-scenario pytest-html pytest-asyncio
 
       # Stage 1: Deterministic Fast Unit Tests (0 API Cost)
       - name: Run Core Unit & Guard Tests
         run: |
           cd rejecta-api
-          pytest tests/test_documents.py tests/test_analysis_guard.py tests/test_parser_docx.py tests/test_paper_structure.py tests/test_scoring_accuracy_step1.py -v --junitxml=junit-unit.xml
+          python -m pytest tests/test_documents.py tests/test_analysis_guard.py tests/test_parser_docx.py tests/test_paper_structure.py tests/test_scoring_accuracy_step1.py -v --junitxml=junit-unit.xml
 
       # Stage 2: LangWatch Scenario Paper Pipeline E2E Evaluation
       - name: Run Scenario Paper Analysis Evaluation
@@ -49,7 +50,7 @@ jobs:
           TEST_PAPERS_DIR: ${{ github.workspace }}/rejecta-api/eval/papers
         run: |
           cd rejecta-api
-          pytest scenarios/test_scenario_paper_analysis.py -v --html=evaluation_report.html --self-contained-html
+          python -m pytest scenarios/test_scenario_paper_analysis.py -v --html=evaluation_report.html --self-contained-html
 
       # Stage 3: Publish Interactive HTML Report as Artifact
       - name: Upload HTML Evaluation Report
