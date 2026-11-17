@@ -59,6 +59,33 @@ class Settings(BaseSettings):
     # judged on what was cut out.
     ANALYSIS_BODY_BUDGET_CHARS: int = 200_000
 
+    # Evidence ledger (services.evidence_ledger): the paper's claims, a rubric of checks per field, and one
+    # investigation per section with retrieved passages. Off: the older one-call-per-batch section review.
+    EVIDENCE_LEDGER_ENABLED: bool = True
+    # The editor's verdict, letter and journal fit written last, from verified findings only (services.editor_letter).
+    EDITOR_LETTER_FROM_FINDINGS: bool = True
+    # Every statement that the paper lacks something is checked against the whole paper (services.absence_audit).
+    ABSENCE_AUDIT_ENABLED: bool = True
+    # The novelty assessment written under the reviewer's rules from the claim ledger (services.novelty).
+    NOVELTY_FROM_CLAIMS: bool = True
+    # Literature knowledge base (services/literature): related papers and journal profiles by vector search, for
+    # novelty and journal fit. Off until it is integrated into the pipeline.
+    LITERATURE_KB_ENABLED: bool = False
+    # PDF reading: tables kept as rows and columns, text inside figures left out (services.pdf_layout).
+    PDF_LAYOUT_TABLES: bool = True
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    # Where the paper index (chunks and their embeddings) and the cache of model answers are kept.
+    # RAG_DATABASE_URL: a LOCAL Postgres (postgresql://user:password@localhost:5432/rejecta_local). It is never
+    # DATABASE_URL, and a Supabase address is refused. Empty: files under RAG_CACHE_DIR.
+    # RAG_STORE: "auto" (Postgres when RAG_DATABASE_URL is set, else files), "files", or "off" (memory only).
+    RAG_DATABASE_URL: str = ""
+    RAG_CACHE_DIR: str = ".cache/rag"
+    RAG_STORE: str = "auto"
+    # The same request to the model (temperature 0, same prompt, same model) gets the stored answer, so the same
+    # paper always gives the same report, across restarts too. Stores model answers, which quote the paper.
+    LLM_RESPONSE_CACHE: bool = True
+    LLM_RESPONSE_CACHE_DAYS: int = 30
+
     # Database (Supabase Postgres, schema "app").
     # DATABASE_URL: runtime connection as the least-privilege role rejecta_api.
     # MIGRATION_DATABASE_URL: owner connection (postgres) for Alembic and

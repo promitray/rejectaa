@@ -251,3 +251,53 @@ def test_a_rejection_reason_carries_its_section_and_the_paragraphs_around_its_ev
     assert "A final paragraph of the same section" in kept["tool_text"]
     assert "Methods paragraph 0." not in kept["tool_text"]  # a long section is cut around the evidence, not at its start
     assert kept["tool_notes"]
+
+
+# ------------------------------------------------------------------ Roman-numbered layouts (IEEE style)
+
+ROMAN_PAPER = "\n".join(
+    [
+        "Smart Hospital Queue System",
+        "ABSTRACT",
+        "A system that shortens outpatient waiting through live token scheduling and workload-aware routing of patients.",
+        "I. INTRODUCTION",
+        *["Long queues are one of the biggest problems in hospitals and patients wait for hours."] * 6,
+        "II.LITERATURE REVIEW",
+        *["Appointment systems rarely handle no-shows or predict waiting times from live delays."] * 6,
+        "III. METHODOLOGY",
+        *["The scheduling engine uses rule-based prioritization and a model that predicts consultation time."] * 6,
+        "IV. IDENTIFIED GAPS IN EXISTING",
+        "RESEARCH",
+        *["Few systems combine disease routing with workload balancing across the available doctors."] * 6,
+        "V. PROPOSED SYSTEM",
+        *["The objectives are shorter waits, balanced doctor workload and a transparent live queue status."] * 6,
+        "VII. LIMITATIONS",
+        *["Integration with electronic records needs coordination and prediction needs historical data."] * 6,
+        "VIII. CONCLUSION",
+        *["We propose a conceptual design for a district hospital queue management system."] * 6,
+        "IX.REFERENCES",
+        "[1] S. Gupta, A. Jain and R. Sharma, “Smart hospital management,” IJARSCT, 2023.",
+        "[2]",
+        "A. Verma et al., “Smart healthcare queue management,” IEEE Xplore, 2024.",
+        "[3] L. V. Green and S. Savin, “Reducing delays for medical appointments,” Operations Research, vol. 56, 2008.",
+        "[4] T. Cayirli and E. Veral, “Outpatient scheduling in health care,” Prod. Oper. Manag., vol. 12, 2003.",
+    ]
+)
+
+
+def test_roman_numbered_headings_give_sections_and_a_reference_list() -> None:
+    parsed = parser._build_document(ROMAN_PAPER, one_reference_per_line=False)
+    assert len(parsed.references) == 4  # "IX.REFERENCES" is a heading; "[2]" alone on its line belongs to what follows
+    assert parsed.references[1].startswith("A. Verma")
+    assert parsed.structure == "detected"
+    assert set(parsed.sections) == {
+        "introduction", "literature review", "methods", "Identified gaps in existing research",
+        "Proposed system", "limitations", "discussion",
+    }
+    assert "RESEARCH" not in parsed.sections["Proposed system"] and "RESEARCH" not in parsed.sections["methods"]
+    assert "Few systems combine disease routing" in parsed.sections["Identified gaps in existing research"]
+    assert "A system that shortens" not in parsed.sections["introduction"]
+
+
+def test_roman_numerals_are_read_correctly() -> None:
+    assert [parser._roman_value(n) for n in ("I", "IV", "VI", "VIII", "IX", "XI")] == [1, 4, 6, 8, 9, 11]

@@ -1,0 +1,28 @@
+# Nature Portfolio journals (Nature, Nature Chemistry, Nature Machine Intelligence, Nature Communications, ...).
+# Their editors decide first on significance to a broad readership; the reporting checks follow the Nature
+# Portfolio Reporting Summary.
+pack: nature
+version: "2026-11-13.2"
+title: Nature Portfolio journals
+applies_to: {journals: ["^nature\\b", "^communications (chemistry|biology|physics|materials|engineering|earth)", "^scientific reports$", "^npj\\b"]}
+items:
+  - id: nature.significance
+    triggers_on: [paper]
+    not_for: [soundness]  # Scientific Reports is Nature Portfolio but reviews for soundness only
+    ask_in: [introduction, discussion]
+    question: "Does the paper state why its advance matters beyond its own subfield, and how much it moves the field compared with the closest earlier work (a conceptual step, not only an improvement in numbers)?"
+    search: "broad significance important implications advance field general impact closest previous"
+    severity: {missing: major, problem: major}
+    fix: "Add to the end of the Introduction two sentences on what the advance changes for readers outside the subfield, and one on how far it goes beyond the closest earlier work (cited)."
+    source: "Nature Portfolio editorial criteria (significance to a broad readership)"
+
+  - id: nature.statistics_reporting
+    triggers_on: [quantitative, comparative]
+    main_only: true
+    ask_in: [results, methods]
+    covered_by: [statistics]
+    question: "For \"{claim}\": are n (and what it counts), the statistical test, and exact P values or confidence intervals reported for the data behind it?"
+    search: "n = independent experiments test P value confidence interval two-sided statistical"
+    severity: {missing: major, problem: minor}
+    fix: "For the data behind \"{claim}\", give n (what was counted), the test used (one- or two-sided) and the exact P value or confidence interval in the figure legend or text."
+    source: "Nature Portfolio Reporting Summary (statistics)"

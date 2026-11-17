@@ -1,0 +1,44 @@
+# Computational chemistry: quantum chemistry, molecular dynamics, simulations.
+pack: chemistry_computational
+version: "2026-11-13.1"
+title: Computational chemistry
+applies_to: {fields: [chemistry_computational]}
+items:
+  - id: chemistry_computational.level_of_theory
+    triggers_on: [paper]
+    ask_in: [methods]
+    question: "Is the level of theory fully stated: functional (with dispersion correction), basis set, solvation model, and the software with its version?"
+    search: "functional B3LYP M06 wB97X-D D3 dispersion basis set def2 6-31G solvation PCM SMD Gaussian ORCA version"
+    severity: {missing: major, problem: minor}
+    fix: "State the functional with its dispersion correction, the basis set(s), the solvation model and the software version for every calculation."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_computational.method_validation
+    triggers_on: [quantitative, comparative, mechanism]
+    main_only: true
+    ask_in: [methods, results]
+    question: "For \"{claim}\": is the chosen method validated for this kind of system, against experiment or a higher-level calculation, with the error stated?"
+    search: "benchmark validated compared experimental CCSD(T) higher level error deviation accuracy"
+    severity: {missing: major, problem: minor}
+    fix: "Validate the method behind \"{claim}\" on a few cases against experiment or CCSD(T), and give the error."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_computational.stationary_points
+    triggers_on: [paper]
+    ask_in: [methods]
+    requires_terms: [transition state, optimiz, optimis, energy profile, barrier]
+    question: "Are optimised structures confirmed by frequency calculations (minima with no imaginary frequency, transition states with one, linked by IRC), and was a conformer search done?"
+    search: "frequency imaginary IRC transition state minimum conformer search conformational"
+    severity: {missing: major, problem: minor}
+    fix: "State that minima have no imaginary frequency and transition states exactly one (confirmed by IRC), and describe the conformer search."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_computational.sampling
+    triggers_on: [paper]
+    ask_in: [methods]
+    requires_terms: [molecular dynamics, simulation, md simulation, force field, trajectory]
+    question: "For simulations: are the force field, simulation length, number of independent replicas and the convergence check stated?"
+    search: "force field ns simulation length replicas independent runs convergence equilibration"
+    severity: {missing: major, problem: minor}
+    fix: "State the force field, the simulation length, the number of independent replicas and how convergence was checked."
+    source: "Rejecta editorial rubric"

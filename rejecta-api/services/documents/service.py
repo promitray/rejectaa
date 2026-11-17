@@ -8,6 +8,7 @@ exactly as it was when it was calibrated.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -37,7 +38,10 @@ SELECTION_CHARS = 6000  # prose sent in one calibration, so the rewrite fits in 
 _MATCH_CHARS = 60
 _TAIL_SLACK = 400  # letters the copy may differ by from the analysed text before the section's end
 SHORTER_WARNING_RATIO = 0.6
-PDF_NOTE = "This copy was rebuilt from the PDF: one column, without the journal layout. Figures are pictures cut from the pages."
+PDF_NOTE = (
+    "This copy was converted from the PDF, preserving its layout, tables and figures. "
+    "Check complex equations and page breaks before submitting."
+)
 
 
 # --------------------------------------------------------------------------- shapes
@@ -144,7 +148,7 @@ async def create_working_copy(
     if source_format == "docx":
         docx = file_bytes
     elif source_format == "pdf":
-        docx = build_working_copy(file_bytes, parsed)
+        docx = await asyncio.to_thread(build_working_copy, file_bytes, parsed)
     else:
         raise ApiError(400, "unsupported_document", "Only PDF and Word (.docx) files can be kept as a working copy.")
     document = docx_ops.open_docx(docx)
@@ -179,7 +183,7 @@ def _prose(paragraphs: list, section: dict[str, Any]) -> tuple[list[int], dict[s
         kind = docx_ops.paragraph_kind(paragraphs[index])
         if kind == "text":
             prose.append(index)
-        elif kind != "empty":
+        elif kind not in ("empty", "page_number"):
             kept[kind] = kept.get(kind, 0) + 1
     return prose, kept
 
@@ -320,7 +324,7 @@ async def apply_proposal(store: DocumentStore, owner: Owner, document_id: uuid.U
     selected = [index + offset for index in payload["selected"]]
 
     new_paragraphs = docx_ops.build_paragraphs(
-        paragraphs[selected[0]], payload["masked_output"], payload["format_tokens"], payload["plain_tokens"]
+        [paragraphs[i] for i in selected], payload["masked_output"], payload["format_tokens"], payload["plain_tokens"]
     )
     if not new_paragraphs:
         raise ApiError(422, "empty_proposal", "The calibrated text is empty.")

@@ -145,13 +145,123 @@ def test_a_section_is_never_mistaken_for_a_reviewers_critique_when_focus_is_give
     assert result.input_type == "manuscript_draft" and result.calibrated_text
 
 
-def test_the_focus_is_collapsed_to_one_line() -> None:
+def test_the_focus_keeps_its_lines_but_collapses_the_spaces_inside_them() -> None:
     provider = _Provider()
-    calibrate(provider, INTRO, focus="Issue:\n\n   too   spaced\n  out")
-    assert "Issue: too spaced out" in provider.system_prompts[0]
+    calibrate(provider, INTRO, focus="Issues:\n\n1. too   spaced\n   Fix:   out")
+    prompt = provider.system_prompts[0]
+    assert "Issues:\n1. too spaced\nFix: out" in prompt
+
+
+def test_the_prompt_asks_for_every_issue_to_be_resolved_and_reported_one_by_one() -> None:
+    provider = _Provider()
+    calibrate(provider, INTRO, focus="1. [major] The novelty is overstated. Fix: say what is new.")
+    prompt = provider.system_prompts[0]
+    assert "Resolve EVERY issue" in prompt and '"Issue N:' in prompt and "not in the text you were given" in prompt
+    assert "check whether" in prompt  # a question for the author is reported, not applied
 
 
 def test_the_request_limits_the_length_of_the_focus() -> None:
-    assert VoiceCalibrateRequest(text="x" * 40, journal="Nature", focus="a" * 700).focus
+    from models import MAX_FOCUS_CHARS
+
+    assert VoiceCalibrateRequest(text="x" * 40, journal="Nature", focus="a" * MAX_FOCUS_CHARS).focus
     with pytest.raises(ValidationError):
-        VoiceCalibrateRequest(text="x" * 40, journal="Nature", focus="a" * 701)
+        VoiceCalibrateRequest(text="x" * 40, journal="Nature", focus="a" * (MAX_FOCUS_CHARS + 1))
+
+
+MISSING_NOTE = "Section: Methodology.\n1. [minor, missing from the text] No random seed is given.\n   Fix: Report the random seeds."
+
+
+class _Sequence(_Provider):
+    """Answers with each reply in turn (the last one repeats)."""
+
+    def __init__(self, replies: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.replies = replies
+        self.user_prompts: list[str] = []
+
+    async def generate(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        self.user_prompts.append(user_prompt)
+        return json.dumps(self.replies[min(len(self.user_prompts) - 1, len(self.replies) - 1)])
+
+
+def test_a_missing_item_with_no_placeholder_is_sent_back_once_and_the_placeholder_is_kept(monkeypatch) -> None:
+    from config import settings
+
+    monkeypatch.setattr(settings, "CALIBRATOR_MEANING_CHECK", False)
+    bare = {"calibrated_masked_text": INTRO, "modifications": ["Issue 1: not present in the text."]}
+    fixed = {"calibrated_masked_text": INTRO + " Training used a [AUTHOR TO ADD: random seed used for training and sampling].",
+             "modifications": ["Issue 1: added a placeholder for the random seed."]}
+    provider = _Sequence([bare, fixed])
+    result = asyncio.run(VoiceCalibratorService(provider).calibrate(
+        text=INTRO, journal_name="Polymer Chemistry", field="Polymer chemistry", focus=MISSING_NOTE))
+    assert len(provider.user_prompts) == 2 and "has 0 [AUTHOR TO ADD: ...] placeholder(s)" in provider.user_prompts[1]
+    assert "[AUTHOR TO ADD: random seed" in (result.calibrated_text or "")
+    assert any(note.startswith("Issue 1: added a placeholder") for note in result.audit_notes)
+
+
+def test_a_note_without_missing_items_is_never_asked_for_placeholders(monkeypatch) -> None:
+    from config import settings
+
+    monkeypatch.setattr(settings, "CALIBRATOR_MEANING_CHECK", False)
+    provider = _Sequence([{"calibrated_masked_text": INTRO, "modifications": ["Issue 1: reworded."]}])
+    asyncio.run(VoiceCalibratorService(provider).calibrate(
+        text=INTRO, journal_name="Polymer Chemistry", field="Polymer chemistry", focus="1. [minor] Too strong.\n   Fix: soften it."))
+    assert len(provider.user_prompts) == 1
+
+
+def test_the_prompt_tells_the_calibrator_what_to_do_with_a_missing_item() -> None:
+    provider = _Provider()
+    calibrate(provider, INTRO, focus=MISSING_NOTE)
+    assert "marked \"missing from the text\"" in provider.system_prompts[0] and "Do not answer it with \"not present\"" in provider.system_prompts[0]
+
+
+TWO_MISSING = (
+    "Section: Methodology.\n1. [minor, missing from the text] No random seed is given.\n   Fix: Report the seeds.\n"
+    "2. [minor, missing from the text] No data statement.\n   Fix: Add a data availability statement."
+)
+
+
+def test_one_placeholder_for_two_missing_items_is_not_enough(monkeypatch) -> None:
+    from config import settings
+
+    monkeypatch.setattr(settings, "CALIBRATOR_MEANING_CHECK", False)
+    one = {"calibrated_masked_text": INTRO + " [AUTHOR TO ADD: random seed].", "modifications": ["Issue 1: added a placeholder."]}
+    both = {"calibrated_masked_text": INTRO + " [AUTHOR TO ADD: random seed]. [AUTHOR TO ADD: where the data can be found].",
+            "modifications": ["Issue 1: added a placeholder.", "Issue 2: added a placeholder."]}
+    provider = _Sequence([one, both])
+    result = asyncio.run(VoiceCalibratorService(provider).calibrate(
+        text=INTRO, journal_name="Polymer Chemistry", field="Polymer chemistry", focus=TWO_MISSING))
+    assert len(provider.user_prompts) == 2 and "lists 2 issue(s)" in provider.user_prompts[1]
+    assert (result.calibrated_text or "").count("[AUTHOR TO ADD") == 2
+
+
+def test_an_issue_the_calibrator_did_not_report_is_flagged_by_number(monkeypatch) -> None:
+    from config import settings
+
+    monkeypatch.setattr(settings, "CALIBRATOR_MEANING_CHECK", False)
+    both = {"calibrated_masked_text": INTRO + " [AUTHOR TO ADD: random seed]. [AUTHOR TO ADD: data].",
+            "modifications": ["Issue 1: added a placeholder.", "Reworded for clarity."]}
+    result = asyncio.run(VoiceCalibratorService(_Sequence([both])).calibrate(
+        text=INTRO, journal_name="Polymer Chemistry", field="Polymer chemistry", focus=TWO_MISSING))
+    assert any(n.startswith("Issue 2: the Calibrator did not say") for n in result.audit_notes)
+    assert not any(n.startswith("Issue 1: the Calibrator did not say") for n in result.audit_notes)
+
+
+def test_a_placeholder_is_not_read_as_an_added_claim_by_the_meaning_check() -> None:
+    from services.calibrator.engine import _without_placeholders
+
+    assert _without_placeholders("We trained it.  [AUTHOR TO ADD: random seed used]  Then we tested.") == "We trained it. Then we tested."
+
+    class Checker(_Provider):
+        async def generate(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+            return json.dumps({"lost": [], "stronger": [], "added": ["[AUTHOR TO ADD: random seed]", "a new claim"]})
+
+    problems = asyncio.run(VoiceCalibratorService(Checker())._meaning_check("a", "b"))
+    assert problems == ["This is not in the original and must not be added: 'a new claim'."]
+
+
+def test_placeholders_do_not_count_as_added_sentences() -> None:
+    from services.calibrator.engine import _without_placeholders
+
+    text = "We trained it. [AUTHOR TO ADD: random seed used]. Then we tested it. We stopped [AUTHOR TO ADD: epochs], as planned."
+    assert _without_placeholders(text) == "We trained it. Then we tested it. We stopped as planned."

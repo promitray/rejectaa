@@ -398,7 +398,7 @@ async def analyse_paper(
             logger.warning("Could not look up earlier analyses", exc_info=True)
 
         try:
-            result = await run_analysis(parsed, journal.strip(), mode, previous=previous)
+            result = await run_analysis(parsed, journal.strip(), mode, previous=previous, refresh_lookups=fresh)
         except Exception as exc:
             logger.error("LLM analysis failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail="Analysis failed — please try again") from exc
@@ -445,6 +445,9 @@ async def analyse_paper(
             document=document_info,
             document_note=document_note,
             revision=result.revision,
+            integrity=result.integrity,
+            consistency=result.consistency,
+            disclosures=result.disclosures,
             meta=PaperMeta(
                 word_count=parsed.word_count,
                 sections_found=(

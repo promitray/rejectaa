@@ -21,6 +21,9 @@ from services.llm.base import AbstractAnalysisProvider
 
 logger = logging.getLogger(__name__)
 
+# What the editor's note says of an issue about something the text lacks (the app writes it; see rejecta-frontend/src/focus.ts)
+MISSING_MARK = "missing from the text"
+
 
 class CalibrationResult(BaseModel):
     """Execution output from VoiceCalibratorService."""
@@ -42,6 +45,31 @@ class CalibrationResult(BaseModel):
     # and what each token stands for.
     calibrated_masked_text: str | None = None
     vault_values: Dict[str, str] = {}
+
+
+PLACEHOLDER_OPEN = "[AUTHOR TO ADD"
+_PLACEHOLDER = re.compile(r"\s*\[AUTHOR TO ADD[^\]]*\][.,;]?")  # with the space before it and the stop after it
+_ISSUE_LINE = re.compile(r"^(\d+)\. \[([^\]]*)\]", re.MULTILINE)
+
+
+def _without_placeholders(text: str) -> str:
+    """The text with each [AUTHOR TO ADD: ...] taken out: a placeholder asks for content, it is not content."""
+    return re.sub(r"\s{2,}", " ", _PLACEHOLDER.sub("", text))
+
+
+def _issues(focus: str | None) -> list[tuple[int, str]]:
+    """(number, its tags) of each numbered issue in the editor's note."""
+    return [(int(n), tags) for n, tags in _ISSUE_LINE.findall(focus or "")]
+
+
+def _missing_items(focus: str | None) -> int:
+    return sum(1 for _, tags in _issues(focus) if MISSING_MARK in tags)
+
+
+def _unreported_issues(focus: str | None, notes: list[Any]) -> list[int]:
+    """Issue numbers the Calibrator gave no "Issue N: ..." entry for."""
+    reported = {int(m.group(1)) for n in notes if (m := re.match(r"\s*Issues?\s*(\d+)", str(n), re.IGNORECASE))}
+    return [number for number, _ in _issues(focus) if number not in reported]
 
 
 class VoiceCalibratorService:
@@ -67,7 +95,8 @@ class VoiceCalibratorService:
         `extra_invariants` are tokens already placed in `text` by the caller (formatted runs of a Word paragraph,
         such as superscript citations). They are protected and verified like the vault's own tokens.
         """
-        focus = re.sub(r"\s+", " ", focus).strip() if focus else None
+        # the note keeps its lines (a numbered list of issues); runs of spaces inside a line are collapsed
+        focus = "\n".join(" ".join(line.split()) for line in focus.splitlines() if line.strip()) if focus else None
         # Step 0: Input Type Classification (skipped for a section: we know what it is)
         classification: ClassificationResult | None = None if focus else InputTypeClassifier.classify(text)
 
@@ -145,10 +174,21 @@ class VoiceCalibratorService:
                     f"You omitted protected token(s) {', '.join(missing)}. You MUST keep all original tokens in your output!"
                 )
             else:
-                problems.extend(check_output(plain(vault_bundle.masked_text), plain(raw_calibrated), intensity))
+                problems.extend(check_output(plain(vault_bundle.masked_text), _without_placeholders(plain(raw_calibrated)), intensity))
                 # a second model call compares the meaning (off with CALIBRATOR_MEANING_CHECK=false)
                 if settings.CALIBRATOR_MEANING_CHECK:
-                    problems.extend(await self._meaning_check(plain(vault_bundle.masked_text), plain(raw_calibrated)))
+                    problems.extend(await self._meaning_check(plain(vault_bundle.masked_text), _without_placeholders(plain(raw_calibrated))))
+            # an issue the note marks as missing from the text needs a placeholder where it belongs; saying "it is not
+            # in the text" is not an answer (the author would never see what to add)
+            wanted = _missing_items(focus)
+            have = raw_calibrated.count(PLACEHOLDER_OPEN)
+            if wanted and not missing and have < wanted:
+                problems.append(
+                    f"The note lists {wanted} issue(s) marked as {MISSING_MARK}, but your version has {have} "
+                    "[AUTHOR TO ADD: ...] placeholder(s). Insert one for each of them, at the place in the text where the "
+                    "missing item belongs (for example \"[AUTHOR TO ADD: random seed used for training and sampling]\"), "
+                    "without digits in it."
+                )
             if not problems or attempt == 1:
                 break
             current_user_prompt = (
@@ -191,6 +231,10 @@ class VoiceCalibratorService:
             final_status = "verified"
             safe_calibrated_text = restored_text
 
+        unreported = _unreported_issues(focus, notes)
+        quality_warnings.extend(
+            f"Issue {number}: the Calibrator did not say what it did for this issue. Check the text for it." for number in unreported
+        )
         return CalibrationResult(
             calibrated_text=safe_calibrated_text,
             original_text=text,
@@ -241,7 +285,7 @@ class VoiceCalibratorService:
             if isinstance(items, list):
                 for item in items[:5]:
                     phrase = re.sub(r"\s+", " ", str(item)).strip()[:160]
-                    if phrase:
+                    if phrase and PLACEHOLDER_OPEN.lower() not in phrase.lower():  # a placeholder is not a claim
                         problems.append(template.format(phrase))
         return problems
 
@@ -325,7 +369,14 @@ Return a single valid JSON object:
         if focus:
             focus_block = f"""EDITOR'S NOTE FOR THIS SECTION (from the pre-submission review):
 {focus}
-Address this note ONLY by restructuring or rewording what is already in the text. If addressing it would need content that is not in the text (a new experiment, measurement, comparison or claim), do NOT write that content. Put a bracketed placeholder where it belongs, in the form [AUTHOR TO ADD: what is needed], and never put digits in a placeholder.
+
+HOW TO USE THE NOTE:
+- Resolve EVERY issue in the note that the text you are given can resolve, using the fix described for it. Where an issue quotes the words it is about, change those words; leave the rest of the section as it is.
+- An issue marked "{MISSING_MARK}" is about something the text lacks. Do not answer it with "not present": insert the placeholder [AUTHOR TO ADD: what is needed] at the place in the text where it belongs (a seed or version in the sentence that describes the training or the software, a data statement at the end of the section) and report "Issue N: added a placeholder for ...".
+- Rewording and restructuring only. If an issue needs content that is not in the text (a new experiment, measurement, comparison, version number, statement or claim), do NOT write that content: put a bracketed placeholder at the place where it belongs, in the form [AUTHOR TO ADD: what is needed], and never put digits in a placeholder.
+- If the fix is a question for the author ("check whether ..."), do not change the text for it; report it in "modifications".
+- An issue about words that are not in the text you were given is not yours to fix: say so in "modifications".
+- Report one entry per issue in "modifications", in the form "Issue N: <what you changed, or why you could not>", before any other entry.
 
 """
 

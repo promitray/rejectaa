@@ -1,0 +1,55 @@
+# Analytical chemistry: sensors, assays, detection and quantification methods.
+pack: chemistry_analytical
+version: "2026-11-13.1"
+title: Analytical chemistry and sensing
+applies_to: {fields: [chemistry_analytical]}
+items:
+  - id: chemistry_analytical.detection_limit
+    triggers_on: [quantitative, comparative]
+    ask_in: [results, methods]
+    requires_terms: [lod, limit of detection, detection limit, loq]
+    question: "For \"{claim}\": is it stated how the limit of detection (and quantification) was determined (e.g. 3σ of n blank measurements divided by the calibration slope), with n?"
+    search: "limit of detection LOD LOQ 3σ signal-to-noise blank standard deviation slope calibration"
+    severity: {missing: major, problem: minor}
+    fix: "State how the LOD and LOQ behind \"{claim}\" were calculated (e.g. 3σ_blank/slope and 10σ_blank/slope) and the number of blank measurements."
+    source: "IUPAC definitions of detection and quantification limits; Rejecta editorial rubric"
+
+  - id: chemistry_analytical.calibration
+    triggers_on: [quantitative]
+    ask_in: [results]
+    requires_terms: [linear, calibration, concentration range]
+    question: "For \"{claim}\": are the linear range, the calibration equation with R², the number of calibration levels and the replicates per level reported?"
+    search: "linear range calibration curve R2 regression equation concentrations replicates"
+    severity: {missing: minor, problem: minor}
+    fix: "Report for \"{claim}\" the calibration equation with R², the linear range, the number of concentration levels and the replicates at each."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_analytical.selectivity
+    triggers_on: [novelty, comparative, practical, causal]
+    main_only: true
+    ask_in: [results]
+    question: "For \"{claim}\": is selectivity tested against interfering species that are structurally similar or common in the intended samples, with the size of their response reported?"
+    search: "selectivity interference interfering species coexisting ions analogues response specificity"
+    severity: {missing: major, problem: minor}
+    fix: "Test the method behind \"{claim}\" against structurally similar compounds and common matrix components at realistic (or excess) concentrations and report their relative response."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_analytical.real_samples
+    triggers_on: [practical]
+    ask_in: [results]
+    question: "\"{claim}\" suggests use on real samples. Are real or spiked real samples analysed, with recovery (%) and RSD, and compared with an established reference method?"
+    search: "real samples spiked recovery RSD matrix serum urine water reference method HPLC validation"
+    severity: {missing: major, problem: minor}
+    fix: "Analyse spiked real samples for \"{claim}\", report recovery (%) and RSD, and compare the results with an established method (e.g. HPLC or LC-MS) on the same samples."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_analytical.reproducibility
+    triggers_on: [quantitative, practical]
+    main_only: true
+    ask_in: [results, methods]
+    covered_by: [replicates]
+    question: "For \"{claim}\": are repeatability and reproducibility reported (RSD across replicate measurements, independently made sensors or substrates, and over time)?"
+    search: "reproducibility repeatability RSD batches substrates independent sensors stability days"
+    severity: {missing: major, problem: minor}
+    fix: "Report the RSD of the response behind \"{claim}\" across replicate measurements, across at least 3 independently made sensors or substrates, and over storage time."
+    source: "Rejecta editorial rubric"

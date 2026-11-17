@@ -1,10 +1,36 @@
 """Shared test fixtures."""
 
-import pytest
+from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure rejecta-api root is always on sys.path across all platforms & CI runners
+API_ROOT = Path(__file__).resolve().parents[1]
+if str(API_ROOT) not in sys.path:
+    sys.path.insert(0, str(API_ROOT))
+
+import pytest
 from auth import tokens
 from config import settings
 from scripts.generate_keys import new_key
+
+
+@pytest.fixture(autouse=True)
+def _offline_review_defaults(monkeypatch: pytest.MonkeyPatch):
+    """Unit tests use the batch section review and keep nothing on disk; the evidence-ledger tests turn it on."""
+    from services import local_store
+
+    monkeypatch.setattr(settings, "EVIDENCE_LEDGER_ENABLED", False)
+    monkeypatch.setattr(settings, "EDITOR_LETTER_FROM_FINDINGS", False)
+    monkeypatch.setattr(settings, "ABSENCE_AUDIT_ENABLED", False)
+    monkeypatch.setattr(settings, "NOVELTY_FROM_CLAIMS", False)
+    monkeypatch.setattr(settings, "LITERATURE_KB_ENABLED", False)
+    monkeypatch.setattr(settings, "RAG_STORE", "off")
+    monkeypatch.setattr(settings, "LLM_RESPONSE_CACHE", False)
+    local_store.reset_store()
+    yield
+    local_store.reset_store()
 
 
 @pytest.fixture

@@ -22,6 +22,7 @@ OUT_OF_SCOPE = "out_of_scope"
 LABELS = (STRONG, WEAK, OUT_OF_SCOPE)
 
 SPREAD_LIMIT = 5
+SECTION_SPREAD_LIMIT = 5
 
 
 @dataclass(frozen=True)
@@ -47,7 +48,14 @@ TARGETS: tuple[Target, ...] = (
     Target("journal_match_accuracy", "Target journal matched to the right OpenAlex source", "min", 0.95, 0.0),
     Target("false_ghosts_strong", "Ghost references reported on strong papers", "max", 0, 0),
     Target("out_of_scope_desk_reject_rate", "Non-research papers given a desk reject", "max", 0.0, 0.0),
+    Target("publication_status_accuracy", "Publication status (published / retracted / ...) found correctly", "min", 1.0, 0.0),
+    Target("retracted_without_warning", "Retracted papers not flagged, or scored 40 or more", "max", 0, 0),
+    Target("section_findings_grounded", "Section findings and strengths whose quotation is in the paper", "min", 1.0, 0.0),
+    Target("section_score_spread_ok_share", f"Papers whose section scores move <= {SECTION_SPREAD_LIMIT} points between runs", "min", 0.90, 0.0),
+    Target("checklist_determinism", "Papers whose section checklists are identical between runs", "min", 1.0, 0.0),
+    Target("section_review_coverage", "Sections the section review reached", "min", 0.95, 0.0),
 )
+RECOMMENDATION_SCORE = 40  # a retracted paper must score below this
 TARGETS_BY_KEY = {t.key: t for t in TARGETS}
 
 
@@ -78,6 +86,33 @@ def _name_overlap(name_sets: list[set[str]]) -> float | None:
     return statistics.mean(len(a & b) / len(a | b) if a | b else 1.0 for a, b in pairs)
 
 
+def section_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """One paper's section results over its runs. Keys are left out when the runs carry no section data."""
+    rows = [r for r in runs if r.get("section_scores") is not None]
+    if not rows:
+        return {}
+    out: dict[str, Any] = {}
+    names = set.intersection(*(set(r["section_scores"]) for r in rows))
+    if len(rows) > 1 and names:  # the sections every run had: how far each score moved between runs
+        out["section_spread"] = max(
+            max(r["section_scores"][n] for r in rows) - min(r["section_scores"][n] for r in rows) for n in names
+        )
+        out["checklist_stable"] = all(
+            len({tuple(r["section_checks"].get(n, [])) for r in rows}) == 1 for n in names
+        )
+    reviewed = [flag for r in rows for flag in (r.get("section_reviewed") or {}).values()]
+    if reviewed:
+        out["section_review_coverage"] = sum(reviewed) / len(reviewed)
+    points = sum(r.get("section_points", 0) for r in rows)
+    if points:
+        out["section_grounded"] = sum(r.get("section_points_grounded", 0) for r in rows) / points
+        out["section_points"] = points
+    findings = [n for r in rows for n in (r.get("section_findings") or {}).values()]
+    if findings:
+        out["findings_per_section"] = statistics.mean(findings)
+    return out
+
+
 def parser_checks(paper: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
     """Compare what the parser found with what the manifest says the paper contains.
 
@@ -94,6 +129,8 @@ def parser_checks(paper: dict[str, Any], parsed: dict[str, Any]) -> dict[str, An
         checks["reference_recall"] = min(1.0, parsed.get("references", 0) / expect["references"])
     if "has_methods" in expect and expect["has_methods"]:
         checks["methods_found"] = "methods" in (parsed.get("section_roles") or [])
+    if expect.get("publication_status") and parsed.get("integrity_status"):
+        checks["publication_status_ok"] = parsed["integrity_status"] == expect["publication_status"]
     return checks
 
 
@@ -107,6 +144,9 @@ def paper_record(paper: dict[str, Any], parsed: dict[str, Any], runs: list[dict[
     formats = [r.get("paper_format") for r in runs if r.get("paper_format")]
     if formats:
         parsed = {**parsed, "analysis_type": max(set(formats), key=formats.count)}
+    statuses = [r.get("integrity_status") for r in runs if r.get("integrity_status")]
+    if statuses:
+        parsed = {**parsed, "integrity_status": statuses[-1]}
     desk_votes = [bool(r.get("desk_reject")) for r in runs]
     expect = paper.get("expect") or {}
     record: dict[str, Any] = {
@@ -120,7 +160,10 @@ def paper_record(paper: dict[str, Any], parsed: dict[str, Any], runs: list[dict[
         "spread": (max(scores) - min(scores)) if scores else None,
         "section_stability": _name_overlap([set(r.get("sections") or []) for r in runs]),
         "desk_reject": sum(desk_votes) > len(desk_votes) / 2 if desk_votes else None,
+        "integrity_status": parsed.get("integrity_status"),
+        "expected_status": expect.get("publication_status"),
         **parser_checks(paper, parsed),
+        **section_metrics(runs),
     }
     if runs:
         last = runs[-1]
@@ -166,7 +209,34 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, float | None]:
         "journal_match_accuracy": _share(collect("journal_match_ok")),
         "false_ghosts_strong": sum(r.get("ghost", 0) for r in strong) if strong else None,
         "out_of_scope_desk_reject_rate": _share([r["desk_reject"] for r in oos]),
+        "publication_status_accuracy": _share(collect("publication_status_ok")),
+        "retracted_without_warning": _retracted_without_warning(records),
+        "section_findings_grounded": _weighted_grounded(records),
+        "section_score_spread_ok_share": _share([s <= SECTION_SPREAD_LIMIT for s in collect("section_spread")]),
+        "checklist_determinism": _share(collect("checklist_stable")),
+        "section_review_coverage": (
+            statistics.mean(collect("section_review_coverage")) if collect("section_review_coverage") else None
+        ),
     }
+
+
+def _weighted_grounded(records: list[dict[str, Any]]) -> float | None:
+    """Share of all section findings and strengths (over every paper) whose quotation is in the paper."""
+    have = [r for r in records if r.get("section_grounded") is not None]
+    total = sum(r["section_points"] for r in have)
+    return sum(r["section_grounded"] * r["section_points"] for r in have) / total if total else None
+
+
+def _retracted_without_warning(records: list[dict[str, Any]]) -> int | None:
+    """Papers known to be retracted that the report did not flag, or still scored as if publishable."""
+    retracted = [r for r in records if r.get("expected_status") == "retracted" and r.get("integrity_status")]
+    if not retracted:
+        return None
+    return sum(
+        1 for r in retracted
+        if r["integrity_status"] != "retracted"
+        or (r.get("median_score") is not None and r["median_score"] >= RECOMMENDATION_SCORE)
+    )
 
 
 def meets(target: Target, value: float | None) -> bool | None:

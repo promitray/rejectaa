@@ -54,8 +54,10 @@ ARXIV_ABS_URL = "https://export.arxiv.org/abs/"
 ARXIV_SEARCH_URL = "https://export.arxiv.org/api/query"
 ARXIV_DOI_TEMPLATE = "10.48550/arXiv.{arxiv_id}"
 
-DOI_PATTERN = r"10\.\d{4,9}/[^\s,\]>\"'\)]+"
-DOI_TRAILING_PUNCTUATION = ".,);:"
+# A DOI may contain brackets: 10.1016/S0304-3835(03)00466-X. They are kept when they balance; a ")" that
+# only closes the text around the DOI ("(doi: 10.1000/xyz).") is cut off with the trailing punctuation.
+DOI_PATTERN = r"10\.\d{4,9}/[^\s,\]\"']+"
+DOI_TRAILING_PUNCTUATION = ".,;:"
 ARXIV_ID_PATTERN = re.compile(
     r"(?:arxiv\.org/(?:abs|pdf)/|arxiv:\s*)"
     r"(\d{4}\.\d{4,5}(?:v\d+)?|[a-z\-]+/\d{7})",
@@ -85,8 +87,21 @@ def _extract_doi(text: str) -> str | None:
     match = re.search(DOI_PATTERN, text)
     if not match:
         return None
-    doi = match.group(0).rstrip(DOI_TRAILING_PUNCTUATION)
-    return doi or None
+    return trim_doi(match.group(0)) or None
+
+
+def trim_doi(raw: str) -> str:
+    """A DOI found in running text without the punctuation and unbalanced brackets that follow it."""
+    doi = raw.strip()
+    while doi:
+        last = doi[-1]
+        if last in DOI_TRAILING_PUNCTUATION:
+            doi = doi[:-1]
+        elif (last == ")" and doi.count(")") > doi.count("(")) or (last == ">" and doi.count(">") > doi.count("<")):
+            doi = doi[:-1]
+        else:
+            break
+    return doi
 
 
 def _extract_arxiv_id(text: str) -> str | None:

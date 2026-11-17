@@ -42,12 +42,172 @@ export interface CitationSummary {
 
 export type ArticleType = 'research_article' | 'communication' | 'perspective' | 'review' | 'mini_review' | 'editorial'
 
+/** One step of a section's fix plan: what is wrong, the words it is about, and what to do. */
+export interface FixStep {
+  step: number
+  severity: 'major' | 'minor'
+  problem: string
+  /** The words of the paper the step is about; empty when something is missing. */
+  quote: string
+  action: string
+  /** "review": the section review (quoted from the paper). "checklist": decided by code. */
+  source: 'review' | 'checklist'
+  /** False when the words the step is about are in a part of the section that Calibrate does not receive. */
+  in_calibrate_text?: boolean
+  /** "add": something the section lacks (a placeholder goes where it belongs). "change": words to rewrite. */
+  kind?: 'add' | 'change'
+  /** What the problem means for the paper's claim. */
+  impact?: string | null
+  /** The source of the rubric check that raised it. */
+  rule?: string | null
+}
+
+/** A problem from the section review. `quote` was found in the paper by the server. */
+export interface SectionFinding {
+  severity: 'major' | 'minor'
+  problem: string
+  /** The paper's own words (taken by sentence id); empty for something the paper does not report. */
+  quote: string
+  fix: string
+  /** What the problem means for the claim. */
+  impact?: string | null
+  /** Sentence ids ("P12.3") the quote is made of. */
+  evidence_ids?: string[]
+  claim_id?: string | null
+  /** The paper's claim the finding is about. */
+  claim?: string | null
+  /** The rubric check that raised it ("cs_ml.tuning_budget"); empty when the reviewer raised it. */
+  check?: string | null
+  /** Where the check comes from ("NeurIPS Paper Checklist ...", "Rejecta editorial rubric"). */
+  source?: string | null
+  /** The page of the file the quotation is on. */
+  page?: number | null
+  /** Something said to be missing was searched for in every section and not found. */
+  searched?: boolean
+  /** The paper covers it, but in another section than this one (a gap of this section only). */
+  cross_reference?: boolean
+  /** What the paper does about it, when it addresses it in part (the finding says what is still missing). */
+  addressed?: string | null
+  origin?: 'rubric' | 'review' | null
+  status?: 'problem' | 'not_reported' | null
+  question?: string | null
+  kind?: 'add' | 'change' | null
+}
+
+export interface LedgerClaim {
+  id: string
+  statement: string
+  type: string
+  main: boolean
+  quote: string
+  evidence_ids: string[]
+  /** Findings about this claim that survived every check. */
+  findings: number
+}
+
+export interface LedgerCheck {
+  q: string
+  section: string
+  check: string
+  source: string
+  question: string
+  claim_id: string | null
+  status: 'supported' | 'problem' | 'not_reported' | 'cant_tell'
+  evidence_ids: string[]
+}
+
+export interface RemovedFinding {
+  section: string
+  check: string | null
+  problem: string
+  reason: string
+  detail: string
+}
+
+/** How the section review was made (the evidence-ledger review). */
+export interface EvidenceLedgerSummary {
+  status: string
+  field: string
+  paper_kind: string
+  packs: { name: string; title: string; version: string }[]
+  claims: LedgerClaim[]
+  questions: number
+  answers: Record<string, number>
+  findings_kept: number
+  removed: Record<string, number>
+  removed_findings?: RemovedFinding[]
+  checks?: LedgerCheck[]
+  retrieval: string
+  store: string
+  version: string
+}
+
+export interface SectionStrength {
+  point: string
+  quote: string
+  /** The page of the file the quotation is on. */
+  page?: number | null
+}
+
+/** One section of the verified outline, read from the file by code. */
+export interface OutlineEntry {
+  key: string
+  title: string
+  /** The printed number or letter ("2", "B"). */
+  label: string
+  part: 'main' | 'appendix'
+  page: number | null
+  role: string
+  /** "Appendix B: Experimental Setups (p. 9)". */
+  display: string
+  /** Its numbered subsections ("2.1 Observations"). */
+  children?: { label: string; title: string; page?: number | null }[]
+}
+
+/** One sentence of the editor's letter and the verified facts it rests on. */
+export interface LetterPoint {
+  text: string
+  refs: string[]
+  kind: 'letter' | 'journal_fit'
+  facts: Record<string, Record<string, unknown>>
+}
+
+/** One checklist item decided by code from the paper's text; every quote is copied from the paper. */
+export interface SectionCheck {
+  key: string
+  label: string
+  /** met: the paper does it. missing: it should and does not. issue: something in the text is wrong. info: a fact. */
+  status: 'met' | 'missing' | 'issue' | 'info'
+  severity?: 'major' | 'minor' | null
+  detail: string
+  quote: string
+  fix: string
+}
+
 export interface SectionScore {
   score: number
+  /** From the verified outline: printed number ("2", "B"), main text or appendix, first page. */
+  label?: string | null
+  part?: 'main' | 'appendix' | null
+  page?: number | null
   issue?: string
   fix?: string
   strength?: string
   weakness?: string
+  /** The heading as the paper prints it ("Conclusion"), when it differs from the section's key ("discussion"). */
+  title?: string | null
+  role?: string | null
+  checks?: SectionCheck[]
+  /** The section review: a summary, up to two strengths and up to four findings, each quoted from the paper. */
+  summary?: string | null
+  strengths?: SectionStrength[]
+  findings?: SectionFinding[]
+  /** What to change, most important first (verified findings and checklist problems). Empty when nothing needs fixing. */
+  fix_plan?: FixStep[]
+  /** The model's own number, kept when `score` was computed in code from the findings and the checklist. */
+  llm_score?: number | null
+  /** The steps of the computed score ("Start at 85 ...", "−10 major finding: ..."). */
+  score_basis?: string[]
   /** "detected": a heading in the file. "derived": found from the content, starting at `anchor`. */
   source?: 'detected' | 'derived' | null
   anchor?: string | null
@@ -70,6 +230,12 @@ export interface CriterionScore {
   weight: number
   /** True when the score was computed from the reference check, not by the model. */
   computed: boolean
+  /** Citation integrity only: share of references whose status could be settled (verified or ghost). */
+  coverage?: number | null
+  /** The model's score before code applied its limits. */
+  raw_score?: number | null
+  /** The limits code applied, in words (e.g. "Capped at 60: 2 major inconsistencies ..."). */
+  adjustments?: string[]
 }
 
 export interface RejectionReason {
@@ -90,6 +256,12 @@ export interface RejectionReason {
   /** The paragraphs around the evidence, prepared by the server for "Fix with Calibrator". */
   tool_text?: string | null
   tool_notes?: string[]
+  /** Who raised it: the model, or code (publication record, consistency check). */
+  origin?: 'model' | 'publication_record' | 'consistency' | 'evidence_ledger'
+  /** The scored criterion this concern bears on. */
+  criterion?: string
+  /** For an unverified concern: why it could not be tied to the paper. */
+  unverified_reason?: string
 }
 
 export interface AnalysisResult {
@@ -112,6 +284,206 @@ export interface AnalysisResult {
   not_assessed?: string[]
   /** Claims in the report that were removed or flagged because the manuscript does not support them. */
   grounding_notes?: string[]
+  /** Concerns the model raised that could not be tied to words in the paper. Shown apart, never scored. */
+  unverified_concerns?: RejectionReason[]
+  /** How the section review was made: the claims it checked, the rubric packs, and what was removed. */
+  evidence_ledger?: EvidenceLedgerSummary | null
+  /** The verified outline, read from the file by code. */
+  outline?: OutlineEntry[]
+  /** What code observed about the structure ("The main text has no Methods section; it is in Appendix B"). */
+  structure_notes?: string[]
+  /** What the file states about where it was presented or published, word for word. */
+  venue_statements?: string[]
+  /** How the target journal decides. */
+  journal_policy?: { journal: string; tier: 'soundness' | 'selective' | 'standard'; basis: string } | null
+  /** The editor's letter, sentence by sentence, with the verified facts each rests on. */
+  letter_points?: LetterPoint[]
+  /** Every statement that the paper lacks something, checked against the whole paper. */
+  absence_audit?: AbsenceAudit | null
+  /** The novelty assessment as checked data: contributions, prior work the paper cites, what is new, verdict. */
+  novelty?: Novelty | null
+}
+
+export interface IdText {
+  text: string
+  ids: string[]
+}
+
+/** A figure or table: in the main text its page and the section that first cites it; in an appendix, the appendix. */
+export interface NoveltyPlace {
+  label: string
+  page?: number
+  cited_in?: string
+  appendix?: string
+  caption?: string
+}
+
+export type NoveltyIntervention =
+  | {
+      kind: 'confound'
+      representation: IdText
+      family: string
+      terms: string[]
+      models: { names: string[]; ids: string[] }
+      same: boolean
+      shared: string[]
+    }
+  | { kind: 'inputs'; representation: IdText; family: string | null; side_effects: IdText }
+  | { kind: 'same_as'; claim: string; figure: string; note: string }
+
+export interface NoveltyContribution {
+  claim: string
+  statement: string
+  main: boolean
+  scope: IdText
+  contribution_type: string
+  prior: {
+    ids: string[]
+    citations: string[]
+    covers: string
+    relation: 'same_finding' | 'builds_on' | 'challenges' | 'reuses_data_from'
+    by_scope: boolean
+  }[]
+  theory: (IdText & { citations: string[] }) | null
+  delta: { text: string; ids: string[]; shown_in: NoveltyPlace[] }
+  places: NoveltyPlace[]
+  evidence_kind: 'new_experiment' | 'reanalysis_of_existing_results' | 'new_explanation' | 'new_scope' | 'none'
+  support: 'causal' | 'correlational' | 'descriptive'
+  intervention: NoveltyIntervention | null
+  strength: {
+    counts: { n: string; what: string; ids: string[]; source: string; from_caption: boolean; names?: string[] }[]
+    control: IdText
+    repeats: IdText & {
+      covers: string[]
+      subsets?: { count: string; kind: 'repeats' | 'tuning'; applies_to: string; exception: boolean; ids: string[] }[]
+      applies?: { label: string; text: string }[]
+    }
+    error_bars: { label: string; caption_defines: boolean; definition: string }[]
+    spread: IdText & { status: 'shown' | 'referred_not_shown' | 'not_given' }
+  }
+  limits: IdText
+  skeptic: IdText & { from_check?: boolean }
+  strengthen: IdText & { from_code?: boolean }
+  checks?: NoveltyCheck[]
+  notes: string[]
+  status: 'new' | 'incremental' | 'overlapping'
+  /** "new (weakly supported)" for a new claim on correlational evidence with no control. */
+  status_label?: string
+}
+
+/** A design check done by code for every paper: unequal budgets or repeats, split type, exclusions, task/metric mix. */
+export interface NoveltyCheck {
+  check: 'unequal_budget' | 'unequal_repeats' | 'split' | 'exclusion' | 'task_metric_mix'
+  text: string
+  ids: string[]
+  source?: string[]
+}
+
+export interface Novelty {
+  contributions: NoveltyContribution[]
+  superlatives: {
+    ids: string[]
+    text: string
+    evidence_ids: string[]
+    supported: boolean
+    axes_backed: string[]
+    axes_not_covered: string[]
+  }[]
+  verdict: 'new' | 'incremental' | 'overlapping'
+  /** "new (vs cited work)": uncited work is not searched. */
+  verdict_label: string
+  reason: string
+  reason_ids: string[]
+  overall: (IdText & { role?: 'strongest_new' | 'strongest_overlap' | 'why_verdict' })[]
+  design_checks?: NoveltyCheck[]
+  journal: { tier: string; journal: string; text: string } | null
+  dropped: string[]
+}
+
+export interface AbsenceAudit {
+  checked: number
+  present: number
+  partly: number
+  absent: number
+  mode: 'full paper' | 'retrieval'
+  items: {
+    where: string
+    statement: string
+    kind: string
+    verdict: 'present' | 'partly' | 'absent'
+    evidence_ids: string[]
+    evidence: string
+    corrected: string
+    /** The things the statement says are missing, each found or not (with where). */
+    parts?: { part: string; found: boolean; where: string; in_scope?: boolean; evidence_ids: string[]; pointer?: string }[]
+    /** The section the statement is about ("Appendix D: Discussion and Conclusion"), or "the whole paper". */
+    scope?: string
+  }[]
+}
+
+export interface IntegrityNotice {
+  type: string
+  label?: string
+  doi?: string | null
+  date?: string | null
+  source?: string
+}
+
+/** Whether the paper is already published, and whether it was retracted or put under concern. */
+export interface PublicationStatus {
+  status: 'retracted' | 'expression_of_concern' | 'corrected' | 'published' | 'not_found' | 'not_checked'
+  doi?: string | null
+  doi_source?: string | null
+  title?: string | null
+  journal?: string | null
+  publisher?: string | null
+  year?: number | null
+  notices?: IntegrityNotice[]
+  file_marks?: { kind: string; text: string; pages: number }[]
+  is_notice?: boolean
+  journal_abbreviation?: string | null
+  /** Published in the very journal the author is targeting. */
+  at_target_journal?: boolean | null
+  sources?: string[]
+  notes?: string[]
+}
+
+export interface ConsistencyQuote {
+  quote: string
+  section: string
+  values: string
+}
+
+export interface ConsistencyFinding {
+  kind: string
+  severity: 'major' | 'minor'
+  message: string
+  quotes: ConsistencyQuote[]
+}
+
+export interface CellLineCheck {
+  name: string
+  status: 'problematic' | 'no_known_problem' | 'not_found' | 'not_checked'
+  accession?: string | null
+  note?: string
+  quote?: string
+}
+
+/** The paper's own values, compounds and cell lines, compared by code. */
+export interface ConsistencyReport {
+  status: 'checked' | 'not_checked' | 'not_applicable'
+  findings: ConsistencyFinding[]
+  facts_checked: number
+  cell_lines: CellLineCheck[]
+  note?: string
+}
+
+/** Competing-interest and funding statements as the paper prints them. Context, never a fault. */
+export interface Disclosures {
+  competing_interests?: string | null
+  funding?: string | null
+  declares_none: boolean
+  interests: string[]
 }
 
 export interface ScoreChange {
@@ -211,6 +583,10 @@ export interface AnalysisPaperResponse {
   document_note?: string | null
   /** Set when this paper is a version of one the account analysed before. */
   revision?: RevisionComparison | null
+  /** Published / retracted / under concern, checked before the paper is scored. */
+  integrity?: PublicationStatus | null
+  consistency?: ConsistencyReport | null
+  disclosures?: Disclosures | null
   meta: {
     word_count: number
     sections_found: string[]

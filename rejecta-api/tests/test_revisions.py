@@ -162,6 +162,30 @@ def test_the_comparison_shows_scores_before_and_after_and_what_became_of_each_is
     assert previous.issues()[0]["id"] == 1
 
 
+def _previous(journal: str, same_file: bool = False) -> revisions.PreviousAnalysis:
+    return revisions.PreviousAnalysis(
+        uuid.uuid4(), revisions._now(), "v1.pdf", journal, "research_article", "a" * 64, [],
+        {"score": 82, "criteria": {}, "sections": {},
+         "reasons": [{"severity": i["severity"], "problem": i["problem"]} for i in EARLIER_ISSUES]},
+        similarity=1.0, same_file=same_file,
+    )
+
+
+def test_a_long_journal_text_is_the_same_journal_as_its_stored_copy() -> None:
+    long_journal = "Journal of Chemical Information and Modeling (JCIM) " + "Journal of Cheminformatics (BMC) " * 8
+    assert len(long_journal) > revisions.MAX_JOURNAL_CHARS
+    stored = long_journal.strip()[: revisions.MAX_JOURNAL_CHARS]  # what the database keeps
+    now = analysis(80, {}, [])
+    assert revisions.compare(_previous(stored), now, long_journal).same_journal is True
+    assert revisions.compare(_previous(stored), now, "Nature").same_journal is False
+
+
+def test_the_same_file_again_lists_no_issues_and_the_model_is_not_asked_about_them() -> None:
+    now = analysis(80, {}, [])
+    assert revisions.compare(_previous("J", same_file=True), now, "J").issues == []
+    assert len(revisions.compare(_previous("J"), now, "J").issues) == len(EARLIER_ISSUES)
+
+
 def test_the_kept_summary_has_scores_and_issues_but_no_text_of_the_paper() -> None:
     result = AnalysisResult.model_validate({
         "mood_score": 70, "verdict": "v", "oracle_letter": "o", "novelty_assessment": "n", "journal_fit": "j",

@@ -29,9 +29,124 @@ class ParsedDocument(BaseModel):
     coverage: float = 0.0
     refers_to_si: bool = False  # the paper points to Supporting Information that was not uploaded
     section_roles: dict[str, str] = Field(default_factory=dict)  # section key -> role
+    # section key -> its heading as printed ("Methodology", "Conclusion"); the key itself stays stable
+    section_titles: dict[str, str] = Field(default_factory=dict)
     body: str = Field(default="", exclude=True)  # cleaned body text, used when headings are missing
     # What the parser could not read properly (e.g. part of the reference list); shown with the report.
     parse_warnings: list[str] = Field(default_factory=list)
+    # Fingerprint of the section names and roles: the same file always gives the same value.
+    structure_signature: str = ""
+    # For the publication-integrity check: what the file itself says about its status and identity.
+    integrity_marks: list["FileMark"] = Field(default_factory=list)
+    doi_candidates: list[str] = Field(default_factory=list)  # the paper's own DOI, most likely first
+    title: str = ""  # the paper's title as printed (largest type on the first page, or the Word title)
+    front_text: str = Field(default="", exclude=True)  # first page text, to confirm a DOI belongs to this paper
+    # The verified outline (services.outline): each section's printed number ("2", "B"), whether it is main text
+    # or an appendix, and its first page; the figures and tables with their captions; and what the first page
+    # says about where the work was presented or published.
+    section_labels: dict[str, str] = Field(default_factory=dict)
+    section_parts: dict[str, str] = Field(default_factory=dict)  # key -> "main" | "appendix"
+    section_pages: dict[str, int] = Field(default_factory=dict)
+    figures: list[dict[str, Any]] = Field(default_factory=list)  # {"label": "Table 1", "caption": ..., "page": 3}
+    # numbered subsections under the sections: {"label": "2.1", "title": "Observations", "parent": "results", "page": 2}
+    subsections: list[dict[str, Any]] = Field(default_factory=list)
+    venue_statements: list[str] = Field(default_factory=list)
+    page_count: int = 0
+    first_page: int = 1  # the page number of page_texts[0] in the file (a cover page is skipped)
+    page_texts: list[str] = Field(default_factory=list, exclude=True)
+    # PDF tables read with their rows and columns (services.pdf_layout): {"label", "caption", "page", "header",
+    # "rows", "source"}. The section texts carry each table as one structured line in its place.
+    tables: list[dict[str, Any]] = Field(default_factory=list)
+    figure_text_removed_chars: int = 0  # labels printed inside figures, left out of the text
+
+
+class FileMark(BaseModel):
+    """A status printed in the file itself, such as a RETRACTED ARTICLE watermark."""
+
+    kind: Literal["retracted", "expression_of_concern", "withdrawn"]
+    text: str  # the words as printed
+    pages: int = 1  # on how many pages they appear
+
+
+class IntegrityNotice(BaseModel):
+    """A notice the publisher or Retraction Watch registered against the paper (from Crossref)."""
+
+    type: str  # retraction | partial_retraction | withdrawal | removal | expression_of_concern | correction | ...
+    label: str = ""
+    doi: str | None = None  # the notice's own DOI
+    date: str | None = None  # ISO date
+    source: str = ""  # publisher | retraction-watch
+
+
+class PublicationStatus(BaseModel):
+    """Whether the uploaded paper is already published, and whether it was retracted or put under concern."""
+
+    status: Literal[
+        "retracted", "expression_of_concern", "corrected", "published", "not_found", "not_checked"
+    ] = "not_checked"
+    doi: str | None = None
+    doi_source: str | None = None  # file | title_search
+    title: str | None = None
+    journal: str | None = None
+    publisher: str | None = None
+    year: int | None = None
+    notices: list[IntegrityNotice] = Field(default_factory=list)
+    file_marks: list[FileMark] = Field(default_factory=list)
+    is_notice: bool = False  # the uploaded file is itself a retraction or correction notice
+    journal_abbreviation: str | None = None
+    at_target_journal: bool | None = None  # published in the very journal the author is targeting
+    sources: list[str] = Field(default_factory=list)  # services that answered
+    notes: list[str] = Field(default_factory=list)  # e.g. sources that disagree
+
+
+class ConsistencyQuote(BaseModel):
+    """A passage of the paper that a consistency finding rests on (checked to be in the paper)."""
+
+    quote: str
+    section: str = ""  # abstract, introduction, methods, results, discussion... or "" when outside the sections
+    values: str = ""  # the value(s) the passage gives, as read
+    page: int | None = None  # the page of the file, found by code from the quotation
+
+
+class ConsistencyFinding(BaseModel):
+    """A contradiction or an implausible value that code found by comparing the paper's own numbers."""
+
+    kind: Literal[
+        "value_mismatch", "category_mismatch", "percent_claim", "unit_mismatch", "implausible_value",
+        "foreign_compound", "problematic_cell_line", "ranking_mismatch",
+    ]
+    severity: Literal["major", "minor"] = "major"
+    message: str
+    quotes: list[ConsistencyQuote] = Field(default_factory=list)
+
+
+class CellLineCheck(BaseModel):
+    """One cell line named in the paper, looked up in Cellosaurus."""
+
+    name: str
+    status: Literal["problematic", "no_known_problem", "not_found", "not_checked"] = "not_checked"
+    accession: str | None = None  # Cellosaurus accession, e.g. CVCL_0520
+    note: str = ""  # the Cellosaurus "Problematic cell line" comment, when there is one
+    quote: str = ""
+
+
+class ConsistencyReport(BaseModel):
+    """What comparing the paper's own values, compounds and cell lines found."""
+
+    status: Literal["checked", "not_checked", "not_applicable"] = "not_checked"
+    findings: list[ConsistencyFinding] = Field(default_factory=list)
+    facts_checked: int = 0  # values read from the paper and confirmed to be in it
+    cell_lines: list[CellLineCheck] = Field(default_factory=list)
+    note: str = ""
+
+
+class Disclosures(BaseModel):
+    """The paper's competing-interest and funding statements, as printed. Context for the reader, never a fault."""
+
+    competing_interests: str | None = None
+    funding: str | None = None
+    declares_none: bool = False  # the authors state they have no competing interests
+    interests: list[str] = Field(default_factory=list)  # kinds of interest the statement names: patent, stock...
 
 
 class PublicationType(str, Enum):
@@ -122,6 +237,117 @@ class Severity(str, Enum):
     minor = "minor"
 
 
+class SectionCheck(BaseModel):
+    """One item of a section's checklist, decided by code from the text (services.section_checks).
+
+    status: "met" (the paper does it; `quote` shows where), "missing" (it should and does not), "issue"
+    (something in the text is wrong or doubtful; `quote` shows it), "info" (a fact, no judgement).
+    Every quote is copied from the paper, so the same file always gives the same checklist.
+    """
+
+    key: str
+    label: str
+    status: str
+    severity: str | None = None  # "major" | "minor" for missing and issue; None otherwise
+    detail: str = ""
+    quote: str = ""
+    fix: str = ""
+
+
+class SectionFinding(BaseModel):
+    """A problem in one section, from the section review (services.section_review). `quote` was found in the paper.
+
+    From the evidence-ledger review (services.evidence_ledger) a finding also says which claim of the paper it is
+    about, which check of the rubric raised it and where that check comes from, and the ids of the sentences its
+    quote was taken from. `quote` is empty for something the paper does not report anywhere.
+    """
+
+    severity: str  # "major" | "minor"
+    problem: str
+    quote: str = ""
+    fix: str
+    impact: str | None = None  # what the problem means for the claim
+    evidence_ids: list[str] = Field(default_factory=list)  # sentence ids ("P12.3") the quote is made of
+    claim_id: str | None = None
+    claim: str | None = None  # the paper's claim the finding is about
+    check: str | None = None  # the rubric check ("cs_ml.tuning_budget"); None: raised by the reviewer
+    source: str | None = None  # where the check comes from ("NeurIPS Paper Checklist ...", "Rejecta editorial rubric")
+    origin: str | None = None  # "rubric" | "review"
+    status: str | None = None  # "problem" | "not_reported"
+    question: str | None = None  # the question the check asked
+    kind: str | None = None  # "add" (missing) | "change"
+    page: int | None = None  # the page of the file the quotation is on
+    # A finding that says something is missing was searched for in every section of the paper (services.
+    # evidence_ledger._existence_check): `searched` when nothing was found; `addressed` is what the paper does
+    # about it when it addresses it in part (the finding then says what is still missing).
+    searched: bool = False
+    addressed: str | None = None
+    addressed_ids: list[str] = Field(default_factory=list)
+    absence_checked: bool = False  # services.absence_audit has read the whole paper for it
+    cross_reference: bool = False  # the paper covers it, but in another section than this one
+
+
+class LedgerClaim(BaseModel):
+    """A claim of the paper as the evidence-ledger review recorded it, with the sentences that state it."""
+
+    id: str
+    statement: str
+    type: str
+    main: bool = False
+    quote: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    findings: int = 0  # findings about this claim that survived every check
+
+
+class EvidenceLedgerSummary(BaseModel):
+    """How the section review was made: the claims it checked, the rubric packs, and what was removed."""
+
+    status: str = "done"
+    field: str = "other"
+    paper_kind: str = "other"
+    packs: list[dict[str, str]] = Field(default_factory=list)
+    claims: list[LedgerClaim] = Field(default_factory=list)
+    questions: int = 0
+    answers: dict[str, int] = Field(default_factory=dict)  # supported / problem / not_reported / cant_tell
+    findings_kept: int = 0
+    removed: dict[str, int] = Field(default_factory=dict)  # without_evidence / found_in_paper / answered_by_paper / not_specific
+    # each removed finding with the reason and, for "found in the paper" / "answered by the paper", the sentences
+    removed_findings: list[dict[str, Any]] = Field(default_factory=list)
+    # every question asked and its answer, "supported" ones included: what was checked, with the sentences
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    ledger_entries_dropped: int = 0
+    retrieval: str = ""
+    store: str = ""
+    version: str = ""
+
+
+MAX_FOCUS_CHARS = 4000  # the editor's note a section is calibrated with: its issues and their fixes
+
+
+class FixStep(BaseModel):
+    """One step of a section's fix plan (services.section_review.build_fix_plan): what is wrong, where, what to do."""
+
+    step: int
+    severity: str  # "major" | "minor"
+    problem: str
+    quote: str = ""  # the words of the paper it is about; empty when the problem is something missing
+    action: str
+    source: str  # "review" (the section review) | "checklist" (decided by code)
+    # False when the words the step is about are in a part of the section that Calibrate does not receive
+    # (a long section is sent in parts): the step cannot be applied to the text it gets.
+    in_calibrate_text: bool = True
+    # "add": something the section lacks (a placeholder goes where it belongs); "change": words to rewrite
+    kind: str = "change"
+    impact: str | None = None  # what the problem means for the paper's claim
+    rule: str | None = None  # the rubric source of the check that raised it
+
+
+class SectionStrength(BaseModel):
+    point: str
+    quote: str = ""
+    page: int | None = None
+
+
 class SectionScore(BaseModel):
     """Evaluation information for one paper section.
 
@@ -134,7 +360,25 @@ class SectionScore(BaseModel):
     fix: str | None = None
     strength: str | None = None
     weakness: str | None = None
+    title: str | None = None  # the heading as the paper prints it, when it differs from the section's name
+    role: str | None = None  # introduction | methods | results | discussion | thematic | other
+    checks: list[SectionCheck] = Field(default_factory=list)
+    # The section review (a model call of its own, every quote checked against the paper)
+    summary: str | None = None
+    strengths: list[SectionStrength] = Field(default_factory=list)
+    findings: list[SectionFinding] = Field(default_factory=list)
+    # When the section was reviewed, `score` is computed in code from the findings and the checklist; the model's
+    # own number is kept here, and `score_basis` lists each step ("Start 85", "−10 major: ...").
+    # What to change, most important first: the section review's findings and the checklist's problems, each
+    # with its quotation and a concrete action. Built by code from verified material, with no model call.
+    fix_plan: list[FixStep] = Field(default_factory=list)
+    llm_score: int | None = None
+    score_basis: list[str] = Field(default_factory=list)
     source: str | None = None  # "detected" (a heading in the file) or "derived" (found from the content)
+    # From the verified outline (services.outline): the printed number ("2", "B"), main text or appendix, first page
+    label: str | None = None
+    part: str | None = None  # "main" | "appendix"
+    page: int | None = None
     anchor: str | None = None  # exact words from the paper where a derived section begins
     # The part of the paper the section covers, cut by code from where the section starts to where the next one starts.
     content: str | None = None
@@ -177,6 +421,11 @@ class RejectionReason(BaseModel):
     section: str = ""
     tool_text: str | None = None
     tool_notes: list[str] = Field(default_factory=list)
+    # Who raised it: the model, or code from the publication record or the consistency check.
+    # "evidence_ledger": a major finding of the section review on a main claim that passed every check there
+    origin: Literal["model", "publication_record", "consistency", "evidence_ledger"] = "model"
+    criterion: str = ""  # the scored criterion this concern bears on (a key of AnalysisResult.criteria)
+    unverified_reason: str = ""  # for an unverified concern: why it could not be tied to the paper
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -194,6 +443,11 @@ class CriterionScore(BaseModel):
     reason: str = ""
     weight: float = 0.0
     computed: bool = False  # True when the code computed it (citation integrity), not the model
+    # Citation integrity only: share of references whose status could be settled (verified or ghost).
+    coverage: float | None = None
+    raw_score: int | None = None  # the score before code applied its limits
+    adjustments: list[str] = Field(default_factory=list)  # the limits code applied, in words
+    base_weight: float | None = None  # the article type's weight, before the target journal's policy
 
 
 class PreviousIssueStatus(BaseModel):
@@ -222,6 +476,27 @@ class AnalysisResult(BaseModel):
     not_assessed: list[str] = Field(default_factory=list)  # things the file did not let us judge
     grounding_notes: list[str] = Field(default_factory=list)  # model claims that were removed or flagged
     previous_issues: list[PreviousIssueStatus] = Field(default_factory=list)  # revisions only
+    # Concerns the model raised that could not be tied to words in the paper. Shown apart, never scored.
+    unverified_concerns: list[RejectionReason] = Field(default_factory=list)
+    # Inputs of the overall score kept so code can recompute it after a later check (see analysis_guard.score_report).
+    score_penalty: int = 0  # points off for what the file did not show (Methods, Supporting Information)
+    raw_overall: int | None = None  # the model's own overall estimate, used only when it gave no criteria
+    evidence_ledger: EvidenceLedgerSummary | None = None  # how the section review was made (services.evidence_ledger)
+    # The verified outline and what code observed about it ("The main text has no Methods section; it is in
+    # Appendix B (p. 9)"), the publication context the file states, and how the target journal decides.
+    outline: list[dict[str, Any]] = Field(default_factory=list)
+    structure_notes: list[str] = Field(default_factory=list)
+    venue_statements: list[str] = Field(default_factory=list)
+    journal_policy: dict[str, str] | None = None
+    # The editor's letter and verdict as written from verified findings only (services.editor_letter): each
+    # sentence with the findings it rests on. Empty when the letter came from the main analysis.
+    letter_points: list[dict[str, Any]] = Field(default_factory=list)
+    # Every statement that the paper lacks something, checked against the whole paper (services.absence_audit):
+    # {"checked", "present", "partly", "absent", "mode", "items": [{"where", "statement", "verdict", "evidence", ...}]}
+    absence_audit: dict[str, Any] | None = None
+    # The novelty assessment as checked data (services.novelty): contributions with the prior work the paper itself
+    # cites, what remains new and where, superlatives, and the verdict decided by code.
+    novelty: dict[str, Any] | None = None
 
     @field_validator("mood", mode="before")
     @classmethod
@@ -298,6 +573,9 @@ class AnalysisPaperResponse(BaseModel):
     document: "DocumentInfo | None" = None  # the editable copy, when the user asked to keep one
     document_note: str | None = None  # why no copy was kept, when one was asked for
     revision: RevisionComparison | None = None  # set when this paper is a version of one analysed before
+    integrity: PublicationStatus | None = None  # published / retracted / under concern, checked before scoring
+    consistency: ConsistencyReport | None = None  # the paper's own numbers, compounds and cell lines compared
+    disclosures: Disclosures | None = None  # competing interests and funding, as the paper states them
 
 
 class AnalyseRequest(BaseModel):
@@ -320,8 +598,8 @@ class VoiceCalibrateRequest(BaseModel):
     intensity: str = Field(default="rewrite", description="Calibration intensity: polish, rewrite, restructure.")
     focus: str | None = Field(
         default=None,
-        max_length=700,
-        description="Editor's note on this section (the issue and fix from the review). Present when the text is a manuscript section.",
+        max_length=MAX_FOCUS_CHARS,
+        description="Editor's note on this section: the issues the review found in it and how to fix each. Present when the text is a manuscript section.",
     )
 
 
@@ -372,7 +650,7 @@ class DocumentCalibrateRequest(BaseModel):
     journal: str = Field(..., min_length=2, max_length=200)
     field: str = Field(default="Multidisciplinary", min_length=2, max_length=100)
     intensity: Literal["polish", "rewrite", "restructure"] = "rewrite"
-    focus: str | None = Field(default=None, max_length=700, description="The review's issue and fix for this section.")
+    focus: str | None = Field(default=None, max_length=MAX_FOCUS_CHARS, description="The review's issues for this section and how to fix each.")
     from_paragraph: int = Field(default=0, ge=0, le=10000, description="Skip this many prose paragraphs of the section (for long sections).")
     evidence: str | None = Field(
         default=None,
@@ -457,5 +735,6 @@ class RebuttalAnalyzeResponse(BaseModel):
     export_document_md: str
 
 
-# DocumentInfo is defined after AnalysisPaperResponse, which refers to it.
+# DocumentInfo is defined after AnalysisPaperResponse, which refers to it; FileMark after ParsedDocument.
 AnalysisPaperResponse.model_rebuild()
+ParsedDocument.model_rebuild()

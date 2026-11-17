@@ -13,6 +13,8 @@
 #                  references     number of entries in the paper's reference list
 #                  has_methods    true when the paper has a Methods / Experimental section in the file
 #                  journal_match  the OpenAlex display name the journal should resolve to
+#                  publication_status  retracted | expression_of_concern | corrected | published | not_found
+#                                 (a retracted paper must be flagged and score below 40)
 #   labelled_by  who checked the expectations (two people for every paper)
 
 papers:
@@ -28,6 +30,7 @@ papers:
       references: 5
       has_methods: false
       journal_match: Chemical Communications
+      publication_status: published
     labelled_by: []
     notes: >
       First failure reported by the team (2026-11-10): scored 40 with two desk-reject reasons for
@@ -48,6 +51,7 @@ papers:
       references: 88
       has_methods: false
       journal_match: Macromolecular Rapid Communications
+      publication_status: published
     labelled_by: []
     notes: >
       Run by the team against "Polymer Chemistry" (2026-11-10): 71, one major reason "limited discussion of

@@ -32,6 +32,7 @@ REVISION_SIMILARITY = 0.3
 HISTORY_TTL = timedelta(days=180)
 RECENT_LIMIT = 50  # earlier analyses of an account compared with a new upload
 MAX_PROBLEM_CHARS = 300
+MAX_JOURNAL_CHARS = 200  # the analysis_history column's limit (CHECK in migration 0010)
 ISSUE_STATUSES = ("resolved", "partly_resolved", "open")
 
 
@@ -84,6 +85,12 @@ class PreviousAnalysis:
         ]
 
 
+    def section_names(self) -> list[str]:
+        """The sections the earlier version was divided into, in order (names only, never text)."""
+        names = self.summary.get("sections") or {}
+        return [name for name in names if isinstance(name, str)]
+
+
 def summarize(analysis: AnalysisResult) -> dict[str, Any]:
     """What is kept of an analysis: scores and the reasons' problem statements, no text of the paper."""
     return {
@@ -134,12 +141,21 @@ def _changes(before: dict[str, Any], after: dict[str, int]) -> list[ScoreChange]
     ]
 
 
+def journal_key(journal: str) -> str:
+    """A journal as it is kept in the history (stripped, cut to the column's length), for comparing two analyses."""
+    return journal.strip()[:MAX_JOURNAL_CHARS].lower()
+
+
 def compare(previous: PreviousAnalysis, analysis: AnalysisResult, journal: str) -> RevisionComparison:
-    """The earlier analysis next to this one: scores, criteria, sections, and what became of the earlier issues."""
+    """The earlier analysis next to this one: scores, criteria, sections, and what became of the earlier issues.
+
+    The very same file has no issues to resolve: nothing in the paper changed, so the earlier issues are not
+    put to the model and not listed.
+    """
     summary = previous.summary
     statuses = {item.id: item for item in analysis.previous_issues}
     issues = []
-    for issue in previous.issues():
+    for issue in [] if previous.same_file else previous.issues():
         found = statuses.get(issue["id"])
         issues.append(
             PreviousIssue(
@@ -155,7 +171,7 @@ def compare(previous: PreviousAnalysis, analysis: AnalysisResult, journal: str) 
         previous_filename=previous.filename,
         previous_journal=previous.journal,
         same_file=previous.same_file,
-        same_journal=previous.journal.strip().lower() == journal.strip().lower(),
+        same_journal=journal_key(previous.journal) == journal_key(journal),
         similarity=previous.similarity,
         score_before=int(summary.get("score") or 0),
         score_after=analysis.mood_score,
@@ -213,7 +229,7 @@ class PostgresHistoryStore:
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, now() + make_interval(secs => $9::double precision))
                 RETURNING id
                 """,
-                owner.kind, owner.id, record.file_sha256, record.filename[:300], record.journal[:200],
+                owner.kind, owner.id, record.file_sha256, record.filename[:300], record.journal[:MAX_JOURNAL_CHARS],
                 record.article_type, record.signature, json.dumps(record.summary), HISTORY_TTL.total_seconds(),
             )
 

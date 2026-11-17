@@ -143,6 +143,11 @@ _SOURCES: dict[str, tuple[int, float]] = {
     "OpenAlex": (3, 0.12),
     "arXiv": (2, 0.5),
     "DataCite": (3, 0.1),
+    # The publication-status check (services.integrity) makes one to three requests per paper. It has its own
+    # lanes so it never waits behind the reference list, which may hold 150 lookups for the same services.
+    "CrossRef status": (2, 0.1),
+    "OpenAlex status": (1, 0.1),
+    "Cellosaurus": (2, 0.1),
 }
 _ANONYMOUS_OPENALEX = (1, 1.0)
 

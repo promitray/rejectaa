@@ -7,11 +7,24 @@ import { useRejectaStore } from '../store'
 import type {
   CitationResult,
   CitationStatus,
+  ConsistencyReport,
+  Disclosures,
   DocumentInfo,
+  AbsenceAudit,
+  Novelty,
+  NoveltyContribution,
+  NoveltyIntervention,
+  NoveltyPlace,
+  AnalysisResult,
+  EvidenceLedgerSummary,
+  LetterPoint,
   Mood,
+  PublicationStatus,
   RejectionReason,
   RevisionComparison,
   ScoreChange,
+  FixStep,
+  SectionCheck,
   SectionScore,
 } from '../types'
 
@@ -178,6 +191,13 @@ export default function Results(): ReactElement {
   const notAssessed = analysis.not_assessed ?? []
   const groundingNotes = analysis.grounding_notes ?? []
   const derivedSections = result.meta.structure_mode === 'derived'
+  const integrity = result.integrity ?? null
+  const retracted = integrity?.status === 'retracted'
+  // A published paper passed peer review: what the report raises are reviewer concerns, not rejection reasons.
+  const published = integrity?.status === 'published' || integrity?.status === 'corrected'
+  const consistencyReport = result.consistency ?? null
+  const disclosures = result.disclosures ?? null
+  const unverifiedConcerns = analysis.unverified_concerns ?? []
   const paperCopy = result.document ?? null
   // section name in the report -> section of the working copy, when it was found there
   const copySections = new Map((paperCopy?.sections ?? []).filter((s) => s.mapped).map((s) => [s.name, s.id]))
@@ -193,7 +213,9 @@ export default function Results(): ReactElement {
               <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${mood.pill}`}>
                 {mood.label}
               </span>
-              <span className="text-sm text-gray-700">{mood.description}</span>
+              <span className="text-sm text-gray-700">
+                {retracted ? 'Retracted — no recommendation' : mood.description}
+              </span>
               {typeLabel ? <Chip className="bg-stone-100 text-stone-700">{typeLabel}</Chip> : null}
             </div>
             <p className="mt-2 text-sm italic text-gray-500">{analysis.verdict}</p>
@@ -223,6 +245,8 @@ export default function Results(): ReactElement {
         ) : null}
         {rerunError ? <p className="mt-2 text-xs text-red-700">{rerunError}</p> : null}
       </section>
+
+      {integrity ? <IntegrityBanner integrity={integrity} /> : null}
 
       {result.revision ? <RevisionPanel revision={result.revision} /> : null}
 
@@ -301,6 +325,17 @@ export default function Results(): ReactElement {
                       </div>
                       <span className="w-8 text-right text-sm text-gray-700">{item.score}</span>
                     </div>
+                    {(item.adjustments ?? []).map((note) => (
+                      <p key={note} className="mt-1 text-xs text-amber-800 sm:pl-[9.75rem]">
+                        {note}
+                        {typeof item.raw_score === 'number' ? ` (the model gave ${item.raw_score})` : ''}
+                      </p>
+                    ))}
+                    {typeof item.coverage === 'number' ? (
+                      <p className="mt-1 text-xs text-gray-500 sm:pl-[9.75rem]">
+                        Coverage {Math.round(item.coverage * 100)}% of references settled
+                      </p>
+                    ) : null}
                     {item.reason ? (
                       <p className="mt-1 text-xs text-gray-500 sm:pl-[9.75rem]">
                         {item.computed ? 'Computed from the reference check. ' : ''}
@@ -311,6 +346,8 @@ export default function Results(): ReactElement {
                 ))}
                 <p className="text-xs text-gray-400">
                   The overall score is the weighted mean of these criteria, so it stays comparable between papers.
+                  Limits applied by code (publication record, inconsistencies in the paper, verified concerns) are
+                  shown under each criterion.
                 </p>
               </div>
             ) : null}
@@ -369,9 +406,13 @@ export default function Results(): ReactElement {
             <p className="font-serif text-sm leading-relaxed text-gray-800">{analysis.oracle_letter}</p>
             <p className="mt-4 text-sm text-gray-500">— Prof. Aldric Frowns, Editorial Board</p>
           </div>
+          <LetterBasis points={(analysis.letter_points ?? []).filter((p) => p.kind === 'letter')} />
         </Panel>
 
         <Panel title="Section analysis" badge="pro" icon="▤">
+          <StructurePanel outline={analysis.outline ?? []} notes={analysis.structure_notes ?? []} />
+          {analysis.evidence_ledger ? <LedgerPanel ledger={analysis.evidence_ledger} /> : null}
+          {analysis.absence_audit ? <AbsenceAuditPanel audit={analysis.absence_audit} /> : null}
           {sectionEntries.length === 0 ? (
             <p className="text-sm text-gray-500">Section data not available</p>
           ) : (
@@ -396,12 +437,19 @@ export default function Results(): ReactElement {
           )}
         </Panel>
 
-        <Panel title="Rejection reasons" badge="pro" icon="!">
+        <Panel title={published ? 'Reviewer concerns' : 'Rejection reasons'} badge="pro" icon="!">
+          {published ? (
+            <p className="mb-3 text-xs text-gray-500">
+              This paper is already published, so these are points a reviewer could raise, not reasons it would be rejected.
+            </p>
+          ) : null}
           {analysis.rejection_reasons.length === 0 ? (
             <p className="text-sm text-gray-500">
-              {groundingNotes.some((note) => note.includes('rejection reason'))
-                ? 'The reasons the model proposed could not be tied to any text in your manuscript, so none are shown.'
-                : 'No major rejection risks identified'}
+              {unverifiedConcerns.length > 0
+                ? 'No concern could be tied to a passage of your manuscript. The ones raised are listed below as unverified.'
+                : published
+                  ? 'No concrete concerns identified'
+                  : 'No major rejection risks identified'}
             </p>
           ) : (
             <div className="space-y-2">
@@ -423,8 +471,46 @@ export default function Results(): ReactElement {
           )}
         </Panel>
 
+        {consistencyReport && consistencyReport.status !== 'not_applicable' ? (
+          <Panel title="Consistency check" badge="pro" icon="≠">
+            <ConsistencyPanel report={consistencyReport} />
+          </Panel>
+        ) : null}
+
+        {disclosures && (disclosures.competing_interests || disclosures.funding) ? (
+          <Panel title="Disclosures" badge="pro" icon="§">
+            <DisclosuresPanel disclosures={disclosures} />
+          </Panel>
+        ) : null}
+
+        {unverifiedConcerns.length > 0 ? (
+          <Panel title="Unverified concerns" badge="pro" icon="?">
+            <p className="mb-3 text-xs text-gray-500">
+              Raised by the model but not tied to any passage of your manuscript. They are not counted as rejection
+              reasons and do not affect the score. Check each one against your paper before acting on it.
+            </p>
+            <ul className="space-y-2">
+              {unverifiedConcerns.map((item, index) => (
+                <li key={`unverified-${index}`} className="rounded-lg border border-dashed border-gray-300 bg-white p-3">
+                  <p className="text-sm text-gray-800">{item.problem || item.reason}</p>
+                  {item.unverified_reason ? (
+                    <p className="mt-1 text-xs text-amber-800">{item.unverified_reason}</p>
+                  ) : null}
+                  {item.solution || item.fix ? (
+                    <p className="mt-1 text-xs text-gray-500">Suggested: {item.solution || item.fix}</p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        ) : null}
+
         <Panel title="Novelty assessment" badge="pro" icon="✦">
-          <p className="text-sm leading-6 text-gray-800">{analysis.novelty_assessment}</p>
+          {analysis.novelty ? (
+            <NoveltyDetail novelty={analysis.novelty} />
+          ) : (
+            <p className="text-sm leading-6 text-gray-800">{analysis.novelty_assessment}</p>
+          )}
         </Panel>
 
         <Panel title="Journal fit" badge="pro" icon="▣">
@@ -464,7 +550,25 @@ export default function Results(): ReactElement {
               ) : null}
             </div>
           ) : null}
+          {analysis.journal_policy?.basis ? (
+            <p className="mt-3 rounded-md bg-stone-50 px-3 py-2 text-xs text-stone-700">
+              <span className="font-semibold">
+                {analysis.journal_policy.tier === 'soundness'
+                  ? 'Soundness-only journal. '
+                  : analysis.journal_policy.tier === 'selective'
+                    ? 'Selective journal. '
+                    : ''}
+              </span>
+              {analysis.journal_policy.basis}
+            </p>
+          ) : null}
+          {(analysis.venue_statements ?? []).length > 0 ? (
+            <p className="mt-2 text-xs text-amber-800">
+              The file states: {(analysis.venue_statements ?? []).map((v) => `“${v}”`).join(' · ')}
+            </p>
+          ) : null}
           <p className="mt-3 text-sm leading-6 text-gray-800">{analysis.journal_fit}</p>
+          <LetterBasis points={(analysis.letter_points ?? []).filter((p) => p.kind === 'journal_fit')} />
         </Panel>
       </div>
 
@@ -737,6 +841,775 @@ function CitationTable({
   )
 }
 
+/** A section's fix plan: numbered steps, most important first, each with the words it is about and what to do. */
+function FixPlan({ plan }: { plan: FixStep[] }): ReactElement {
+  return (
+    <ol className="mt-2 w-full space-y-2">
+      {plan.map((item) => (
+        <li
+          key={item.step}
+          className={`rounded-md border-l-2 px-3 py-2 text-sm ${item.severity === 'major' ? 'border-red-400 bg-red-50/50' : 'border-amber-300 bg-amber-50/40'}`}
+        >
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+            Step {item.step} · {item.severity}
+            {item.source === 'checklist' ? ' · found by code' : ''}
+          </p>
+          <p className="text-gray-800">{item.problem}</p>
+          {item.impact ? <p className="mt-0.5 text-xs text-gray-600">Why it matters: {item.impact}</p> : null}
+          {item.quote ? (
+            <blockquote className="mt-1 border-l-2 border-gray-200 pl-2 text-xs italic text-gray-500">“{item.quote}”</blockquote>
+          ) : null}
+          <p className="mt-1 text-sky-700">→ {item.action}</p>
+          {item.rule ? <p className="mt-0.5 text-[10px] text-gray-400">Check: {item.rule}</p> : null}
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+/** The section review: what the section does, what is good, and the problems, each with the words it is about. */
+function SectionReviewBlock({ section }: { section: SectionScore }): ReactElement {
+  const strengths = section.strengths ?? []
+  const findings = section.findings ?? []
+  const basis = section.score_basis ?? []
+  const [showBasis, setShowBasis] = useState(false)
+  return (
+    <div className="mt-2 space-y-2 sm:pl-[7.5rem]">
+      {section.summary ? <p className="text-sm text-gray-700">{section.summary}</p> : null}
+      {basis.length > 0 ? (
+        <div className="text-xs">
+          <button
+            type="button"
+            onClick={() => setShowBasis((value) => !value)}
+            aria-expanded={showBasis}
+            className="text-stone-500 underline hover:text-stone-800"
+          >
+            {showBasis ? 'Hide how this score was set ▴' : 'How this score was set ▾'}
+          </button>
+          {showBasis ? (
+            <ul className="mt-1 space-y-0.5 text-gray-500">
+              {basis.map((step, index) => (
+                <li key={index}>{step}</li>
+              ))}
+              <li className="pt-0.5 text-gray-400">
+                Computed from the findings and checklist below, so the same findings always give the same score.
+              </li>
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+      {strengths.map((item, index) => (
+        <div key={`s-${index}`} className="text-sm">
+          <p className="text-green-700">✓ {item.point}</p>
+          {item.quote ? (
+            <blockquote className="ml-4 mt-0.5 border-l-2 border-green-100 pl-2 text-xs italic text-gray-500">“{item.quote}”</blockquote>
+          ) : null}
+        </div>
+      ))}
+      {findings.map((item, index) => (
+        <div
+          key={`f-${index}`}
+          className={`rounded-md border-l-2 px-3 py-2 text-sm ${item.severity === 'major' ? 'border-red-400 bg-red-50/50' : 'border-amber-300 bg-amber-50/40'}`}
+        >
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+            {item.severity}
+            {item.status === 'not_reported' ? ' · not reported in the paper' : ''}
+            {item.claim_id ? ` · about claim ${item.claim_id}` : ''}
+          </p>
+          {item.claim ? <p className="text-xs text-gray-500">Claim: “{item.claim}”</p> : null}
+          <p className="text-gray-800">{item.problem}</p>
+          {item.impact ? <p className="mt-0.5 text-xs text-gray-600">Why it matters: {item.impact}</p> : null}
+          {item.quote ? (
+            <blockquote className="mt-1 border-l-2 border-gray-200 pl-2 text-xs italic text-gray-500">
+              “{item.quote}”
+              {item.evidence_ids?.length ? <span className="not-italic text-gray-400"> [{item.evidence_ids.join(', ')}]</span> : null}
+            </blockquote>
+          ) : null}
+          <p className="mt-1 text-sky-700">→ {item.fix}</p>
+          {item.addressed ? (
+            <p className="mt-1 text-xs text-gray-600">
+              What the paper does: <span className="italic">“{item.addressed}”</span>
+            </p>
+          ) : null}
+          {item.searched ? (
+            <p className="mt-0.5 text-[10px] text-gray-500">Searched every section of the paper, appendices included: not found.</p>
+          ) : null}
+          {item.cross_reference ? (
+            <p className="mt-0.5 text-[10px] text-amber-700">A gap of this section only: the paper covers it in another section.</p>
+          ) : null}
+          <p className="mt-0.5 text-[10px] text-gray-400">
+            {item.evidence_ids?.length || item.quote ? (
+              <span className="text-green-700">✓ Verified against the text{item.page ? `, p. ${item.page}` : ''}</span>
+            ) : (
+              <span>Not reported anywhere in the paper (searched)</span>
+            )}
+            {item.source && item.origin === 'rubric' ? ` · Check: ${item.source}` : ''}
+          </p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** The paper's outline as code read it from the file: what is main text, what is appendix, and on which page;
+ * and what the main text lacks. The review names only these sections. */
+function StructurePanel({ outline, notes }: { outline: AnalysisResult['outline']; notes: string[] }): ReactElement | null {
+  const entries = outline ?? []
+  if (entries.length === 0 && notes.length === 0) return null
+  return (
+    <div className="mb-3 rounded-lg border border-stone-200 p-3 text-sm">
+      <p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Paper structure (read from the file)</p>
+      <ul className="mt-1 flex flex-wrap gap-1.5">
+        {entries.map((e) => (
+          <li
+            key={e.key}
+            className={`rounded px-2 py-0.5 text-xs ${e.part === 'appendix' ? 'bg-amber-50 text-amber-800' : 'bg-stone-100 text-stone-700'}`}
+          >
+            {e.display}
+            {e.children?.length ? (
+              <span className="text-stone-400"> · {e.children.map((c) => `${c.label} ${c.title}`).join(' · ')}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+      {notes.map((note, index) => (
+        <p key={index} className="mt-1.5 text-xs text-stone-600">
+          ⓘ {note}
+        </p>
+      ))}
+    </div>
+  )
+}
+
+const AUDIT_VERDICT: Record<string, { label: string; tone: string }> = {
+  present: { label: 'removed: the paper has it', tone: 'text-green-700' },
+  partly: { label: 'corrected: the paper does part of it', tone: 'text-amber-700' },
+  absent: { label: 'kept: not found anywhere in the paper', tone: 'text-red-700' },
+}
+
+/** Every "the paper lacks X" statement of the report, checked against the whole paper: what was removed,
+ * what was corrected, and what was confirmed missing, with the paper's own words for each. */
+const NOVELTY_TONE: Record<string, string> = {
+  new: 'bg-emerald-50 text-emerald-800 ring-emerald-200',
+  incremental: 'bg-amber-50 text-amber-800 ring-amber-200',
+  overlapping: 'bg-rose-50 text-rose-800 ring-rose-200',
+}
+
+const RELATION_LABEL: Record<string, string> = {
+  same_finding: 'Already reported',
+  builds_on: 'Builds on',
+  challenges: 'Challenges',
+  reuses_data_from: 'Reuses data from',
+}
+
+const KIND_LABEL: Record<string, string> = {
+  new_experiment: 'New experiment',
+  reanalysis_of_existing_results: 'Reanalysis of results already shown',
+  new_explanation: 'New explanation',
+  new_scope: 'New scope',
+}
+
+function Ids({ ids }: { ids: string[] }): ReactElement | null {
+  if (!ids.length) return null
+  return <span className="ml-1 font-mono text-[11px] text-gray-500">[{ids.slice(0, 4).join(', ')}]</span>
+}
+
+function placeText(place: NoveltyPlace): string {
+  if (place.appendix) return `${place.label}, ${place.appendix}${place.page ? `, p. ${place.page}` : ''}`
+  const bits = [place.label, place.page ? `p. ${place.page}` : '', place.cited_in ? `cited in ${place.cited_in}` : '']
+  return bits.filter(Boolean).join(', ')
+}
+
+function Row({ label, children }: { label: string; children: ReactNode }): ReactElement {
+  return (
+    <div className="grid grid-cols-[8.5rem_1fr] gap-2 max-sm:grid-cols-1 max-sm:gap-0">
+      <dt className="text-xs font-medium uppercase tracking-wide text-gray-500">{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  )
+}
+
+function InterventionText({ i }: { i: NoveltyIntervention }): ReactElement {
+  if (i.kind === 'same_as') {
+    return (
+      <span>
+        Same intervention as {i.claim} (both rest on {i.figure}): <span className="text-amber-700">{i.note}</span>
+      </span>
+    )
+  }
+  if (i.kind === 'inputs') {
+    return (
+      <span>
+        Applied to the models&apos; own inputs ({i.representation.text || i.family || 'as defined'}), so not itself a confound.
+        <Ids ids={i.representation.ids} />{' '}
+        {i.side_effects.ids.length ? (
+          <>
+            It also changes {i.side_effects.text}.
+            <Ids ids={i.side_effects.ids} />
+          </>
+        ) : (
+          <span className="text-gray-600">Whether it changes sparsity, scale, type or dimensionality is not stated.</span>
+        )}
+      </span>
+    )
+  }
+  return (
+    <span className="text-amber-700">
+      Defined with {i.representation.text}, computed from {i.family}
+      {i.terms.length ? ` (${i.terms.join(', ')})` : ''}
+      <Ids ids={i.representation.ids} />; {i.models.names.join(', ')} take {i.family} as input
+      <Ids ids={i.models.ids} /> —{' '}
+      {i.same ? `the same representation (${i.shared.join(', ').toUpperCase()})` : `a related representation of the same family, not the same one`}.
+      Not causal without ruling this out.
+    </span>
+  )
+}
+
+function StrengthRows({ c }: { c: NoveltyContribution }): ReactElement {
+  const s = c.strength
+  return (
+    <>
+      <Row label="Counts">
+        {s.counts.length ? (
+          s.counts.map((x) => (
+            <span key={`${x.n}-${x.source}`} className="block">
+              {x.n} {x.what}
+              {x.from_caption ? (
+                <span className="text-gray-600">
+                  {' '}
+                  (from the caption of {x.source}
+                  {x.names?.length ? `: ${x.names.join(', ')}` : ''})
+                </span>
+              ) : x.source ? (
+                <span className="text-gray-600"> ({x.source})</span>
+              ) : null}
+              <Ids ids={x.ids} />
+            </span>
+          ))
+        ) : (
+          <span className="text-gray-600">Not given in the text or captions.</span>
+        )}
+      </Row>
+      <Row label="Control">
+        {s.control.ids.length ? (
+          <>
+            {s.control.text}
+            <Ids ids={s.control.ids} />
+          </>
+        ) : (
+          <span className="text-amber-700">No control, ablation or counter-test.</span>
+        )}
+      </Row>
+      <Row label="Repeats">
+        {s.repeats.ids.length ? (
+          <>
+            {s.repeats.text}
+            <span className="text-gray-600">
+              {s.repeats.covers.length ? ` — covers ${s.repeats.covers.join(', ')}` : ' — which experiments it covers is not stated'}
+            </span>
+            <Ids ids={s.repeats.ids} />
+          </>
+        ) : (
+          <span className="text-amber-700">Not stated.</span>
+        )}
+      </Row>
+      {(s.repeats.subsets ?? []).length > 1 ? (
+        <Row label="By subset">
+          {(s.repeats.subsets ?? []).map((x, n) => (
+            <span key={n} className="block">
+              {x.count || 'a different count, not stated'}
+              {x.kind === 'tuning' ? ' (tuning budget)' : ''}
+              <span className="text-gray-600"> — {x.applies_to}</span>
+              <Ids ids={x.ids} />
+            </span>
+          ))}
+        </Row>
+      ) : null}
+      {(s.repeats.applies ?? []).map((a) => (
+        <Row key={a.label} label={`Repeats, ${a.label}`}>
+          {a.text}
+        </Row>
+      ))}
+      {s.error_bars.map((e) => (
+        <Row key={e.label} label={`Error bars, ${e.label}`}>
+          {e.caption_defines ? (
+            <>Defined in the caption: “{e.definition}”</>
+          ) : (
+            <span className="text-gray-600">Not defined in the caption; whether they are drawn cannot be read from the text.</span>
+          )}
+        </Row>
+      ))}
+      <Row label="Spread values">
+        {s.spread.status === 'shown' ? (
+          <>
+            {s.spread.text}
+            <Ids ids={s.spread.ids} />
+          </>
+        ) : s.spread.status === 'referred_not_shown' ? (
+          <span className="text-amber-700">
+            Referred to{s.spread.text ? ` in ${s.spread.text}` : ''}, not shown: the appendix it points to does not show them.
+            <Ids ids={s.spread.ids} />
+          </span>
+        ) : (
+          <span className="text-amber-700">Not shown.</span>
+        )}
+      </Row>
+    </>
+  )
+}
+
+function NoveltyClaim({ c }: { c: NoveltyContribution }): ReactElement {
+  return (
+    <li className="rounded-lg border border-gray-200 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-xs text-gray-500">{c.claim}</span>
+        {c.main ? <span className="text-[11px] uppercase tracking-wide text-gray-500">main</span> : null}
+        <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ${NOVELTY_TONE[c.status] ?? ''}`}>
+          {c.status_label || c.status}
+        </span>
+        {c.contribution_type ? (
+          <span className="text-[11px] text-gray-500">{c.contribution_type.replace(/_/g, ' ')}</span>
+        ) : null}
+      </div>
+      <p className="mt-1 font-medium text-gray-900">{c.statement}</p>
+      <dl className="mt-2 space-y-1.5">
+        {c.scope.text ? (
+          <Row label="Scope">
+            {c.scope.text}
+            <Ids ids={c.scope.ids} />
+          </Row>
+        ) : null}
+        {c.prior.map((p) => (
+          <Row key={`${p.relation}-${p.ids.join()}`} label={p.by_scope ? 'Within scope of' : RELATION_LABEL[p.relation] ?? p.relation}>
+            {p.citations.join('; ')}
+            {p.by_scope ? <span className="text-gray-600"> — earlier work on {p.covers}, which this claim falls under</span> : null}
+            <Ids ids={p.ids} />
+          </Row>
+        ))}
+        {c.theory ? (
+          <Row label="Known theory">
+            Rests on {c.theory.citations.join('; ')}: the novelty is the application or test, not the theory.
+            <Ids ids={c.theory.ids} />
+          </Row>
+        ) : null}
+        <Row label="What is new">
+          {c.delta.text ? (
+            <>
+              {c.delta.text}
+              <span className="text-gray-600">
+                {' '}
+                ({KIND_LABEL[c.evidence_kind] ?? c.evidence_kind}, {c.support})
+              </span>
+              <Ids ids={c.delta.ids} />
+            </>
+          ) : (
+            <span className="text-gray-600">Nothing specific is shown as new.</span>
+          )}
+        </Row>
+        {c.places.length ? (
+          <Row label="Evidence">
+            {c.places.map((p) => (
+              <span key={p.label} className="block">
+                {placeText(p)}
+              </span>
+            ))}
+          </Row>
+        ) : null}
+        {c.intervention ? (
+          <Row label={c.intervention.kind === 'inputs' ? 'Intervention' : 'Possible confound'}>
+            <InterventionText i={c.intervention} />
+          </Row>
+        ) : null}
+        <StrengthRows c={c} />
+        {c.limits.ids.length ? (
+          <Row label="Limits">
+            {c.limits.text}
+            <Ids ids={c.limits.ids} />
+          </Row>
+        ) : null}
+        {c.skeptic.ids.length ? (
+          <Row label="Skeptic's objection">
+            {c.skeptic.text}
+            <Ids ids={c.skeptic.ids} />
+          </Row>
+        ) : null}
+        {c.strengthen.ids.length ? (
+          <Row label="Would be stronger with">
+            {c.strengthen.text}
+            <Ids ids={c.strengthen.ids} />
+          </Row>
+        ) : null}
+        {(c.checks ?? [])
+          .filter((d) => d.check === 'task_metric_mix')
+          .map((d) => (
+            <Row key={d.text} label="Design check">
+              <span className="text-amber-700">{d.text}</span>
+            </Row>
+          ))}
+        {c.notes.map((n) => (
+          <Row key={n} label="Note">
+            <span className="text-gray-600">{n}</span>
+          </Row>
+        ))}
+      </dl>
+    </li>
+  )
+}
+
+function NoveltyDetail({ novelty }: { novelty: Novelty }): ReactElement {
+  const reasonIds = novelty.reason_ids.length
+    ? novelty.reason_ids
+    : novelty.contributions.filter((c) => c.main).flatMap((c) => [...c.prior.flatMap((p) => p.ids), ...c.delta.ids])
+  return (
+    <div className="space-y-4 text-sm leading-6 text-gray-800">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ring-1 ${NOVELTY_TONE[novelty.verdict] ?? ''}`}>
+          {novelty.verdict_label || novelty.verdict}
+        </span>
+        {novelty.reason ? (
+          <span>
+            {novelty.reason}
+            <Ids ids={[...new Set(reasonIds)]} />
+          </span>
+        ) : null}
+      </div>
+      {novelty.journal ? (
+        <p className="text-gray-700">
+          <span className="text-xs font-medium uppercase tracking-wide text-gray-500">Against the journal ({novelty.journal.tier}): </span>
+          {novelty.journal.text}.
+        </p>
+      ) : null}
+      {novelty.overall.length ? (
+        <p>
+          {novelty.overall.map((s) => (
+            <span key={s.text}>
+              {s.text}
+              <Ids ids={s.ids} />{' '}
+            </span>
+          ))}
+        </p>
+      ) : null}
+      {novelty.design_checks?.length ? (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Design checks</p>
+          <ul className="mt-1 space-y-1">
+            {novelty.design_checks.map((d) => (
+              <li key={d.text}>
+                {d.text}
+                <Ids ids={d.ids} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      <ul className="space-y-3">
+        {novelty.contributions.map((c) => (
+          <NoveltyClaim key={c.claim} c={c} />
+        ))}
+      </ul>
+      {novelty.superlatives.length ? (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Self-described superlatives</p>
+          <ul className="mt-1 space-y-1">
+            {novelty.superlatives.map((s) => (
+              <li key={s.ids.join()}>
+                <span className={s.supported ? 'text-emerald-700' : 'text-amber-700'}>
+                  {s.supported ? 'Backed by a comparison' : 'Unverified'}
+                </span>
+                {': '}“{s.text}”
+                {s.supported ? (
+                  <span className="text-gray-600">
+                    {' '}— backed on {s.axes_backed.join(', ')}
+                    {s.axes_not_covered.length ? `; not on ${s.axes_not_covered.join(', ')}` : ''}
+                  </span>
+                ) : null}
+                <Ids ids={[...s.ids, ...s.evidence_ids]} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      <p className="text-xs text-gray-500">
+        Judged against the earlier work this paper itself cites; work it does not cite was not searched.
+      </p>
+    </div>
+  )
+}
+
+function AbsenceAuditPanel({ audit }: { audit: AbsenceAudit }): ReactElement | null {
+  const [open, setOpen] = useState(false)
+  if (!audit.checked) return null
+  return (
+    <div className="mb-4 rounded-lg border border-stone-200 p-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-stone-800">
+          <span className="font-semibold">“Missing” statements checked against the {audit.mode}.</span> {audit.checked} checked:{' '}
+          {audit.present} removed, {audit.partly} corrected, {audit.absent} confirmed missing.
+        </p>
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+          className="text-xs text-stone-500 underline hover:text-stone-800"
+        >
+          {open ? 'Hide ▴' : 'Show each ▾'}
+        </button>
+      </div>
+      {open ? (
+        <ul className="mt-2 space-y-2 text-xs">
+          {audit.items.map((item, index) => (
+            <li key={index} className="rounded-md border border-stone-100 p-2">
+              <p className="text-stone-500">
+                {item.where}
+                {item.scope ? ` · judged on ${item.scope}` : ''} ·{' '}
+                <span className={AUDIT_VERDICT[item.verdict]?.tone}>{AUDIT_VERDICT[item.verdict]?.label}</span>
+              </p>
+              <p className={item.verdict === 'absent' ? 'text-stone-800' : 'text-stone-500 line-through decoration-stone-300'}>
+                {item.statement}
+              </p>
+              {item.parts?.length ? (
+                <p className="mt-0.5 text-stone-600">
+                  {item.parts.map((part, n) => (
+                    <span
+                      key={n}
+                      className={`mr-2 ${part.found ? (part.in_scope === false ? 'text-amber-700' : 'text-green-700') : part.pointer ? 'text-amber-700' : 'text-red-700'}`}
+                    >
+                      {part.found ? (part.in_scope === false ? '↗' : '✓') : part.pointer ? '⇢' : '✗'} {part.part}
+                      {part.found && part.where ? ` (${part.in_scope === false ? 'only in ' : ''}${part.where})` : ''}
+                      {!part.found && part.pointer ? ' (only referred to, not shown in the file)' : ''}
+                    </span>
+                  ))}
+                </p>
+              ) : null}
+              {item.corrected ? <p className="mt-0.5 text-stone-800">→ {item.corrected}</p> : null}
+              {item.evidence ? (
+                <blockquote className="mt-1 border-l-2 border-stone-200 pl-2 italic text-stone-500">
+                  “{item.evidence}” <span className="not-italic text-stone-400">[{item.evidence_ids.join(', ')}]</span>
+                </blockquote>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  )
+}
+
+const FACT_PREFIX: Record<string, string> = {
+  F: 'Concern',
+  S: 'Strength',
+  C: 'Claim',
+  O: 'Structure',
+  V: 'Publication context',
+  J: 'Journal',
+}
+
+/** What each sentence of the letter rests on: the verified facts it cites. */
+function LetterBasis({ points }: { points: LetterPoint[] }): ReactElement | null {
+  const [open, setOpen] = useState(false)
+  if (points.length === 0) return null
+  const describe = (fact: Record<string, unknown>): string => {
+    const text = fact.problem ?? fact.point ?? fact.statement ?? fact.text ?? (Array.isArray(fact.papers) ? (fact.papers as string[]).join('; ') : '')
+    const where = typeof fact.where === 'string' && fact.where ? ` (${fact.where})` : ''
+    return `${String(text)}${where}`
+  }
+  return (
+    <div className="mt-2 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="text-stone-500 underline hover:text-stone-800"
+      >
+        {open ? 'Hide what this is based on ▴' : 'What each sentence is based on ▾'}
+      </button>
+      {open ? (
+        <ol className="mt-2 space-y-2">
+          {points.map((point, index) => (
+            <li key={index} className="rounded-md border border-stone-200 p-2">
+              <p className="text-stone-800">{point.text}</p>
+              <ul className="mt-1 space-y-0.5 text-stone-500">
+                {point.refs.map((ref) => (
+                  <li key={ref}>
+                    <span className="font-mono text-stone-400">{ref}</span> {FACT_PREFIX[ref[0]] ?? ''}:{' '}
+                    {point.facts[ref] ? describe(point.facts[ref]) : ''}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
+  )
+}
+
+const ANSWER_LABEL: Record<string, { label: string; tone: string }> = {
+  supported: { label: 'answered by the paper', tone: 'text-green-700' },
+  problem: { label: 'problem', tone: 'text-red-700' },
+  not_reported: { label: 'not reported', tone: 'text-amber-700' },
+  cant_tell: { label: 'could not tell', tone: 'text-gray-500' },
+}
+
+const REMOVED_LABEL: Record<string, string> = {
+  without_evidence: 'cited no sentence of the paper',
+  found_in_paper: 'the paper reports it after all',
+  answered_by_paper: 'the paper answers it',
+  not_specific: 'not specific to this paper',
+  narrowed: 'narrowed to what the paper does not answer',
+}
+
+/** What the section review checked: the paper's claims, the rubric packs used, every question and its answer,
+ * and every finding that was removed (and why), so a reader can check the review itself. */
+function LedgerPanel({ ledger }: { ledger: EvidenceLedgerSummary }): ReactElement {
+  const [open, setOpen] = useState(false)
+  const removedTotal = Object.values(ledger.removed ?? {}).reduce((a, b) => a + b, 0)
+  const checks = ledger.checks ?? []
+  return (
+    <div className="mb-4 rounded-lg border border-stone-200 bg-stone-50 p-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-stone-800">
+          <span className="font-semibold">Checked against the paper's own claims.</span>{' '}
+          {ledger.claims.length} claim(s), {ledger.questions} check(s) from{' '}
+          {ledger.packs.map((p) => p.title).join(', ') || 'the general rubric'}.
+          {removedTotal > 0 ? ` ${removedTotal} draft finding(s) removed after checking.` : ''}
+        </p>
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+          className="text-xs text-stone-500 underline hover:text-stone-800"
+        >
+          {open ? 'Hide details ▴' : 'Show claims and checks ▾'}
+        </button>
+      </div>
+      {open ? (
+        <div className="mt-3 space-y-3">
+          <ul className="space-y-1.5">
+            {ledger.claims.map((claim) => (
+              <li key={claim.id}>
+                <p className="text-stone-800">
+                  <span className="font-mono text-xs text-stone-500">{claim.id}</span>{' '}
+                  {claim.main ? <span className="text-[10px] font-semibold uppercase text-stone-500">main · </span> : null}
+                  <span className="text-[10px] uppercase text-stone-400">{claim.type}</span> {claim.statement}
+                  {claim.findings > 0 ? (
+                    <span className="ml-1 text-xs text-red-700">({claim.findings} finding{claim.findings > 1 ? 's' : ''})</span>
+                  ) : (
+                    <span className="ml-1 text-xs text-green-700">(no problem found)</span>
+                  )}
+                </p>
+                {claim.quote ? (
+                  <blockquote className="ml-6 border-l-2 border-stone-200 pl-2 text-xs italic text-stone-500">“{claim.quote}”</blockquote>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          {checks.length > 0 ? (
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Every check and its answer</p>
+              <ul className="mt-1 space-y-1 text-xs">
+                {checks.map((check) => (
+                  <li key={check.q} className="text-stone-700">
+                    <span className={ANSWER_LABEL[check.status]?.tone ?? 'text-gray-500'}>
+                      {ANSWER_LABEL[check.status]?.label ?? check.status}
+                    </span>{' '}
+                    · {check.question}
+                    {check.evidence_ids.length ? <span className="text-stone-400"> [{check.evidence_ids.join(', ')}]</span> : null}
+                    <span className="text-stone-400"> — {check.source}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {(ledger.removed_findings ?? []).length > 0 ? (
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Removed after checking</p>
+              <ul className="mt-1 space-y-1 text-xs text-stone-600">
+                {(ledger.removed_findings ?? []).map((item, index) => (
+                  <li key={index}>
+                    <span className="line-through decoration-stone-300">{item.problem}</span>{' '}
+                    <span className="text-stone-500">— {item.reason}{item.detail ? `: ${item.detail}` : ''}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : removedTotal > 0 ? (
+            <p className="text-xs text-stone-500">
+              Removed:{' '}
+              {Object.entries(ledger.removed)
+                .filter(([, n]) => n > 0)
+                .map(([key, n]) => `${n} ${REMOVED_LABEL[key] ?? key}`)
+                .join('; ')}
+            </p>
+          ) : null}
+          <p className="text-[10px] text-stone-400">
+            Search: {ledger.retrieval}. Field: {ledger.field}; kind: {ledger.paper_kind}. Version {ledger.version}.
+          </p>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+const CHECK_MARK: Record<SectionCheck['status'], { mark: string; tone: string }> = {
+  met: { mark: '✓', tone: 'text-green-700' },
+  missing: { mark: '✗', tone: 'text-red-700' },
+  issue: { mark: '!', tone: 'text-amber-700' },
+  info: { mark: 'i', tone: 'text-gray-500' },
+}
+
+/** The section's checklist, decided by code from the text: problems first, then what the paper does, then facts. */
+function SectionChecklist({ checks }: { checks: SectionCheck[] }): ReactElement {
+  const rank = (c: SectionCheck): number =>
+    c.status === 'met' ? 3 : c.status === 'info' ? 4 : c.severity === 'major' ? 0 : c.status === 'missing' ? 1 : 2
+  const ordered = [...checks].sort((a, b) => rank(a) - rank(b))
+  const problems = checks.filter((c) => c.status === 'missing' || c.status === 'issue').length
+  const [open, setOpen] = useState<number | null>(null)
+  return (
+    <div className="mt-2 sm:pl-[7.5rem]">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+        Checklist · {problems === 0 ? 'no problems found' : `${problems} to check`}
+        <span className="font-normal normal-case tracking-normal"> · read by code from your text</span>
+      </p>
+      <ul className="mt-1 space-y-1">
+        {ordered.map((check, index) => {
+          const { mark, tone } = CHECK_MARK[check.status]
+          const expandable = Boolean(check.quote || check.detail || check.fix)
+          return (
+            <li key={`${check.key}-${index}`} className="text-sm">
+              <button
+                type="button"
+                disabled={!expandable}
+                onClick={() => setOpen(open === index ? null : index)}
+                aria-expanded={open === index}
+                className="flex w-full items-start gap-2 text-left disabled:cursor-default"
+              >
+                <span className={`w-3 shrink-0 text-center font-semibold ${tone}`} aria-hidden="true">{mark}</span>
+                <span className="flex-1 text-gray-700">
+                  {check.label}
+                  {check.severity === 'major' ? (
+                    <span className="ml-2 rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-red-700">major</span>
+                  ) : null}
+                </span>
+                {expandable ? <span className="text-xs text-gray-400">{open === index ? '▴' : '▾'}</span> : null}
+              </button>
+              {open === index ? (
+                <div className="ml-5 mt-1 space-y-1 text-xs">
+                  {check.detail ? <p className="text-gray-600">{check.detail}</p> : null}
+                  {check.quote ? (
+                    <blockquote className="border-l-2 border-gray-200 pl-2 italic text-gray-500">“{check.quote}”</blockquote>
+                  ) : null}
+                  {check.fix ? <p className="text-sky-700">→ {check.fix}</p> : null}
+                </div>
+              ) : null}
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
 function SectionRow({
   name,
   section,
@@ -757,6 +1630,7 @@ function SectionRow({
   const width = Math.min(100, Math.max(0, section.score))
   const [showFix, setShowFix] = useState(false)
   const [showContent, setShowContent] = useState(false)
+  const plan = section.fix_plan ?? []
 
   // The section text for the tools is prepared by the server (captions left out, length limited) and passed on as it is.
   const handleCalibrateSection = (): void => {
@@ -767,9 +1641,11 @@ function SectionRow({
           journal: targetJournal,
           ...(field ? { field } : {}),
           focus: {
-            section: sectionLabel(name),
+            section: section.title || sectionLabel(name),
             issue: section.issue ?? section.weakness ?? '',
             fix: section.fix ?? '',
+            // every issue of the section with how to fix it: the Calibrator resolves each one
+            ...(plan.length > 0 ? { steps: plan } : {}),
           },
           notes: section.tool_notes ?? [],
           ...(copy ? { document: copy } : {}),
@@ -809,7 +1685,15 @@ function SectionRow({
   return (
     <div>
       <div className="flex items-center gap-3">
-        <p className="w-28 shrink-0 break-words text-sm font-medium capitalize">{sectionLabel(name)}</p>
+        <div className="w-28 shrink-0">
+          <p className="break-words text-sm font-medium">{section.title || sectionLabel(name)}</p>
+          {section.part === 'appendix' || section.label || section.page ? (
+            <p className={`text-[10px] ${section.part === 'appendix' ? 'text-amber-700' : 'text-gray-400'}`}>
+              {section.part === 'appendix' ? `Appendix${section.label ? ` ${section.label}` : ''}` : section.label ? `Section ${section.label}` : ''}
+              {section.page ? `${section.part === 'appendix' || section.label ? ' · ' : ''}p. ${section.page}` : ''}
+            </p>
+          ) : null}
+        </div>
         <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-gray-100">
           <div className={`h-full ${barClass(section.score)}`} style={{ width: `${width}%` }} />
         </div>
@@ -823,12 +1707,12 @@ function SectionRow({
       ) : (
         <div className="mt-1 space-y-1 sm:pl-[7.5rem]">
           {section.strength ? <p className="text-sm text-green-700">✓ {section.strength}</p> : null}
-          {section.issue ? (
+          {section.issue && !section.summary ? (
             <p className="text-sm text-gray-500">
               {section.score < SUGGESTION_SCORE ? '⚠' : '•'} {section.issue}
             </p>
           ) : null}
-          {section.fix ? (
+          {section.fix || plan.length > 0 ? (
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <button
                 type="button"
@@ -864,13 +1748,18 @@ function SectionRow({
                 onClick={handleCalibrateSection}
                 className="inline-flex items-center gap-1 rounded bg-stone-900 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-stone-800 transition"
               >
-                <span>✨ Calibrate {sectionLabel(name)}</span>
+                <span>✨ Calibrate {section.title || sectionLabel(name)}</span>
               </button>
-              {showFix ? <p className="w-full mt-1 text-sm text-sky-700">→ {section.fix}</p> : null}
+              {showFix && plan.length > 0 ? <FixPlan plan={plan} /> : null}
+              {showFix && plan.length === 0 && section.fix ? (
+                <p className="w-full mt-1 text-sm text-sky-700">→ {section.fix}</p>
+              ) : null}
             </div>
           ) : null}
         </div>
       )}
+      {section.summary || section.strengths?.length || section.findings?.length ? <SectionReviewBlock section={section} /> : null}
+      {section.checks && section.checks.length > 0 ? <SectionChecklist checks={section.checks} /> : null}
       {section.content ? (
         <div className="mt-1.5 sm:pl-[7.5rem]">
           <button
@@ -998,6 +1887,211 @@ function RevisionPanel({ revision }: { revision: RevisionComparison }): ReactEle
   )
 }
 
+const SECTION_NAME: Record<string, string> = {
+  abstract: 'Abstract',
+  introduction: 'Introduction',
+  methods: 'Methods',
+  results: 'Results',
+  discussion: 'Discussion',
+}
+
+const CELL_LINE_STATUS: Record<string, { label: string; className: string }> = {
+  problematic: { label: 'problematic', className: 'bg-red-50 text-red-700' },
+  no_known_problem: { label: 'no known problem', className: 'bg-green-50 text-green-700' },
+  not_found: { label: 'no exact record', className: 'bg-gray-100 text-gray-600' },
+  not_checked: { label: 'not checked', className: 'bg-gray-100 text-gray-600' },
+}
+
+/** What code found by comparing the paper's own values, and the cell lines looked up in Cellosaurus. */
+function ConsistencyPanel({ report }: { report: ConsistencyReport }): ReactElement {
+  if (report.status === 'not_checked') {
+    return <p className="text-sm text-gray-500">{report.note || 'The consistency check could not be completed this time.'}</p>
+  }
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-gray-500">
+        {report.facts_checked} values were read from your manuscript and compared across its sections by code. Every
+        item below quotes the passages it rests on.
+      </p>
+      {report.findings.length === 0 ? (
+        <p className="text-sm text-gray-700">No inconsistencies found between the values the paper gives.</p>
+      ) : (
+        <ul className="space-y-2">
+          {report.findings.map((finding) => (
+            <li
+              key={finding.message}
+              className={`rounded-lg border p-3 ${finding.severity === 'major' ? 'border-amber-200 bg-amber-50' : 'border-gray-200 bg-gray-50'}`}
+            >
+              <p className="text-sm text-gray-900">{finding.message}</p>
+              <ul className="mt-2 space-y-1">
+                {finding.quotes.map((quote) => (
+                  <li key={`${quote.section}-${quote.quote}`} className="text-xs text-gray-600">
+                    <span className="font-medium">{SECTION_NAME[quote.section] ?? (quote.section || 'Text')}:</span>{' '}
+                    “{quote.quote}”
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      )}
+      {report.cell_lines.length > 0 ? (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Cell lines (Cellosaurus)</p>
+          <ul className="mt-1 space-y-1">
+            {report.cell_lines.map((line) => {
+              const status = CELL_LINE_STATUS[line.status] ?? CELL_LINE_STATUS.not_checked
+              return (
+                <li key={line.name} className="text-xs text-gray-700">
+                  <span className="font-medium">{line.name}</span>{' '}
+                  <Chip className={status.className}>{status.label}</Chip>
+                  {line.accession ? (
+                    <a
+                      className="ml-1 underline"
+                      href={`https://www.cellosaurus.org/${line.accession}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {line.accession}
+                    </a>
+                  ) : null}
+                  {line.note ? <span className="block text-red-700">{line.note}</span> : null}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** The paper's own competing-interest and funding statements: context for the reader, never a fault. */
+function DisclosuresPanel({ disclosures }: { disclosures: Disclosures }): ReactElement {
+  return (
+    <div className="space-y-2 text-sm text-gray-800">
+      {disclosures.interests.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {disclosures.interests.map((kind) => (
+            <Chip key={kind} className="bg-sky-50 text-sky-800">{kind}</Chip>
+          ))}
+        </div>
+      ) : disclosures.declares_none ? (
+        <p className="text-xs text-gray-500">The authors declare no competing interests.</p>
+      ) : null}
+      {disclosures.competing_interests ? (
+        <p><span className="font-medium">Competing interests:</span> {disclosures.competing_interests}</p>
+      ) : null}
+      {disclosures.funding ? (
+        <p><span className="font-medium">Funding:</span> {disclosures.funding}</p>
+      ) : null}
+      <p className="text-xs text-gray-500">
+        Quoted from the paper. A disclosed interest is context for weighing the claims, not a sign of misconduct, and
+        it does not change the score.
+      </p>
+    </div>
+  )
+}
+
+const NOTICE_SOURCE: Record<string, string> = {
+  publisher: 'publisher',
+  'retraction-watch': 'Retraction Watch',
+}
+
+/** The publication record, shown above everything else: it decides what the score cannot. */
+function IntegrityBanner({ integrity }: { integrity: PublicationStatus }): ReactElement | null {
+  const where = [integrity.journal, integrity.year ? `(${integrity.year})` : ''].filter(Boolean).join(' ')
+  const doiLink = integrity.doi ? (
+    <a className="underline" href={`https://doi.org/${integrity.doi}`} target="_blank" rel="noreferrer">
+      {integrity.doi}
+    </a>
+  ) : null
+  const notices = (integrity.notices ?? []).filter((n) => n.type !== 'correction' || integrity.status === 'corrected')
+  const noticeList =
+    notices.length > 0 ? (
+      <ul className="mt-2 space-y-1">
+        {notices.map((notice) => (
+          <li key={`${notice.type}-${notice.doi ?? ''}`} className="text-xs">
+            {notice.label || notice.type}
+            {notice.date ? ` · ${notice.date}` : ''}
+            {notice.source
+              ? ` · ${notice.source.split(', ').map((s) => NOTICE_SOURCE[s] ?? s).join(' and ')}`
+              : ''}
+            {notice.doi ? (
+              <>
+                {' · '}
+                <a className="underline" href={`https://doi.org/${notice.doi}`} target="_blank" rel="noreferrer">
+                  read the notice
+                </a>
+              </>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    ) : null
+  const marks = (integrity.file_marks ?? []).map((m) => `"${m.text}"`).join(', ')
+  const notes = (integrity.notes ?? []).map((note) => (
+    <p key={note} className="mt-1 text-xs opacity-80">{note}</p>
+  ))
+
+  if (integrity.status === 'retracted') {
+    return (
+      <section className="mt-4 rounded-xl border-2 border-red-300 bg-red-50 p-4 text-red-900">
+        <p className="text-sm font-semibold">
+          {integrity.is_notice ? 'This file is a retraction notice' : 'This article has been retracted'}
+        </p>
+        <p className="mt-1 text-sm">
+          {where ? `Published in ${where}` : 'The publication record'}
+          {doiLink ? <> · {doiLink}</> : null}
+          {marks ? ` · the file is marked ${marks}` : ''}. Its findings should not be relied on or cited as valid,
+          and no recommendation is made. The analysis below describes the text only.
+        </p>
+        {noticeList}
+        {notes}
+      </section>
+    )
+  }
+  if (integrity.status === 'expression_of_concern') {
+    return (
+      <section className="mt-4 rounded-xl border-2 border-amber-300 bg-amber-50 p-4 text-amber-900">
+        <p className="text-sm font-semibold">The publisher has issued an expression of concern</p>
+        <p className="mt-1 text-sm">
+          {where ? `Published in ${where}` : 'The publication record'}
+          {doiLink ? <> · {doiLink}</> : null}. The score is capped until the concern is resolved.
+        </p>
+        {noticeList}
+        {notes}
+      </section>
+    )
+  }
+  if (integrity.status === 'published' || integrity.status === 'corrected') {
+    return (
+      <section className="mt-4 rounded-xl border border-sky-200 bg-sky-50 p-4 text-sky-900">
+        <p className="text-sm font-semibold">
+          Already published{where ? ` in ${where}` : ''}
+          {integrity.status === 'corrected' ? ', with a correction' : ''}
+        </p>
+        <p className="mt-1 text-sm">
+          {doiLink ? <>DOI {doiLink}. </> : null}
+          {integrity.at_target_journal
+            ? 'It passed peer review in this journal, so nothing in it is treated as a desk rejection here.'
+            : 'It passed peer review there. Your target journal is a different one, so scope and level are judged for it.'}
+        </p>
+        {integrity.status === 'corrected' ? noticeList : null}
+        {notes}
+      </section>
+    )
+  }
+  if (integrity.status === 'not_checked' && (integrity.notes ?? []).length > 0) {
+    return (
+      <section className="mt-4 rounded-xl border border-gray-200 bg-gray-50 p-3 text-gray-700">
+        <p className="text-xs">Publication status not checked: {(integrity.notes ?? []).join(' ')}</p>
+      </section>
+    )
+  }
+  return null
+}
+
 function ReasonCard({
   item,
   targetJournal,
@@ -1051,7 +2145,18 @@ function ReasonCard({
   return (
     <article className={`rounded-lg border border-gray-200 border-l-4 p-3.5 ${style.border}`}>
       <div className="flex items-center justify-between">
-        <p className={`text-[10px] font-bold uppercase tracking-wide ${style.label}`}>{style.name}</p>
+        <p className={`text-[10px] font-bold uppercase tracking-wide ${style.label}`}>
+          {style.name}
+          {item.origin && item.origin !== 'model' ? (
+            <span className="ml-2 rounded bg-white/70 px-1.5 py-0.5 text-[9px] font-semibold normal-case tracking-normal text-gray-600">
+              {item.origin === 'publication_record'
+                ? 'from the publication record'
+                : item.origin === 'evidence_ledger'
+                  ? 'from the section-by-section check of the paper’s claims'
+                  : 'found by comparing the paper’s own values'}
+            </span>
+          ) : null}
+        </p>
         <div className="flex items-center gap-2">
           <button
             type="button"
