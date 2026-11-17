@@ -1,0 +1,35 @@
+# Catalysis: activity, comparison with known catalysts, stability.
+pack: chemistry_catalysis
+version: "2026-11-13.1"
+title: Catalysis
+applies_to: {fields: [chemistry_catalysis]}
+items:
+  - id: chemistry_catalysis.activity_metrics
+    triggers_on: [comparative, quantitative]
+    main_only: true
+    ask_in: [results]
+    question: "For \"{claim}\": is activity reported as a turnover number or frequency (or a rate normalised per active site or mass), not only as yield or conversion?"
+    search: "TON TOF turnover number frequency rate per site normalized activity"
+    severity: {missing: minor, problem: minor}
+    fix: "Report TON/TOF (or the rate per active site or per mass of catalyst) for the results behind \"{claim}\", with the conditions."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_catalysis.benchmark_catalysts
+    triggers_on: [comparative, novelty]
+    main_only: true
+    ask_in: [results]
+    question: "For \"{claim}\": is the catalyst compared with established catalysts for the same reaction under the same conditions in this paper, not only with literature values from other conditions?"
+    search: "compared commercial benchmark catalyst Pd/C reported literature same conditions"
+    severity: {missing: major, problem: major}
+    fix: "Run an established catalyst for this reaction under identical conditions alongside the new one for \"{claim}\", or mark the literature values as measured under different conditions."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_catalysis.stability_leaching
+    triggers_on: [paper]
+    ask_in: [results]
+    requires_terms: [heterogeneous, recycl, reuse, supported catalyst]
+    question: "For a heterogeneous or recycled catalyst: are recycling runs, leaching tests (hot filtration or ICP of the solution) and characterization after use reported?"
+    search: "recycling reuse runs leaching hot filtration ICP after reaction stability spent catalyst"
+    severity: {missing: major, problem: minor}
+    fix: "Report at least 3–5 recycling runs, a hot-filtration or ICP leaching test, and the catalyst's characterization after use (e.g. XRD, TEM)."
+    source: "Rejecta editorial rubric"

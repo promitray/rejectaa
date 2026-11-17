@@ -427,3 +427,102 @@ def test_a_headed_conflict_statement_ends_at_the_next_heading() -> None:
     text = "Conflicts of interest\nThere are no conflicts to declare.\nAcknowledgements\nWe thank the facility staff."
     found = read_disclosures(parsed_text(text))
     assert found.competing_interests == "There are no conflicts to declare." and found.declares_none
+
+
+# ------------------------------------------------------------------ field-agnostic quantities (an ML benchmark)
+
+ML_ABSTRACT = "In this study, we benchmark 12 representative models (3 non-deep models and 9 deep models) on 14 molecule datasets."
+ML_RESULTS = (
+    "As can be observed in Table 1, non-deep models rank as the top one on 10/14 datasets. "
+    "Additionally, tree models rank as the top one on 8/15 datasets. "
+    "XGB reaches an AUC-ROC of 0.896 on BACE in Table 1."
+)
+ML_DISCUSSION = "We benchmark 13 models across all datasets. On BACE, XGB reaches an AUC-ROC of 0.912."
+
+
+def ml_doc() -> ParsedDocument:
+    return doc(ML_ABSTRACT, {"results": ("results", ML_RESULTS), "discussion": ("discussion", ML_DISCUSSION)})
+
+
+def q(kind: str, quantity: str, value: float, quote: str, **extra: Any) -> dict[str, Any]:
+    return {"kind": kind, "quantity": quantity, "value": value, "quote": quote, **extra}
+
+
+ML_ANSWER = {"field": "cs_ml", "facts": [], "quantities": [
+    q("count", "models compared", 12, "we benchmark 12 representative models", core=True),
+    q("count", "non-deep models", 3, "3 non-deep models and 9 deep models", part_of="models compared"),
+    q("count", "deep models", 9, "3 non-deep models and 9 deep models", part_of="models compared"),
+    q("count", "datasets benchmarked", 14, "on 14 molecule datasets", core=True),
+    q("fraction", "datasets where non-deep models rank first", 10, "rank as the top one on 10/14 datasets", denominator=14, of="datasets benchmarked"),
+    q("fraction", "datasets where tree models rank first", 8, "tree models rank as the top one on 8/15 datasets", denominator=15, of="datasets benchmarked"),
+    q("result", "XGB AUC-ROC on BACE", 0.896, "XGB reaches an AUC-ROC of 0.896 on BACE"),
+    q("result", "XGB AUC-ROC on BACE", 0.912, "XGB reaches an AUC-ROC of 0.912"),
+    q("count", "models compared", 13, "We benchmark 13 models across all datasets", core=True),
+    q("count", "datasets benchmarked", 99, "on 14 molecule datasets", core=True),  # 99 is not in its quote: dropped
+]}
+
+
+def test_counts_fractions_and_restated_results_are_compared_in_any_field() -> None:
+    report = check(ml_doc(), ML_ANSWER)
+    messages = [f.message for f in report.findings]
+    assert any("8/15 datasets benchmarked, but the paper uses 14 datasets benchmarked" in m for m in messages)
+    assert not any("10/14" in m for m in messages)
+    assert any(m.startswith("Models compared: 12 in the Abstract, but 13 in Discussion") for m in messages)
+    assert any(m.startswith("XGB AUC-ROC on BACE: 0.896") and "0.912" in m for m in messages)
+    assert not any("99" in m for m in messages)
+    major = {f.message.split(":")[0] for f in report.findings if f.severity == "major"}
+    assert {"Models compared", "XGB AUC-ROC on BACE"} <= major
+
+
+def test_sub_groups_must_add_up_to_their_total() -> None:
+    answer = {"facts": [], "quantities": [
+        q("count", "models compared", 12, "we benchmark 12 representative models", core=True),
+        q("count", "non-deep models", 3, "3 non-deep models and 9 deep models", part_of="models compared"),
+        q("count", "deep models", 10, "We benchmark 13 models across all datasets", part_of="models compared"),
+    ]}
+    answer["quantities"][2]["value"] = 13  # 3 + 13 = 16 > 12
+    report = check(ml_doc(), answer)
+    assert any("3 non-deep models + 13 deep models = 16, but the total is given as 12" in f.message for f in report.findings)
+    consistency.clear_cache()
+    fine = check(ml_doc(), {"facts": [], "quantities": ML_ANSWER["quantities"][:3]})
+    assert not any("total is given" in f.message for f in fine.findings)
+
+
+def test_results_are_compared_at_the_precision_written() -> None:
+    def res(value: float, text: str) -> consistency._Quantity:
+        return consistency._Quantity("result", "x", "x", value, None, "", "", False, "", text, "", consistency._decimals(value, text))
+
+    assert not consistency._differ(res(0.886, "AUC 0.886"), res(0.89, "AUC 0.89"))
+    assert consistency._differ(res(0.896, "AUC 0.896"), res(0.912, "AUC 0.912"))
+
+
+def test_a_number_must_be_written_in_its_own_quote() -> None:
+    assert consistency._number_in(14, "on 14 molecule datasets")
+    assert not consistency._number_in(14, "on 140 molecule datasets")
+    assert consistency._number_in(1513, "BACE (1,513) AUC ROC")
+    assert consistency._number_in(0.896, "an AUC-ROC of 0.896 on BACE")
+
+
+
+def test_values_listed_together_in_one_passage_are_not_compared() -> None:
+    consistency.clear_cache()
+    text = "We set a new SOTA for pLogP optimization at 104.29, 90.12, 69.68 and improved results."
+    parsed = doc(text, {"results": ("results", "The constrained task improved by 5.3 on average over 800 molecules.")})
+    answer = {"facts": [], "quantities": [
+        q("result", "pLogP optimization", 104.29, "SOTA for pLogP optimization at 104.29"),
+        q("result", "pLogP optimization", 90.12, "pLogP optimization at 104.29, 90.12, 69.68"),
+    ]}
+    assert check(parsed, answer).findings == []
+
+
+
+def test_a_setting_varied_on_purpose_is_not_a_contradiction() -> None:
+    consistency.clear_cache()
+    methods = ("Stationary phase was maintained at 25 °C during all runs. Solutions were injected twice, using stationary "
+               "phase temperature of 25 °C (according to the method) and 30 °C.")
+    parsed = doc("An HPLC method is validated.", {"methods": ("methods", methods)})
+    answer = {"facts": [], "quantities": [
+        q("parameter", "column temperature", 25, "Stationary phase was maintained at 25 °C", unit="°C"),
+        q("parameter", "column temperature", 30, "according to the method) and 30 °C", unit="°C"),
+    ]}
+    assert check(parsed, answer).findings == []

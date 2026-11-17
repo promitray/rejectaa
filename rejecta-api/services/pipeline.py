@@ -26,7 +26,8 @@ from models import (
 )
 from services import revisions
 from services import paper_profile
-from services import section_review
+from services import absence_audit, editor_letter, novelty, section_review
+from config import settings
 from services.analysis_guard import AnalysisContext, paper_context
 from services.citations import MAX_REFERENCES, build_citation_summary, verify_citations
 from services.consistency import check_consistency
@@ -35,6 +36,8 @@ from services.evidence_check import check_support
 from services.integrity import check_publication, same_journal
 from services.journals import match_journal
 from services.llm import get_provider_cached
+from services.local_store import digest
+from services.lookup_snapshot import snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -58,16 +61,15 @@ class PipelineResult:
 
 def citation_summary_text(summary: CitationSummary) -> str:
     """The citation facts the model is given. Editorial warnings stay in the API response for the UI;
-    feeding them to the model skewed scores (e.g. 75 -> 38 on a landmark paper)."""
-    not_found = summary.unverified - summary.check_incomplete
+    feeding them to the model skewed scores (e.g. 75 -> 38 on a landmark paper).
+
+    Only the facts that do not depend on how busy the lookup services were: the number of references and the
+    ghosts (a DOI or arXiv id that does not exist). How many were verified or could not be checked changes from
+    run to run, and the citation criterion is scored by code from them anyway (analysis_guard._citation_criterion).
+    """
     return (
-        f"{summary.verified} verified, "
-        f"{summary.ghost} ghost (DOI or arXiv ID does not exist in CrossRef/arXiv; "
-        f"possible fabricated reference), "
-        f"{not_found} unverified (checked, no matching record found), "
-        f"{summary.check_incomplete} not checked (a lookup service was busy, so nothing can be "
-        f"concluded about them) "
-        f"out of {summary.total} total references."
+        f"{summary.total} references; {summary.ghost} ghost (DOI or arXiv ID does not exist in CrossRef/arXiv; "
+        f"possible fabricated reference). The reference check is scored separately by code."
     )
 
 
@@ -82,6 +84,7 @@ async def run_analysis(
     consistency: CheckConsistency | None = None,
     previous: revisions.PreviousAnalysis | None = None,
     review_sections_enabled: bool = True,
+    refresh_lookups: bool = False,
 ) -> PipelineResult:
     """Check citations and the journal, then run the model and its checks on a parsed paper.
 
@@ -92,11 +95,35 @@ async def run_analysis(
     def default_consistency(paper: ParsedDocument) -> Awaitable[ConsistencyReport]:
         return check_consistency(paper, get_provider_cached())
 
+    # The same paper is given the same lookups for a few days (services.lookup_snapshot): a busy service on a
+    # second run must not change what the model reads. `refresh_lookups` ("Run again") asks for fresh ones.
+    paper_key = digest(parsed.full_text)
+    citation_lookup = snapshot(
+        "citations", [digest(*parsed.references)], lambda: verify(parsed.references),
+        dump=lambda results: [r.model_dump(mode="json") for r in results],
+        load=lambda rows: [CitationResult.model_validate(r) for r in rows], refresh=refresh_lookups,
+    )
+    journal_lookup = snapshot(
+        "journal", [journal.strip().lower(), digest(parsed.abstract)], lambda: match(parsed.abstract, journal),
+        dump=lambda found: found.model_dump(mode="json"), load=JournalMatch.model_validate,
+        keep=lambda found: bool(found.found), refresh=refresh_lookups,
+    )
+    integrity_lookup = snapshot(
+        "publication", [paper_key], lambda: check(parsed),
+        dump=lambda status: status.model_dump(mode="json"), load=PublicationStatus.model_validate,
+        keep=lambda status: status.status != "not_checked", refresh=refresh_lookups,
+    )
+    consistency_lookup = snapshot(  # its cell-line lookups go over the network too
+        "consistency", [paper_key], lambda: (consistency or default_consistency)(parsed),
+        dump=lambda report: report.model_dump(mode="json"), load=ConsistencyReport.model_validate,
+        keep=lambda report: report.status != "not_checked" and all(c.status != "not_checked" for c in report.cell_lines),
+        refresh=refresh_lookups,
+    )
     citation_outcome, journal_outcome, integrity_outcome, consistency_outcome = await asyncio.gather(
-        verify(parsed.references),
-        match(parsed.abstract, journal),
-        check(parsed),
-        (consistency or default_consistency)(parsed),
+        citation_lookup,
+        journal_lookup,
+        integrity_lookup,
+        consistency_lookup,
         return_exceptions=True,
     )
     if isinstance(consistency_outcome, BaseException):
@@ -163,6 +190,15 @@ async def run_analysis(
         publication=integrity,
         consistency=consistency_report,
         disclosures=disclosures,
+        section_labels=dict(parsed.section_labels),
+        section_parts=dict(parsed.section_parts),
+        section_pages=dict(parsed.section_pages),
+        figures=list(parsed.figures),
+        subsections=list(parsed.subsections),
+        venue_statements=list(parsed.venue_statements),
+        page_texts=list(parsed.page_texts),
+        first_page=parsed.first_page,
+        journal=journal.strip(),
     )
     provider = get_provider_cached()
     # The section-by-section review. With headings from the parser it needs nothing from the main analysis,
@@ -197,6 +233,13 @@ async def run_analysis(
     else:
         review = section_review.SectionReview()
     analysis = section_review.apply_review(analysis, review, context)
+    if settings.ABSENCE_AUDIT_ENABLED:
+        analysis = await absence_audit.audit(analysis, context, provider)
+    if settings.NOVELTY_FROM_CLAIMS:
+        analysis = await novelty.assess(analysis, context, provider)
+    analysis = editor_letter.attach_context(analysis, context)
+    if settings.EDITOR_LETTER_FROM_FINDINGS:
+        analysis = await editor_letter.rewrite(analysis, context, journal_dump, provider)
     revision = revisions.compare(previous, analysis, journal) if previous is not None else None
     return PipelineResult(
         analysis=analysis, citations=citation_summary, journal=journal_data, context=context, revision=revision,

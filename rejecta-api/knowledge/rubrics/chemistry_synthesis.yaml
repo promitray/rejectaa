@@ -1,0 +1,66 @@
+# Synthetic chemistry: new compounds, methods, substrate scope. The Supporting Information is usually not
+# uploaded: a statement that the data are in the SI answers these questions.
+pack: chemistry_synthesis
+version: "2026-11-13.1"
+title: Synthetic chemistry
+applies_to: {fields: [chemistry_synthesis, chemistry_catalysis]}
+items:
+  - id: chemistry_synthesis.characterization
+    triggers_on: [paper]
+    kinds: [synthesis, method]
+    ask_in: [methods, results]
+    question: "Are identity and purity data given, or explicitly placed in the Supporting Information, for each new compound (1H and 13C NMR, HRMS or elemental analysis; melting point for solids)?"
+    search: "NMR 1H 13C HRMS elemental analysis characterization purity melting point spectra supporting information new compound"
+    severity: {missing: major, problem: major}
+    fix: "Give 1H and 13C NMR and HRMS (or elemental analysis) for every new compound, or state that they are in the Supporting Information with the compound numbers."
+    source: "ACS journal guidelines on characterization of new compounds; Rejecta editorial rubric"
+
+  - id: chemistry_synthesis.yield_basis
+    triggers_on: [quantitative, comparative]
+    kinds: [synthesis, method]
+    ask_in: [methods, results]
+    requires_terms: [yield, yields]
+    question: "For \"{claim}\": are the yields isolated yields or determined by NMR or GC (with which internal standard), and is that stated?"
+    search: "isolated yield NMR yield GC yield internal standard determined"
+    severity: {missing: minor, problem: minor}
+    fix: "State for each yield behind \"{claim}\" whether it is isolated or determined by NMR/GC, and name the internal standard."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_synthesis.scope_limits
+    triggers_on: [generalization]
+    kinds: [synthesis, method]
+    ask_in: [results, discussion]
+    question: "\"{claim}\" states a broad scope. Does the substrate table include substrates that failed or gave low yields, and are the limits of the scope stated?"
+    search: "scope substrates limitation unsuccessful failed low yield tolerated not tolerated"
+    severity: {missing: minor, problem: minor}
+    fix: "Add the substrates that failed or gave low yields to the scope for \"{claim}\" and state the limits (functional groups not tolerated)."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_synthesis.mechanism_controls
+    triggers_on: [mechanism, causal]
+    ask_in: [results, discussion]
+    question: "For the proposed mechanism in \"{claim}\": are control experiments reported (without catalyst, reagent or light; radical traps; kinetic or isotope-labelling experiments) that support it?"
+    search: "control experiment without catalyst radical trap TEMPO kinetic isotope labelling mechanism"
+    severity: {missing: major, problem: major}
+    fix: "Report the control experiments for \"{claim}\" (without each key component, a radical trap or labelling experiment), or present the mechanism as proposed."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_synthesis.scale_reproducibility
+    triggers_on: [paper]
+    kinds: [synthesis, method]
+    ask_in: [methods]
+    question: "Is the reaction scale given for the key procedures, and are key results repeated (repeat runs or a gram-scale reaction)?"
+    search: "mmol scale gram-scale repeated duplicate reproducibility general procedure"
+    severity: {missing: minor, problem: minor}
+    fix: "Give the scale (mmol) in each general procedure and repeat the key reaction, or run it on gram scale, reporting both yields."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_synthesis.crystal_data
+    triggers_on: [paper]
+    ask_in: [methods, results]
+    requires_terms: [x-ray, crystal structure, crystallographic, single crystal]
+    question: "For the crystal structures reported: are CCDC deposition numbers given?"
+    search: "CCDC deposition crystallographic data X-ray crystal structure"
+    severity: {missing: minor, problem: minor}
+    fix: "Give the CCDC deposition number for each crystal structure."
+    source: "Rejecta editorial rubric"

@@ -16,6 +16,23 @@ from config import settings
 from scripts.generate_keys import new_key
 
 
+@pytest.fixture(autouse=True)
+def _offline_review_defaults(monkeypatch: pytest.MonkeyPatch):
+    """Unit tests use the batch section review and keep nothing on disk; the evidence-ledger tests turn it on."""
+    from services import local_store
+
+    monkeypatch.setattr(settings, "EVIDENCE_LEDGER_ENABLED", False)
+    monkeypatch.setattr(settings, "EDITOR_LETTER_FROM_FINDINGS", False)
+    monkeypatch.setattr(settings, "ABSENCE_AUDIT_ENABLED", False)
+    monkeypatch.setattr(settings, "NOVELTY_FROM_CLAIMS", False)
+    monkeypatch.setattr(settings, "LITERATURE_KB_ENABLED", False)
+    monkeypatch.setattr(settings, "RAG_STORE", "off")
+    monkeypatch.setattr(settings, "LLM_RESPONSE_CACHE", False)
+    local_store.reset_store()
+    yield
+    local_store.reset_store()
+
+
 @pytest.fixture
 def signing_key(monkeypatch: pytest.MonkeyPatch) -> str:
     """Configure a fresh Ed25519 signing key; returns its kid."""

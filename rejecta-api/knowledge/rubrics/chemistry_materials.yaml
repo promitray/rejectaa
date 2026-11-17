@@ -1,0 +1,44 @@
+# Materials chemistry: synthesis and characterization of materials, device or performance measurements.
+pack: chemistry_materials
+version: "2026-11-13.1"
+title: Materials chemistry
+applies_to: {fields: [chemistry_materials]}
+items:
+  - id: chemistry_materials.structure_evidence
+    triggers_on: [paper]
+    ask_in: [results, methods]
+    question: "Is the material's structure and composition established by complementary methods (e.g. XRD with microscopy and spectroscopy or elemental analysis), and are quantitative values (particle size, surface area) given with their distribution and number of measurements?"
+    search: "XRD TEM SEM XPS BET particle size distribution characterization composition"
+    severity: {missing: major, problem: minor}
+    fix: "Add complementary characterization of the material (e.g. XRD plus TEM and XPS) and report sizes or surface areas with their distribution and the number of particles or samples measured."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_materials.performance_comparison
+    triggers_on: [comparative, novelty]
+    main_only: true
+    ask_in: [results]
+    question: "For \"{claim}\": is the performance compared with reported materials measured under comparable conditions (same test protocol, loading, temperature, current density), and are differences in conditions stated?"
+    search: "compared reported literature table performance conditions current density loading temperature"
+    severity: {missing: major, problem: major}
+    fix: "Add a comparison table for \"{claim}\" listing each reported material with its test conditions, and mark comparisons made under different conditions."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_materials.repeatability
+    triggers_on: [quantitative]
+    main_only: true
+    ask_in: [results]
+    covered_by: [replicates, spread]
+    question: "For \"{claim}\": is the value measured on more than one independently made sample or device, with the spread reported?"
+    search: "independent samples batches devices repeated error bars standard deviation reproducibility"
+    severity: {missing: major, problem: minor}
+    fix: "Measure the value in \"{claim}\" on at least 3 independently made samples or devices and report mean ± standard deviation."
+    source: "Rejecta editorial rubric"
+
+  - id: chemistry_materials.stability
+    triggers_on: [practical]
+    ask_in: [results]
+    question: "\"{claim}\" suggests use in practice. Is long-term or cycling stability measured, with the material characterized after the test?"
+    search: "stability cycling cycles long-term durability after test retention degradation"
+    severity: {missing: minor, problem: minor}
+    fix: "Add a stability or cycling test for \"{claim}\" over a relevant duration and characterize the material after it."
+    source: "Rejecta editorial rubric"

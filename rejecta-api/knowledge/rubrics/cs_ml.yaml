@@ -1,0 +1,96 @@
+# Machine learning and data-driven computer science: methods, benchmarks, datasets.
+pack: cs_ml
+version: "2026-11-13.2"
+title: Machine learning / data-driven computing
+applies_to: {fields: [cs_ml]}
+items:
+  - id: cs_ml.baselines
+    triggers_on: [comparative, novelty]
+    main_only: true
+    ask_in: [methods, results]
+    question: "For \"{claim}\": are strong and recent baselines included, and is any obvious one missing? (A citation of the paper a baseline comes from counts as its source; say so if it is given.)"
+    search: "baseline baselines compared state-of-the-art adopt from recent study official code implementation"
+    severity: {missing: major, problem: major}
+    fix: "Add the strongest recent baseline that is missing from the comparison behind \"{claim}\", or explain why it is left out."
+    source: "NeurIPS Paper Checklist (experimental setting/details); Rejecta editorial rubric"
+
+  - id: cs_ml.implementation
+    triggers_on: [comparative]
+    main_only: true
+    ask_in: [methods]
+    question: "For \"{claim}\": beyond citing each baseline's paper, is the implementation used identified (official code, or a named library with its version), so the comparison can be repeated?"
+    search: "implementation official code library version github released reproduced PyTorch DGL RDKit"
+    severity: {missing: minor, problem: minor}
+    fix: "For each model behind \"{claim}\", name the implementation used (official code or library with version) in the setup."
+    source: "NeurIPS Paper Checklist (experimental setting/details); Rejecta editorial rubric"
+
+  - id: cs_ml.tuning_budget
+    triggers_on: [comparative]
+    ask_in: [methods]
+    question: "For \"{claim}\": did each compared model get the same hyperparameter search (search space, number of trials, selection metric, validation data), and is that reported for every model?"
+    search: "hyperparameter tuning search space grid random bayesian trials optuna validation selected learning rate"
+    severity: {missing: major, problem: major}
+    fix: "Add a table with, for every compared model, the hyperparameter search space, number of trials and selection metric, so the comparison in \"{claim}\" is shown to be fair."
+    source: "NeurIPS Paper Checklist (experimental setting/details); Rejecta editorial rubric"
+
+  - id: cs_ml.data_split
+    triggers_on: [paper]
+    kinds: [method, benchmark, application, dataset]
+    ask_in: [methods]
+    question: "How are training, validation and test sets made (random, scaffold, temporal, cluster or group split), is the choice justified for the claim, and is the test set kept out of model selection?"
+    search: "split train validation test random scaffold temporal fold cross-validation held-out"
+    severity: {missing: major, problem: major}
+    fix: "State the split method and ratios for every dataset, why it suits the claim (e.g. a scaffold or temporal split for out-of-distribution claims), and that test data were not used for model selection."
+    source: "Rejecta editorial rubric"
+
+  - id: cs_ml.variance
+    triggers_on: [comparative, quantitative]
+    main_only: true
+    ask_in: [results]
+    covered_by: [seed, spread]
+    question: "For \"{claim}\": are results reported over several runs, seeds or folds with mean and spread (standard deviation or confidence interval), so the difference is larger than run-to-run variation?"
+    search: "seeds runs repeated mean standard deviation std confidence interval folds variance"
+    severity: {missing: major, problem: major}
+    fix: "Report the results behind \"{claim}\" as mean ± standard deviation over at least 3 seeds or folds, and state the number of runs."
+    source: "NeurIPS Paper Checklist (statistical significance)"
+
+  - id: cs_ml.significance
+    triggers_on: [comparative]
+    main_only: true
+    ask_in: [results]
+    question: "\"{claim}\" compares methods across datasets or runs. Is the difference tested statistically (a paired test, or a Friedman test with post-hoc analysis across datasets), or only judged from averages or ranks?"
+    search: "significant significance test p-value wilcoxon friedman nemenyi paired t-test critical difference rank"
+    severity: {missing: minor, problem: major}
+    fix: "Test the comparison in \"{claim}\" for significance: a paired test per dataset, or a Friedman test with Nemenyi post-hoc across datasets (critical-difference diagram), and report the p-values."
+    source: "NeurIPS Paper Checklist (statistical significance); Rejecta editorial rubric"
+
+  - id: cs_ml.ablation
+    triggers_on: [causal, mechanism, novelty]
+    kinds: [method]
+    main_only: true
+    ask_in: [results]
+    question: "For \"{claim}\": is there an ablation that removes each proposed component in turn, showing which one gives the improvement?"
+    search: "ablation without removing component variant w/o contribution of each"
+    severity: {missing: major, problem: minor}
+    fix: "Add an ablation table for \"{claim}\": the full model and one variant per proposed component removed, on the same data and seeds."
+    source: "Rejecta editorial rubric"
+
+  - id: cs_ml.leakage
+    triggers_on: [paper]
+    kinds: [method, benchmark, application]
+    ask_in: [methods]
+    question: "Could test information reach training: duplicates or near-duplicates across splits, preprocessing (scaling, feature selection) fitted on all data, or pretraining on data that overlaps the test set? Does the paper address this?"
+    search: "duplicate overlap leakage preprocessing normalization fitted pretraining pretrained deduplicate"
+    severity: {missing: minor, problem: major}
+    fix: "State how duplicates across splits were removed and that preprocessing was fitted on training data only; for pretrained models, check and report overlap with the test sets."
+    source: "Rejecta editorial rubric"
+
+  - id: cs_ml.metric_choice
+    triggers_on: [comparative, quantitative]
+    main_only: true
+    ask_in: [methods, results]
+    question: "For \"{claim}\": is the evaluation metric suited to the task and data (e.g. class imbalance, regression scale), and is it the one used by the compared work?"
+    search: "metric accuracy auc roc prc rmse mae f1 imbalance evaluation"
+    severity: {missing: minor, problem: minor}
+    fix: "Justify the metric behind \"{claim}\" for this data (e.g. PRC-AUC for imbalanced classes) and report the metric used by the compared work too."
+    source: "Rejecta editorial rubric"

@@ -38,10 +38,15 @@ from services.textfold import GREEK_TABLE
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_PROMPT_VERSION = "2026-11-13.2"
+EXTRACTION_PROMPT_VERSION = "2026-11-16.1"  # .16.1: tables read as rows and columns
 EXTRACTION_BUDGET_CHARS = 120_000
 TOTAL_BUDGET_SECONDS = 120.0
 MAX_FACTS = 80
+MAX_QUANTITIES = 90
+PASSAGE_SLACK = 40  # letters and digits between two quotations that are still one passage
+EXTRACTION_MAX_TOKENS = 12_000  # the field-agnostic list is long; a cut-off answer would lose the whole check
+FIELDS = ("cs_ml", "chemistry", "biology_lab", "physics_materials", "clinical", "other")
+QUANTITY_KINDS = ("count", "fraction", "result", "parameter")
 MAX_FINDINGS = 8
 MAX_CELL_LINES = 12
 CACHE_TTL_SECONDS = 7 * 24 * 3600.0
@@ -71,9 +76,26 @@ _SYSTEM = (
     "Return ONLY valid JSON."
 )
 
-_INSTRUCTIONS = """Extract from the manuscript below, as JSON with exactly these keys:
+_INSTRUCTIONS = """You extract checkable factual values from a research paper so code can compare them across
+sections for internal consistency. You do NOT judge correctness: you only extract values exactly as written, so a
+separate comparison step can flag mismatches. Return JSON with exactly these keys:
 
 {
+  "field": "<from the paper's content, not the journal name: one of FIELDS>",
+  "quantities": [
+    {"kind": "<count | fraction | result | parameter>",
+     "quantity": "<canonical name of WHAT is counted or measured, IDENTICAL for every mention of the same quantity,
+                  e.g. 'datasets benchmarked', 'models compared', 'deep models', 'patients enrolled',
+                  'XGB AUC-ROC on BACE', 'yield of compound 3a'>",
+     "value": <the number as written; for a fraction the numerator>,
+     "denominator": <fractions only: the number after the slash or 'of', e.g. 15 in '8/15 datasets'; else null>,
+     "of": "<fractions: the canonical 'quantity' name of the total the denominator counts, e.g. 'datasets benchmarked'>",
+     "part_of": "<counts of a sub-group: the canonical name of the total it is part of, e.g. 'models compared'; else empty>",
+     "core": <true for the count of the paper's own unit of analysis (its datasets, models, compounds, samples,
+              patients, cell lines, reactions...); else false>,
+     "unit": "<unit exactly as written, or empty>",
+     "quote": "<5-25 words copied EXACTLY from the manuscript that contain this value>"}
+  ],
   "studied_compounds": ["<the compound(s) or material(s) this paper is about>"],
   "facts": [
     {"experiment": "<short name of the assay or procedure, e.g. 'MTT assay', 'cell cycle analysis', 'xenograft dosing', 'compound characterisation'. Use EXACTLY the same name every time the same procedure is mentioned, in any section>",
@@ -98,7 +120,32 @@ _INSTRUCTIONS = """Extract from the manuscript below, as JSON with exactly these
   "cell_lines": [{"name": "<cell line name as written, e.g. HepG2, MGC-803>", "quote": "<5-30 exact words>"}]
 }
 
-Rules:
+Tables appear in the text as one line: "[Table N (p. X) as a table. Columns: a | b | c. Rows: r1 | v | v; ...]". A
+value in a table is named by its row and column ("XGB AUC-ROC on BACE"), and its quote is the row as written
+("BACE (1,513) | AUC ROC | 0.886 | 0.896"), so code can compare it with the same value restated in the text.
+
+Rules for "quantities" (every field; never skip a type because it is "not typical" for the field):
+- COUNTS: the total of the paper's own unit of analysis (datasets, models, compounds, samples, patients, trials,
+  replicates, cell lines, reactions, structures), EVERY time it is stated (abstract, text, captions, tables,
+  appendix), and the counts of its sub-groups, with "part_of".
+- FRACTIONS: every "N/M ..." or "N of M ..." (e.g. "top-1 on 8/15 datasets", "10/14 datasets").
+- RESULTS: a numeric result (metric, measurement, yield, score) stated in more than one place (table, caption,
+  prose, abstract): each statement, with the SAME "quantity" name including its condition.
+- PARAMETERS: experimental settings the paper reports (hyperparameters, seed and epoch counts, split ratios, sample
+  sizes, temperatures, concentrations, stoichiometry), each time they are stated.
+- Identifiers (a dataset, compound, cell line, model, material, cohort) whose numbers are restated: use the
+  identifier in "quantity" so code can compare the restatements.
+- Different items get different names: values listed together for different things ("104.29, 90.12, 69.68" for
+  the top-1, top-2 and top-3 molecules; results per dataset or per model) are "pLogP top-1", "pLogP top-2", ...,
+  never one shared name. One name = one quantity that should have one value.
+- Extract restated values first (stated in two or more places), then single ones, up to MAXQUANTITIES entries. A
+  typical research paper has 30-90 such entries: every count of its datasets/samples/models/compounds wherever it
+  is restated, every N/M, every table value repeated in the text, every setting. List them all; do not stop at a
+  few examples. Do not decide what is important and do not compare: code does that. Zero entries is right only if the paper truly
+  restates no count, quantity, unit or identifier; if you find none, read again.
+- Section and page are found by code from the quote: copy the quote exactly.
+
+Rules for the other keys:
 - Read the Abstract, Methods, Results, Discussion and figure captions. Take every value of the listed parameters,
   in EVERY section where it appears (the same value in the Abstract and in the Methods is two facts).
 - Protocol values only: what was given, used or set (doses, concentrations, durations, densities, temperatures,
@@ -143,6 +190,49 @@ class _Paper:
             self.raw_parts.append((label, text))
         self.whole = _norm(parsed.full_text)
         self.title_and_abstract = _norm(f"{parsed.title} {parsed.abstract}")
+        self.pages = [_norm(t) for t in (parsed.page_texts or [])]
+        self.first_page = parsed.first_page or 1
+        # how the reader finds a section: "Appendix B: Experimental Setups", "Section 2: Benchmarking Results"
+        self.display: dict[str, str] = {"abstract": "the Abstract"}
+        for name in parsed.sections:
+            role = parsed.section_roles.get(name, "")
+            label = role if role in pp.CANONICAL_ROLES else (name if role else "")
+            title = parsed.section_titles.get(name) or name.capitalize()
+            number = parsed.section_labels.get(name, "")
+            if parsed.section_parts.get(name) == "appendix":
+                shown = f"Appendix {number}: {title}" if number.isalpha() else f"Appendix: {title}"
+            else:
+                shown = f"Section {number}: {title}" if number else title
+            self.display.setdefault(label, shown)
+
+    def same_passage(self, a: str, b: str) -> bool:
+        """Two quotations from the same place (one inside the other, or overlapping): values listed together there
+        ("104.29, 90.12, 69.68" for the top three) are different items, not two statements of one value."""
+        ka, kb = _norm(a), _norm(b)
+        if not ka or not kb or ka in kb or kb in ka:
+            return True
+        pa, pb = self.whole.find(ka), self.whole.find(kb)
+        if pa < 0 or pb < 0:
+            return False
+        return abs(pa - pb) < max(len(ka), len(kb)) + PASSAGE_SLACK
+
+    def stated_together(self, a: float, b: float) -> bool:
+        """Both values in one sentence of the paper ("at 25 °C (according to the method) and 30 °C"): a deliberate
+        variation (robustness, a range of conditions), not two statements of one setting that disagree."""
+        for _, text in self.raw_parts:
+            for sentence in re.split(r"(?<=[.!?])\s+", text):
+                if _number_in(a, sentence) and _number_in(b, sentence):
+                    return True
+        return False
+
+    def page_of(self, quote: str) -> int | None:
+        key = _norm(quote)[:60]
+        if len(key) < 12:
+            return None
+        for p, text in enumerate(self.pages):
+            if key in text:
+                return p + self.first_page
+        return None
 
     def locate(self, quote: str) -> _Located:
         key = _norm(quote)
@@ -451,6 +541,154 @@ def _compare_groups(facts: list[_Fact]) -> list[ConsistencyFinding]:
     return findings
 
 
+@dataclass
+class _Quantity:
+    kind: str
+    name: str  # normalised canonical name
+    shown: str  # as the model wrote it
+    value: float
+    denominator: float | None
+    of: str  # normalised
+    part_of: str  # normalised
+    core: bool
+    unit: str
+    quote: str
+    section: str
+    decimals: int = 0  # how many decimals the paper wrote this value with
+
+
+def _number_in(value: float, text: str) -> bool:
+    """Whether the number is written in the text (as a whole number, not inside a longer one): 14 in "on 14
+    datasets", not in "140"; 0.886 in "0.886"; 1,513 in "1,513"."""
+    for written in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        number = _number(written)
+        if number is not None and _same(number, value) and abs(number - value) < 1e-9 + 1e-6 * abs(value):
+            return True
+    return False
+
+
+def _decimals(value: float, text: str) -> int:
+    for written in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        number = _number(written)
+        if number is not None and abs(number - value) < 1e-9 + 1e-6 * abs(value):
+            return len(written.split(".")[1]) if "." in written else 0
+    return 0
+
+
+def _differ(a: "_Quantity", b: "_Quantity") -> bool:
+    """Two statements of one quantity disagree: counts must be equal; a measured value is compared at the coarser
+    precision the paper wrote (0.886 and 0.89 agree, 0.896 and 0.912 do not)."""
+    if a.kind == "count":
+        return a.value != b.value
+    places = min(a.decimals, b.decimals)
+    return round(a.value, places) != round(b.value, places) and not (a.kind == "parameter" and _same(a.value, b.value))
+
+
+def _quantities(raw: Any, paper: _Paper) -> list[_Quantity]:
+    """The model's quantities whose quotation is in the paper and contains the number it gives."""
+    out: list[_Quantity] = []
+    for item in (raw if isinstance(raw, list) else [])[:MAX_QUANTITIES]:
+        if not isinstance(item, dict):
+            continue
+        kind = _clean_text(item.get("kind"), 20).lower()
+        name = _clean_text(item.get("quantity"), 120)
+        quote = _clean_text(item.get("quote"))
+        value = _number(item.get("value"))
+        where = paper.locate(quote)
+        if kind not in QUANTITY_KINDS or not name or value is None or not where.found:
+            continue
+        if not _number_in(value, quote):
+            continue  # the number is not in its own quotation
+        denominator = _number(item.get("denominator")) if kind == "fraction" else None
+        if kind == "fraction" and (denominator is None or not _number_in(denominator, quote)):
+            continue
+        out.append(_Quantity(
+            kind=kind, name=_norm(name), shown=name, value=value, denominator=denominator,
+            of=_norm(_clean_text(item.get("of"), 120)), part_of=_norm(_clean_text(item.get("part_of"), 120)),
+            core=bool(item.get("core")), unit=_clean_text(item.get("unit"), 30), quote=quote, section=where.section,
+            decimals=_decimals(value, quote),
+        ))
+    return out
+
+
+def _qquote(q: _Quantity) -> ConsistencyQuote:
+    shown = f"{_fmt(q.value)}/{_fmt(q.denominator)}" if q.denominator is not None else _fmt(q.value)
+    return ConsistencyQuote(quote=q.quote, section=q.section, values=f"{shown} {q.unit}".strip())
+
+
+def _where(q: _Quantity, paper: _Paper) -> str:
+    return paper.display.get(q.section) or _section_name(q.section)
+
+
+def _compare_quantities(quantities: list[_Quantity], paper: _Paper) -> list[ConsistencyFinding]:
+    """Counts, fractions, sub-group sums and restated results that disagree within the paper.
+
+    - the same count or result given different values in two places (2 % tolerance for rounding);
+    - a fraction "N/M" whose M is not the paper's stated total of what it counts ("8/15 datasets" with 14 datasets);
+    - sub-groups that add up to more than their total, or, given together with the total, to a different number.
+    """
+    findings: list[ConsistencyFinding] = []
+    by_name: dict[str, list[_Quantity]] = {}
+    for q in quantities:
+        if q.kind in ("count", "result", "parameter"):
+            by_name.setdefault(q.name, []).append(q)
+
+    for name, group in sorted(by_name.items()):
+        first = group[0]
+        other = next(
+            (q for q in group[1:] if _differ(first, q) and not paper.same_passage(first.quote, q.quote)
+             and not (q.kind == "parameter" and paper.stated_together(first.value, q.value))),
+            None,
+        )
+        if other is None or first.kind == "parameter" and first.unit != other.unit:
+            continue
+        severity = "major" if first.kind == "result" or first.core else "minor"
+        findings.append(ConsistencyFinding(
+            kind="value_mismatch", severity=severity,
+            message=(f"{first.shown[:1].upper() + first.shown[1:]}: {_fmt(first.value)} {first.unit} in {_where(first, paper)}, "
+                     f"but {_fmt(other.value)} {other.unit} in {_where(other, paper)}.").replace("  ", " "),
+            quotes=[_qquote(first), _qquote(other)],
+        ))
+
+    totals = {name: group for name, group in by_name.items() if group[0].kind == "count"}
+    for q in quantities:
+        if q.kind != "fraction" or q.denominator is None or not q.of:
+            continue
+        group = totals.get(q.of)
+        if not group or any(_same(t.value, q.denominator) for t in group):
+            continue
+        total = group[0]
+        if q.value > q.denominator:
+            continue
+        findings.append(ConsistencyFinding(
+            kind="value_mismatch", severity="minor",
+            message=(f"{_where(q, paper)[:1].upper() + _where(q, paper)[1:]} gives {_fmt(q.value)}/{_fmt(q.denominator)} "
+                     f"{total.shown}, but the paper uses {_fmt(total.value)} {total.shown} ({_where(total, paper)})."),
+            quotes=[_qquote(total), _qquote(q)],
+        ))
+
+    parts: dict[str, dict[str, _Quantity]] = {}
+    for q in quantities:
+        if q.kind == "count" and q.part_of and q.part_of != q.name:
+            parts.setdefault(q.part_of, {}).setdefault(q.name, q)
+    for total_name, members in sorted(parts.items()):
+        group = totals.get(total_name)
+        if not group or len(members) < 2:
+            continue
+        total = group[0]
+        summed = sum(m.value for m in members.values())
+        together = all(m.quote == total.quote for m in members.values())  # "12 models (3 non-deep and 9 deep)"
+        if _same(summed, total.value) or (summed < total.value and not together):
+            continue
+        listed = " + ".join(f"{_fmt(m.value)} {m.shown}" for m in members.values())
+        findings.append(ConsistencyFinding(
+            kind="value_mismatch", severity="major" if total.core else "minor",
+            message=f"{total.shown[:1].upper() + total.shown[1:]}: {listed} = {_fmt(summed)}, but the total is given as {_fmt(total.value)}.",
+            quotes=[_qquote(total), *[_qquote(m) for m in list(members.values())[:3]]],
+        ))
+    return findings
+
+
 def _plausibility(facts: list[_Fact]) -> list[ConsistencyFinding]:
     findings: list[ConsistencyFinding] = []
     for fact in facts:
@@ -656,8 +894,14 @@ async def _extract(parsed: ParsedDocument, provider: Any) -> dict[str, Any]:
     hit = _extraction_cache.get(key)
     if hit and time.monotonic() - hit[0] < CACHE_TTL_SECONDS:
         return hit[1]
-    prompt = _INSTRUCTIONS.replace("PARAMS", ", ".join(PARAMETERS)).replace("MAXFACTS", str(MAX_FACTS)) + text
-    raw = await provider.generate(_SYSTEM, prompt, temperature=0.0)
+    prompt = (
+        _INSTRUCTIONS.replace("PARAMS", ", ".join(PARAMETERS)).replace("MAXFACTS", str(MAX_FACTS))
+        .replace("MAXQUANTITIES", str(MAX_QUANTITIES)).replace("FIELDS", ", ".join(FIELDS)) + text
+    )
+    try:
+        raw = await provider.generate(_SYSTEM, prompt, temperature=0.0, max_tokens=EXTRACTION_MAX_TOKENS)
+    except TypeError:  # a provider whose generate has no token limit argument
+        raw = await provider.generate(_SYSTEM, prompt, temperature=0.0)
     data = provider.parse_json_response(raw) if hasattr(provider, "parse_json_response") else json.loads(raw)
     if len(_extraction_cache) >= MAX_CACHE_ENTRIES:
         _extraction_cache.pop(next(iter(_extraction_cache)))
@@ -675,8 +919,10 @@ def findings_from(data: dict[str, Any], paper: _Paper) -> tuple[list[Consistency
     facts += _durations_by_name(facts, paper)
     facts += _phases_by_code(paper)
     studied = [_clean_text(s, 80) for s in (data.get("studied_compounds") or []) if _clean_text(s, 80)]
+    quantities = _quantities(data.get("quantities"), paper)
     findings = (
         _percent_claims(data.get("percent_claims"), paper)
+        + _compare_quantities(quantities, paper)
         + _compare_groups(facts)
         + _foreign_compounds(data.get("treatments"), studied, paper)
         + _plausibility(facts)
@@ -690,13 +936,35 @@ def findings_from(data: dict[str, Any], paper: _Paper) -> tuple[list[Consistency
             key = finding.message
         unique.setdefault(key, finding)
     ordered = sorted(unique.values(), key=lambda f: (f.severity != "major",))
-    return ordered[:MAX_FINDINGS], len(facts)
+    for finding in ordered:
+        for q in finding.quotes:
+            if q.page is None:
+                q.page = paper.page_of(q.quote)
+    return ordered[:MAX_FINDINGS], len(facts) + len(quantities)
+
+
+def ranking_mismatches(parsed: ParsedDocument, paper: _Paper) -> list[ConsistencyFinding]:
+    """Ranking statements in the text ("X outperforms all ... on D") against the table they rest on: by code."""
+    from services.ranking_check import ranking_findings
+
+    texts = [("abstract", parsed.abstract)]
+    for name, text in parsed.sections.items():
+        role = parsed.section_roles.get(name, "")
+        texts.append((role if role in pp.CANONICAL_ROLES else (name if role else ""), text))
+    out = []
+    for f in ranking_findings(texts, parsed.figures)[:MAX_FINDINGS]:
+        quotes = [ConsistencyQuote(**{k: v for k, v in q.items() if k != "page"}) for q in f["quotes"]]
+        for q, raw in zip(quotes, f["quotes"]):
+            q.page = raw.get("page") or paper.page_of(q.quote)
+        out.append(ConsistencyFinding(kind="ranking_mismatch", severity="minor", message=f["message"], quotes=quotes))
+    return out
 
 
 async def _check(parsed: ParsedDocument, provider: Any, client: httpx.AsyncClient) -> ConsistencyReport:
     paper = _Paper(parsed)
     data = await _extract(parsed, provider)
     findings, facts_checked = findings_from(data, paper)
+    findings += ranking_mismatches(parsed, paper)
     cell_lines = await _cell_lines(data.get("cell_lines"), paper, client)
     for line in cell_lines:
         if line.status != "problematic":

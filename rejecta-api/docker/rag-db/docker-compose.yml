@@ -1,0 +1,32 @@
+# Local Postgres for the evidence-ledger store (services.local_store): model-answer cache, embeddings and each
+# paper's chunk index. For development and testing only; never the production (Supabase) database.
+#
+#   docker compose -f docker/rag-db/docker-compose.yml up -d      (from rejecta-api/)
+#   .env:  RAG_DATABASE_URL=postgresql://rejecta_rag:<RAG_DB_PASSWORD>@localhost:5433/rejecta_local
+#
+# Port 5433 on the host, so it does not clash with a Postgres already on 5432. The image includes pgvector
+# (enabled by init/01-extensions.sql) for the literature knowledge base later; the store itself uses float4[].
+name: rejecta-rag
+
+services:
+  rag-db:
+    image: pgvector/pgvector:pg16
+    container_name: rejecta-rag-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rejecta_local
+      POSTGRES_USER: rejecta_rag
+      POSTGRES_PASSWORD: ${RAG_DB_PASSWORD:?set RAG_DB_PASSWORD in docker/rag-db/.env}
+    ports:
+      - "127.0.0.1:5433:5432"   # only this machine can connect
+    volumes:
+      - rag-data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rejecta_rag -d rejecta_local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  rag-data:

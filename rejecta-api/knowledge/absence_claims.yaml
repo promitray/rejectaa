@@ -1,0 +1,83 @@
+# Kinds of "the paper lacks X" statements a review makes, with what counts as X in a paper (services.absence_audit).
+#
+# A statement that something is missing cannot be backed by a quotation, so before it reaches the report the
+# whole paper is read for it. For each kind:
+#   detect    regular expression on the statement (lower case) that says which kind it is (first match wins)
+#   query     what to search for: the evidence that would contradict the statement, in the words papers use
+#             (used when the paper is too long to be read whole)
+#   evidence  what counts as having X, told to the checker; written so that an experiment is recognised by what
+#             it does, not by what it is called
+version: "2026-11-14.4"
+kinds:
+  - id: controlled_experiment
+    detect: "controlled|isolat|causal|mechanis|ablation|confound|disentangl|attribut|underlying cause|why .* (?:fail|work|improve|struggle)"
+    query: >-
+      experiment that changes one factor and measures the effect on the outcome; increasing or decreasing a
+      property; perturbation; smoothing; transformation of the input; intervention; ablation removing a component;
+      designed comparison of conditions; verify the explanation; test the hypothesis
+    evidence: >-
+      Any experiment or analysis that deliberately varies the suspected cause and measures the effect counts, even
+      when the paper calls it an "explanation", "analysis", "verification" or "case study" and never says
+      "controlled experiment". Comparing conditions built to differ in that factor (e.g. smoothed vs original
+      labels, cliff vs non-cliff molecules, transformed vs original features, with vs without a component) counts.
+
+  - id: statistics
+    detect: "statistic|significan|p[- ]?values?|confidence interval|error bars?|standard deviation|variance|uncertaint|spread|\\bn\\b|sample size"
+    query: >-
+      standard deviation; error bars; mean over repeated runs; independent runs with different seeds; confidence
+      interval; p-value; significance test; t-test; Wilcoxon; Friedman; number of samples n
+    evidence: >-
+      Treat each statistic as its own part: the number of runs or samples (n); a measure of spread (standard
+      deviations, error bars, ranges over repeated runs); a significance test with P values or confidence
+      intervals. Each is found wherever it is, an appendix or a table caption included ("The standard deviations
+      can be seen in the appendix" finds the spread, in the appendix). When spread and n are given but no test, the
+      finding is "partly": spread and n given (say where), significance test missing.
+
+  - id: results_evidence
+    detect: "quantitative|empirical (?:evidence|results|support)|specific results|experimental results|(?:numerical|numeric) results|evidence (?:to|that) support|supporting (?:data|results|evidence)|performance (?:metrics|values|numbers|results)|metrics"
+    query: >-
+      results shown in a table or figure; as shown in Table; as shown in Figure; outperform; values; RMSE; accuracy;
+      AUC; performance of the models; improves; decreases
+    evidence: >-
+      Results reported in a table or figure count as quantitative evidence, and so do numeric values in the text.
+      Quote the sentence that reports them ("As shown in Table 2, the non-deep models consistently outperform deep
+      ones") or the table or figure caption that names what is measured. A plot of each model's performance is
+      a result per model even without a table.
+
+  - id: replicates
+    detect: "replicat|repeat|independent (?:run|sample|experiment)|seeds?|reproducib"
+    query: "independent runs; repeated experiments; random seeds; replicates; triplicate; number of repetitions; folds"
+    evidence: "Any stated number of independent runs, seeds, folds, replicates or repetitions counts."
+
+  - id: baseline
+    detect: "baseline|compar(?:e|ison) (?:with|to|against)|state[- ]of[- ]the[- ]art|benchmark against|competing method"
+    query: "compared with; baseline; previous method; state-of-the-art; outperforms; versus; benchmark against"
+    evidence: "A comparison in a table, figure or text with another method, material or condition counts, with the methods named."
+
+  - id: limitations
+    detect: "limitation|caveat|shortcoming|weakness(?:es)? of (?:the|this) (?:study|work|method)|future work|scope"
+    query: "limitation; however; does not apply; future work; remains open; caveat; restricted to; we note that"
+    evidence: "Any sentence in which the authors state a limit of their work, an open question or a condition under which it may not hold counts."
+
+  - id: generalization
+    detect: "generali[sz]|external|out[- ]of[- ]distribution|other datasets|unseen|transfer|broader applicab"
+    query: "external dataset; out-of-distribution; unseen; scaffold split; other datasets; generalization; transfer; additional benchmark"
+    evidence: "Tests on data, systems or conditions outside those used for development count."
+
+  - id: data_code
+    detect: "data availab|code availab|reproduc.* code|released|github|repository|open[- ]source"
+    query: "data availability; code availability; available at; github; repository; supplementary data; upon request"
+    evidence: "A statement of where the data or code can be obtained counts, including 'available upon request'."
+
+  - id: methods_detail
+    detect: "hyperparameter|tuning|split|preprocess|normali[sz]|protocol|procedure|parameters?|settings?|conditions?"
+    query: "hyperparameters tuned; search space; trials; split ratio; preprocessing; normalization; protocol; experimental setup"
+    evidence: >-
+      The SPECIFIC detail must be stated, anywhere in the paper (appendices and the setup section included):
+      e.g. that normalisation or feature selection was fitted on the training set only, the search space and
+      number of trials, the split ratio. Describing the procedure without that detail does not count.
+
+  - id: other
+    detect: ".*"
+    query: "the information said to be missing, stated in other words"
+    evidence: "The information counts as present when any passage states it or shows it, in any section or appendix."

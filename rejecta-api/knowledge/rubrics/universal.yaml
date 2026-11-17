@@ -1,0 +1,87 @@
+# Checks that apply to every research paper, whatever its field.
+#
+# Item fields (services.rubrics reads them):
+#   id           unique, "<pack>.<name>"
+#   triggers_on  claim types the item is asked for ("novelty", "comparative", "causal", "generalization",
+#                "quantitative", "mechanism", "practical"), or "paper" for one question about the whole paper
+#   main_only    true: only for the paper's main claims
+#   ask_in       section roles, in order of preference, where the question is asked (the first one the paper has)
+#   kinds        optional: paper kinds the item applies to (method, benchmark, synthesis, ...); default all
+#   requires_terms  optional: asked only when the paper uses one of these words
+#   covered_by   checklist keys (services.section_checks) that already decide this; the item is skipped then
+#   not_for      journal tiers (knowledge/journals.yaml: soundness, selective, standard) the item is skipped for
+#   question     what the reviewer asks; {claim} is the claim's statement
+#   search       words that find the passages that answer it (besides the claim itself)
+#   severity     {missing: ..., problem: ...}: "major" or "minor". A major item on a claim that is not a main
+#                claim counts as minor.
+#   fix          what to do when it fails, specific to the check; {claim} as above
+#   source       where the check comes from. "Rejecta editorial rubric": our own reviewing practice.
+pack: universal
+version: "2026-11-13.1"
+title: Every research paper
+applies_to: {fields: [any]}
+items:
+  - id: universal.claim_support
+    triggers_on: [novelty, comparative, causal, generalization, quantitative, mechanism, practical]
+    main_only: true
+    ask_in: [results, thematic, discussion]
+    question: "Is the claim \"{claim}\" backed by data this paper shows (a figure, table or reported value), and do those data show what the claim says, no more?"
+    search: "results show figure table data values demonstrate"
+    severity: {missing: major, problem: major}
+    fix: "Point the claim \"{claim}\" to the figure or table that shows it, or narrow the claim to what the data show."
+    source: "Rejecta editorial rubric"
+
+  - id: universal.novelty_comparison
+    triggers_on: [novelty]
+    ask_in: [introduction, discussion]
+    question: "The paper claims \"{claim}\". Does it name the closest earlier work and say concretely what is new compared with it (a method, result, scale or condition earlier work did not reach)?"
+    search: "previous work prior studies reported earlier unlike compared first novel"
+    severity: {missing: major, problem: major}
+    fix: "Name the closest earlier studies for \"{claim}\" and state in one sentence what this paper adds that they did not (with citations)."
+    source: "Rejecta editorial rubric"
+
+  - id: universal.comparison_fairness
+    triggers_on: [comparative]
+    ask_in: [methods, results]
+    question: "The paper claims \"{claim}\". Were the compared approaches, materials or conditions evaluated under the same conditions (same data or samples, same budget, same metric), and does the paper say so?"
+    search: "compared same conditions baseline control benchmark identical protocol"
+    severity: {missing: major, problem: major}
+    fix: "State, for the comparison behind \"{claim}\", that every compared approach used the same data or samples, conditions and metric, and list any difference."
+    source: "Rejecta editorial rubric"
+
+  - id: universal.causal_evidence
+    triggers_on: [causal, mechanism]
+    ask_in: [results, discussion]
+    question: "The paper claims \"{claim}\". Is there an experiment or analysis that isolates this cause (a control, an ablation, a mechanistic measurement), or is it inferred from correlation or from the outcome alone?"
+    search: "control ablation mechanism because due to attributed isolate confirm"
+    severity: {missing: major, problem: major}
+    fix: "Add the control or ablation that isolates the cause in \"{claim}\", or present it as a hypothesis."
+    source: "Rejecta editorial rubric"
+
+  - id: universal.generalization_scope
+    triggers_on: [generalization]
+    ask_in: [discussion, results]
+    question: "The paper claims \"{claim}\". Do the systems, datasets or conditions actually tested cover that scope, and does the paper state where the claim may not hold?"
+    search: "general broadly applicable all various range scope limitation tested"
+    severity: {missing: minor, problem: major}
+    fix: "Limit \"{claim}\" to the systems or datasets tested, or add tests outside them, and state where it may not hold."
+    source: "Rejecta editorial rubric"
+
+  - id: universal.quantitative_match
+    triggers_on: [quantitative]
+    ask_in: [results]
+    question: "The paper states \"{claim}\". Is the same value, with its unit and condition, reported in the results, and is its spread or uncertainty given?"
+    search: "value percent improvement accuracy yield error mean standard deviation"
+    severity: {missing: major, problem: major}
+    fix: "Report the value in \"{claim}\" where the results are given, with its unit, condition and spread, and make the abstract match it."
+    source: "Rejecta editorial rubric"
+
+  - id: universal.practical_evidence
+    triggers_on: [practical]
+    main_only: true
+    ask_in: [results, discussion]
+    question: "The paper claims practical value: \"{claim}\". Is that use demonstrated or measured in this paper, or only proposed?"
+    search: "application practical real-world useful demonstrate deployment use case"
+    severity: {missing: minor, problem: minor}
+    fix: "Either show the use in \"{claim}\" with a measured example, or describe it as a possible application."
+    source: "Rejecta editorial rubric"

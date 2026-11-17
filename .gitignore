@@ -48,3 +48,7 @@ memory.md
 rejecta-api/eval/papers/
 rejecta-api/eval/cache/
 rejecta-api/eval/runs/
+
+# Local paper index and model-answer cache (services.local_store)
+rejecta-api/.cache/
+rejecta-api/docker/rag-db/.env

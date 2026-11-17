@@ -10,9 +10,11 @@ from config import settings
 from models import AnalysisResult
 from services import paper_profile as pp
 from services.analysis_guard import AnalysisContext, current_context, finalize_payload
+from services import outline
+from services.journal_policy import policy_for
 
 # Bump when the prompt or the scoring changes: it is part of the cache key, so old results are not reused.
-PROMPT_VERSION = "2026-11-13.4"  # .4: detected sections listed with the heading the paper prints
+PROMPT_VERSION = "2026-11-16.1"  # .16.1: tables as rows and columns, figures only by caption (services.pdf_layout)
 MODE_A = "a"
 MODE_B = "b"
 MESSAGE_OVERHEAD_CHARS = 40_000  # room for the instructions, citation summary and journal data
@@ -251,6 +253,9 @@ def _profile_block(ctx: AnalysisContext) -> str:
             f"as \"name\" (source \"detected\", empty anchor): {names}. When you write about a section, call it "
             "by its heading in the paper."
         )
+        block = outline.outline_block(ctx)
+        if block:
+            lines.append(block)
     return "\n".join(lines)
 
 
@@ -376,6 +381,9 @@ class AbstractAnalysisProvider(ABC):
         standing = journal_standing(journal_data)
         if standing:
             head += f"Target journal standing: {standing}\n\n"
+        policy = policy_for(target_journal).prompt_line()
+        if policy:
+            head += policy + "\n\n"
         if ctx is not None:
             head += _profile_block(ctx) + "\n\n"
         tail = (

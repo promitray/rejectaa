@@ -13,7 +13,13 @@ from collections import OrderedDict
 
 from models import AnalysisPaperResponse
 from services.documents.store import Owner
+from config import settings
 from services.consistency import EXTRACTION_PROMPT_VERSION
+from services.absence_audit import AUDIT_PROMPT_VERSION, kinds_version
+from services.editor_letter import LETTER_PROMPT_VERSION
+from services.novelty import NOVELTY_PROMPT_VERSION
+from services.evidence_ledger import EVIDENCE_LEDGER_VERSION
+from services.journal_policy import policy_version
 from services.evidence_check import SUPPORT_PROMPT_VERSION
 from services.llm.base import PROMPT_VERSION
 from services.section_review import SECTION_REVIEW_PROMPT_VERSION
@@ -23,11 +29,25 @@ MAX_ENTRIES = 200
 # every prompt whose answer is part of the report: a change to any of them must not serve an older report
 REPORT_VERSION = "|".join((PROMPT_VERSION, EXTRACTION_PROMPT_VERSION, SUPPORT_PROMPT_VERSION, SECTION_REVIEW_PROMPT_VERSION))
 
+
+def report_version() -> str:
+    """REPORT_VERSION plus the evidence-ledger review (its prompts and rubric packs) when it is on."""
+    version = f"{REPORT_VERSION}|journals:{policy_version()}"
+    if settings.EVIDENCE_LEDGER_ENABLED:
+        version += f"|ledger:{EVIDENCE_LEDGER_VERSION}"
+    if settings.EDITOR_LETTER_FROM_FINDINGS:
+        version += f"|letter:{LETTER_PROMPT_VERSION}"
+    if settings.ABSENCE_AUDIT_ENABLED:
+        version += f"|absence:{AUDIT_PROMPT_VERSION}@{kinds_version()}"
+    if settings.NOVELTY_FROM_CLAIMS:
+        version += f"|novelty:{NOVELTY_PROMPT_VERSION}"
+    return version
+
 _entries: OrderedDict[str, tuple[float, AnalysisPaperResponse]] = OrderedDict()
 
 
 def cache_key(owner: Owner, file_sha256: str, journal: str, mode: str, article_type: str | None, model: str) -> str:
-    parts = [owner.kind, str(owner.id), file_sha256, journal.strip().lower(), mode, article_type or "auto", REPORT_VERSION, model]
+    parts = [owner.kind, str(owner.id), file_sha256, journal.strip().lower(), mode, article_type or "auto", report_version(), model]
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 

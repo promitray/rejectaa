@@ -16,7 +16,7 @@ import fitz
 from docx import Document as open_docx
 
 from models import FileMark, ParsedDocument
-from services import paper_profile
+from services import outline, paper_profile, textclean
 from services.citation_refs import trim_after_citation
 from services.citations import trim_doi
 
@@ -574,6 +574,8 @@ def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocum
     dois: list[str] = []
     title = ""
     front_text = ""
+    outline_pages: list[str] = []
+    skip = 0
     try:
         document = fitz.open(stream=file_bytes, filetype="pdf")
         page_texts = [page.get_text() for page in document]
@@ -601,10 +603,13 @@ def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocum
         except Exception:  # the known headings still work without the typography
             logger.debug("Layout heading detection failed", exc_info=True)
         page_texts = page_texts[skip:]
+        outline_pages = [_normalize_pdf_text(text) for text in page_texts]
         # The "COMMUNICATION" label is also a running header on later pages, so it is read from the
         # first page before running lines are removed.
         first_page_lines = page_texts[0].split("\n") if page_texts else []
-        full_text = _normalize_pdf_text("\n".join(_drop_running_lines(page_texts))).strip()
+        # Tables as tables, figure labels left out (services.pdf_layout); the plain text when that is switched off.
+        body_pages, tables, figure_chars = _layout_pages(document, skip, page_texts)
+        full_text = _normalize_pdf_text("\n".join(_drop_running_lines(body_pages))).strip()
         logger.debug("Extracted text from %d pages (skipped %d cover page)", len(page_texts), skip)
     except (ValueError, RuntimeError, TypeError, fitz.FileDataError) as exc:
         raise ValueError(
@@ -614,7 +619,7 @@ def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocum
         if document is not None:
             document.close()
 
-    return _build_document(
+    parsed = _build_document(
         full_text,
         one_reference_per_line=False,
         article_type_hint=article_type,
@@ -627,7 +632,37 @@ def parse_pdf(file_bytes: bytes, article_type: str | None = None) -> ParsedDocum
         doi_candidates=dois,
         title=title,
         front_text=front_text,
+        page_texts=outline_pages,
+        first_page=skip + 1,
     )
+    parsed.tables = tables
+    parsed.figure_text_removed_chars = figure_chars
+    return parsed
+
+
+def _layout_pages(document: "fitz.Document", skip: int, plain: list[str]) -> tuple[list[str], list[dict], int]:
+    """Each page's text with its tables kept as tables and its figure labels left out (services.pdf_layout), the
+    tables found, and how many characters of figure text were left out. Plain text when switched off or on failure."""
+    from config import settings
+
+    if not settings.PDF_LAYOUT_TABLES:
+        return plain, [], 0
+    from services.pdf_layout import page_layout
+
+    texts: list[str] = []
+    tables: list[dict] = []
+    dropped = 0
+    for offset, text in enumerate(plain):
+        try:
+            layout = page_layout(document[skip + offset], skip + offset + 1)
+        except Exception:  # noqa: BLE001 - that page's plain text
+            logger.debug("Layout reading failed", exc_info=True)
+            texts.append(text)
+            continue
+        texts.append(layout.text)
+        tables += [t.to_json() for t in layout.tables]
+        dropped += layout.figure_chars_dropped
+    return texts, tables, dropped
 
 
 def parse_docx(file_bytes: bytes, article_type: str | None = None) -> ParsedDocument:
@@ -745,7 +780,12 @@ def _paragraph_text(lines: list[str], per_line: bool = False) -> str:
             else:
                 current.append(line)
         paragraphs.append(" ".join(current))
-    cleaned = [re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "-", re.sub(r"\s+", " ", para)).strip() for para in paragraphs]
+    # a word the typesetter broke at the line end is joined ("re- cently" -> "recently"); a compound keeps its
+    # hyphen ("non- deep" -> "non-deep"), decided from the paper's own words (services.textclean)
+    cleaned = [
+        re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "-", textclean.dehyphenate_current(re.sub(r"\s+", " ", para))).strip()
+        for para in paragraphs
+    ]
     return PARAGRAPH_BREAK.join(para for para in cleaned if para)
 
 
@@ -852,6 +892,8 @@ def _build_document(
     doi_candidates: list[str] | None = None,
     title: str = "",
     front_text: str = "",
+    page_texts: list[str] | None = None,
+    first_page: int = 1,
 ) -> ParsedDocument:
     """Shared text-to-structure step for every input format.
 
@@ -861,7 +903,29 @@ def _build_document(
     kept. Every step is a pure function of the file, so the same file always gives the same sections.
     """
     lines = full_text.split("\n")
+    keys_token = _FILE_LAYOUT_KEYS.set(_merge_layout_headings(lines, layout_headings)[1])
+    vocab_token = textclean.use_vocabulary(full_text)
+    style_abstract = textclean.rejoin_current(style_abstract)  # read from the page before the vocabulary existed
+    block_abstract = textclean.rejoin_current(block_abstract)
+    try:
+        parsed = _build_document_with_keys(
+            lines, full_text, one_reference_per_line, article_type_hint, reflow, style_abstract, label_lines,
+            layout_headings, block_abstract, integrity_marks, doi_candidates, title, front_text,
+        )
+        try:  # the outline (numbers, main text or appendix, pages, figures) is extra: never a reason to fail
+            outline.attach(parsed, lines, page_texts, first_page, front_text)
+        except Exception:  # noqa: BLE001
+            logger.warning("Reading the paper's outline failed", exc_info=True)
+        return parsed
+    finally:
+        textclean.reset_vocabulary(vocab_token)
+        _FILE_LAYOUT_KEYS.reset(keys_token)
 
+
+def _build_document_with_keys(
+    lines, full_text, one_reference_per_line, article_type_hint, reflow, style_abstract, label_lines,
+    layout_headings, block_abstract, integrity_marks, doi_candidates, title, front_text,
+) -> ParsedDocument:
     user_type = paper_profile.coerce_article_type(article_type_hint)
     label_type = paper_profile.detect_article_type(label_lines if label_lines else _front_lines(lines, reflow)[:60])
     article_type = user_type or label_type
@@ -1168,6 +1232,25 @@ def _layout_key(text: str) -> str:
 _LAYOUT_HEADINGS: ContextVar[frozenset[str]] = ContextVar("layout_headings", default=frozenset())
 
 
+# Every heading the file's layout marks, in both readings. Used to find where a reference list really ends.
+_FILE_LAYOUT_KEYS: ContextVar[frozenset[str]] = ContextVar("file_layout_keys", default=frozenset())
+
+
+def _ends_reference_list(line: str) -> bool:
+    """True when the line is a heading that can end a reference list.
+
+    Only a known title ("Acknowledgements", "Related Work") or a heading the file's layout marks (bold or
+    larger type) counts. A keyword guess does not: "S. Large-scale comparison of machine learning methods",
+    the leftover "S." of an author name plus a journal title, looks like "S. <Methods>" and used to cut the
+    list in the middle.
+    """
+    key = _layout_key(line)
+    if key and (key in _FILE_LAYOUT_KEYS.get() or key in _LAYOUT_HEADINGS.get()):
+        return True
+    parts = _heading_parts(line)
+    return parts is not None and parts[0] in _KNOWN_TITLES
+
+
 def _keyword_role(title: str) -> str | None:
     words = set(re.findall(r"[a-z]+", title.lower()))
     for role, vocabulary in _ROLE_WORDS:
@@ -1257,8 +1340,9 @@ def _split_reference_blocks(lines: list[str]) -> tuple[list[str], list[list[str]
         limit = starts[number + 1] if number + 1 < len(starts) else len(lines)
         end = limit
         for index in range(start + 1 + MIN_REFERENCE_BLOCK_LINES, limit):
-            title = _heading_title(lines[index])
-            if title is not None and title not in REFERENCE_TITLES:
+            if _heading_title(lines[index]) in REFERENCE_TITLES:
+                continue
+            if _ends_reference_list(lines[index]):
                 end = index
                 break
         blocks.append(lines[start + 1 : end])
@@ -1413,6 +1497,26 @@ def _topic_heading(line: str, wanted_number: int) -> str | None:
     return title
 
 
+_LETTER_LEADING = re.compile(r"^\s*([A-H])[\.\)]\s+(\S.*)$")
+
+
+def _in_file_layout(line: str) -> bool:
+    """Whether the file's own layout marks this line as a heading (bold or larger type, a Word heading style)."""
+    key = _layout_key(line)
+    return bool(key) and (key in _FILE_LAYOUT_KEYS.get() or key in _LAYOUT_HEADINGS.get())
+
+
+def _letter_topic(line: str, wanted_letter: str) -> str | None:
+    """Title of a lettered top-level heading ("B. Experimental Setups"), only the next letter in sequence."""
+    match = _LETTER_LEADING.match(line)
+    if not match or match.group(1) != wanted_letter:
+        return None
+    title = match.group(2).strip().rstrip(":")
+    if not (3 <= len(title) <= MAX_LAYOUT_HEADING_CHARS) or not title[:1].isupper() or re.match(r"^\d", title):
+        return None
+    return title
+
+
 MIN_OPENING_CHARS = 600  # shorter than this, the text before the first heading is front matter, not an introduction
 _OPENING_SKIP = re.compile(r"(?i)^\s*(?:keywords?|index terms)\b|@|doi\s*:|©|\breceived\b|\baccepted\b")
 
@@ -1491,16 +1595,20 @@ def _extract_sections_detailed(
     boundaries: list[tuple[int, str | None, str | None]] = []  # (line, role, key)
     shown_at: dict[int, str] = {}  # boundary line -> heading as printed
     next_number = 1
+    next_letter = "A"  # appendix sections lettered A., B., C. ...
     for index, line in enumerate(lines):
         parts_of_heading = _heading_parts(line)
         if parts_of_heading is not None:
             title, shown = parts_of_heading
             number = _LEADING_NUMBER.match(line)
             roman = _ROMAN_LEADING.match(line)
+            letter = _LETTER_LEADING.match(line)
             if number and int(number.group(1)) == next_number:
                 next_number += 1
             elif roman and _roman_value(roman.group(1)) == next_number:
                 next_number += 1
+            elif letter and letter.group(1) == next_letter:
+                next_letter = chr(ord(next_letter) + 1)
             if title in _TITLE_TO_SECTION and _is_table_header(lines, index, _TITLE_TO_SECTION[title], boundaries):
                 continue  # "Method" over a results table's columns, not a second Methods section
             if title in _TITLE_TO_SECTION or index not in shown_at:
@@ -1528,6 +1636,20 @@ def _extract_sections_detailed(
             ):
                 continue  # a page number above a table whose first column is headed "Method"
             boundaries.append((index, None, None))
+        elif not thematic_paper and _in_file_layout(line) and (
+            (next_number >= 2 and _topic_heading(line, next_number)) or _letter_topic(line, next_letter)
+        ):
+            # A heading the file's layout marks (bold or larger type) that continues the paper's own numbering
+            # ("3. Why above phenomena would occur?" after "2. Results") or its lettered appendices ("A. ..."). Its
+            # text is a part of the paper in its own right, not the end of the section before it.
+            topic = _topic_heading(line, next_number) if next_number >= 2 else None
+            if topic is not None:
+                next_number += 1
+            else:
+                topic = _letter_topic(line, next_letter)
+                next_letter = chr(ord(next_letter) + 1)
+            shown_at[index] = topic  # type: ignore[assignment]
+            boundaries.append((index, paper_profile.ROLE_THEMATIC, topic))
         elif thematic_paper:
             topic = _topic_heading(line, next_number) or _roman_topic(line, next_number)
             if topic is not None:

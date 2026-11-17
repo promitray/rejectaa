@@ -100,6 +100,16 @@ class AnalysisContext:
     # The paper's own values compared by code (services.consistency), and its disclosure statements.
     consistency: ConsistencyReport | None = None
     disclosures: Disclosures | None = None
+    # The verified outline (services.outline) and the target journal's policy (services.journal_policy)
+    section_labels: dict[str, str] = field(default_factory=dict)
+    section_parts: dict[str, str] = field(default_factory=dict)
+    section_pages: dict[str, int] = field(default_factory=dict)
+    figures: list[dict[str, Any]] = field(default_factory=list)
+    subsections: list[dict[str, Any]] = field(default_factory=list)
+    venue_statements: list[str] = field(default_factory=list)
+    page_texts: list[str] = field(default_factory=list)
+    first_page: int = 1
+    journal: str = ""
     corpus: str = field(init=False, default="")
     norm_text: str = field(init=False, default="")  # the paper, Unicode-normalised
     corpus_index: list[int] = field(init=False, default_factory=list)  # corpus position -> position in norm_text
@@ -590,6 +600,16 @@ def _attach_checks(
 MAX_SECTION_NAME_CHARS = 120  # a paper's own numbered headings can be long
 
 
+def outline_fields(ctx: AnalysisContext, key: str) -> dict[str, Any]:
+    """A detected section's printed number, part (main text or appendix) and first page, from the outline."""
+    out: dict[str, Any] = {"part": ctx.section_parts.get(key, "main")}
+    if ctx.section_labels.get(key):
+        out["label"] = ctx.section_labels[key]
+    if ctx.section_pages.get(key):
+        out["page"] = ctx.section_pages[key]
+    return out
+
+
 def _clean_sections(
     raw: Any, ctx: AnalysisContext | None, notes: list[str], article_type: str | None = None
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -633,6 +653,7 @@ def _clean_sections(
             key_name = match
             role = ctx.section_roles.get(match, role)
             position = detected_order[match]
+            fields.update(outline_fields(ctx, match))
         else:
             key_name = name
         fields["role"] = role
@@ -860,12 +881,59 @@ def _concern_caps(criteria: dict[str, dict[str, Any]], reasons: list[dict[str, A
     """A criterion cannot score high while a verified concern on it says otherwise (scores and concerns agree)."""
     for reason in reasons:
         criterion = criteria.get(str(reason.get("criterion") or ""))
-        if criterion is None or criterion.get("computed") or reason.get("origin") != "model":
+        if criterion is None or criterion.get("computed") or reason.get("origin") not in ("model", "evidence_ledger"):
             continue
         if reason.get("severity") == "desk_reject":
             _cap(criterion, CRITERION_CAP_DESK_REJECT, "a desk-reject concern bears on it.")
         elif reason.get("severity") == "major":
             _cap(criterion, CRITERION_CAP_MAJOR, "a major concern bears on it.")
+
+
+def _journal_weights(criteria: dict[str, dict[str, Any]], ctx: AnalysisContext) -> None:
+    """Weight the criteria the way the target journal decides (services.journal_policy): at a soundness-only
+    journal novelty and fit count much less. Always from the article type's own weight, so it can run again."""
+    from services.journal_policy import WEIGHT_FACTORS, policy_for
+
+    policy = policy_for(ctx.journal) if ctx.journal else None
+    factors = WEIGHT_FACTORS.get(policy.tier, {}) if policy else {}
+    for key, criterion in criteria.items():
+        if criterion.get("base_weight") is None:
+            criterion["base_weight"] = float(criterion.get("weight") or 0)
+        factor = factors.get(key, 1.0)
+        criterion["weight"] = criterion["base_weight"] * factor
+        if factor != 1.0 and policy is not None and not criterion.get("computed"):
+            criterion["adjustments"].append(policy.weight_note())
+
+
+def outline_checks(out: dict[str, Any], ctx: AnalysisContext, notes: list[str]) -> None:
+    """Every free-text field kept inside the verified outline (services.outline): a sentence naming a section or
+    figure the paper does not have is removed, an appendix section is marked as one. A concern whose problem
+    names a section that does not exist is set aside as unverified."""
+    from services import outline
+
+    if not ctx.section_texts:
+        return
+    removed: list[str] = []
+    kept_reasons: list[dict[str, Any]] = []
+    for reason in out.get("rejection_reasons") or []:
+        problem = str(reason.get("problem") or reason.get("reason") or "")
+        _, gone = outline.check_prose(problem, ctx)
+        if gone and reason.get("origin") == "model":
+            reason["unverified_reason"] = "It refers to a section or figure the paper does not have."
+            out.setdefault("unverified_concerns", []).append(reason)
+            removed.extend(gone)
+            continue
+        kept_reasons.append(reason)
+    out["rejection_reasons"] = kept_reasons
+    for container, key in _text_fields(out):
+        text, gone = outline.check_prose(container[key], ctx)
+        container[key] = text
+        removed.extend(gone)
+    if removed:
+        notes.append(
+            f"{len(removed)} statement(s) named a section, figure or table the paper does not have and were removed "
+            f"(e.g. {removed[0][:120]})."
+        )
 
 
 def _publication_cap(pub: PublicationStatus | None) -> int | None:
@@ -890,6 +958,7 @@ def score_report(out: dict[str, Any], ctx: AnalysisContext) -> None:
             criterion["raw_score"] = int(criterion["score"])
         criterion["score"] = int(criterion["raw_score"])
         criterion["adjustments"] = []
+    _journal_weights(criteria, ctx)
     _consistency_caps(criteria, ctx)
     _concern_caps(criteria, list(out.get("rejection_reasons") or []))
     from_model = any(not c.get("computed") for c in criteria.values())
@@ -1047,6 +1116,7 @@ def finalize_payload(parsed: dict[str, Any], ctx: AnalysisContext | None) -> dic
         out["rejection_reasons"] = consistency_reasons + [
             r for r in out["rejection_reasons"] if not r.get("_repeats_consistency")
         ]
+    outline_checks(out, ctx, notes)
     removed = [0]
     for container, key in _text_fields(out):
         container[key] = _scrub_quotes(container[key], ctx, removed)

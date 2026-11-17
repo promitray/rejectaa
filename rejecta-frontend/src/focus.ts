@@ -25,6 +25,7 @@ export function buildSectionFocus(section: string, steps: FixStep[]): { note: st
       // an issue about something the text lacks is marked, so the Calibrator puts a placeholder where it belongs
       lines.push(`${index + 1}. [${step.severity}${step.kind === 'add' ? `, ${MISSING_MARK}` : ''}] ${step.problem}`)
       if (step.quote) lines.push(`   In the text: “${step.quote.length > quoteChars ? `${step.quote.slice(0, quoteChars).trimEnd()} …` : step.quote}”`)
+      if (step.impact && quoteChars > MIN_QUOTE_CHARS) lines.push(`   Why it matters: ${step.impact}`)
       lines.push(`   Fix: ${step.action}`)
     })
     return lines.join('\n')

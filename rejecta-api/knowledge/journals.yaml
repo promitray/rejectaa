@@ -1,0 +1,68 @@
+# What a journal's editors decide on, by journal name. Used to tell the model how this journal judges a paper,
+# and to weight the scored criteria: a soundness-only journal does not reject for lack of novelty or impact.
+#
+# tier:
+#   soundness  - peer review for scientific soundness only; perceived importance or novelty is not a criterion
+#   selective  - editors select for significance and broad interest; most submissions are declined before review
+#   standard   - (default, not listed) specialist journal expecting a sound, useful advance in its field
+# match: regular expressions on the journal name in lower case (first match wins).
+# basis: what the decision rests on, in words the report can show. Edit freely; keep it to what the journal states.
+version: "2026-11-13.1"
+journals:
+  - name: Scientific Reports
+    match: ["^scientific reports$", "^sci(\\.)? rep(\\.|orts)?$"]
+    tier: soundness
+    basis: "Scientific Reports assesses whether the work is scientifically valid and technically sound, not its perceived importance."
+  - name: PLOS ONE
+    match: ["^plos one$"]
+    tier: soundness
+    basis: "PLOS ONE evaluates research on scientific validity, strong methodology and ethical standards, not on perceived impact or novelty."
+  - name: PeerJ
+    match: ["^peerj"]
+    tier: soundness
+    basis: "PeerJ journals review for scientific and methodological soundness, not subjective importance."
+  - name: Royal Society Open Science
+    match: ["^royal society open science$", "^r(\\.)? soc(\\.)? open sci"]
+    tier: soundness
+    basis: "Royal Society Open Science judges submissions on the quality of the science, not on perceived significance."
+  - name: F1000Research
+    match: ["^f1000research$"]
+    tier: soundness
+    basis: "F1000Research publishes after checks and reviews articles for scientific soundness."
+  - name: Heliyon
+    match: ["^heliyon$"]
+    tier: soundness
+    basis: "Heliyon considers technically sound research across disciplines."
+
+  - name: Nature
+    match: ["^nature$"]
+    tier: selective
+    basis: "Nature selects work of outstanding scientific importance that will interest readers well beyond its own field."
+  - name: Nature research journals
+    match: ["^nature [a-z]", "^nature$"]
+    tier: selective
+    basis: "Nature research journals select for significant advances of broad interest within their discipline; editors decline most submissions without review."
+  - name: Nature Communications
+    match: ["^nature communications$"]
+    tier: selective
+    basis: "Nature Communications publishes work representing important advances of significance to specialists within each field."
+  - name: Science
+    match: ["^science$"]
+    tier: selective
+    basis: "Science selects papers of broad significance; most submissions are declined without in-depth review."
+  - name: Cell
+    match: ["^cell$"]
+    tier: selective
+    basis: "Cell selects for conceptual advances of broad interest."
+  - name: PNAS
+    match: ["^proceedings of the national academy of sciences", "^pnas$"]
+    tier: selective
+    basis: "PNAS publishes research of exceptional significance."
+  - name: Journal of the American Chemical Society
+    match: ["^journal of the american chemical society$", "^j(\\.)? am(\\.)? chem(\\.)? soc"]
+    tier: selective
+    basis: "JACS publishes fundamental advances of broad significance to chemistry."
+  - name: Angewandte Chemie
+    match: ["^angewandte chemie"]
+    tier: selective
+    basis: "Angewandte Chemie selects work of high importance and urgency to a broad chemistry readership."

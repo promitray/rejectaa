@@ -41,6 +41,23 @@ class ParsedDocument(BaseModel):
     doi_candidates: list[str] = Field(default_factory=list)  # the paper's own DOI, most likely first
     title: str = ""  # the paper's title as printed (largest type on the first page, or the Word title)
     front_text: str = Field(default="", exclude=True)  # first page text, to confirm a DOI belongs to this paper
+    # The verified outline (services.outline): each section's printed number ("2", "B"), whether it is main text
+    # or an appendix, and its first page; the figures and tables with their captions; and what the first page
+    # says about where the work was presented or published.
+    section_labels: dict[str, str] = Field(default_factory=dict)
+    section_parts: dict[str, str] = Field(default_factory=dict)  # key -> "main" | "appendix"
+    section_pages: dict[str, int] = Field(default_factory=dict)
+    figures: list[dict[str, Any]] = Field(default_factory=list)  # {"label": "Table 1", "caption": ..., "page": 3}
+    # numbered subsections under the sections: {"label": "2.1", "title": "Observations", "parent": "results", "page": 2}
+    subsections: list[dict[str, Any]] = Field(default_factory=list)
+    venue_statements: list[str] = Field(default_factory=list)
+    page_count: int = 0
+    first_page: int = 1  # the page number of page_texts[0] in the file (a cover page is skipped)
+    page_texts: list[str] = Field(default_factory=list, exclude=True)
+    # PDF tables read with their rows and columns (services.pdf_layout): {"label", "caption", "page", "header",
+    # "rows", "source"}. The section texts carry each table as one structured line in its place.
+    tables: list[dict[str, Any]] = Field(default_factory=list)
+    figure_text_removed_chars: int = 0  # labels printed inside figures, left out of the text
 
 
 class FileMark(BaseModel):
@@ -88,6 +105,7 @@ class ConsistencyQuote(BaseModel):
     quote: str
     section: str = ""  # abstract, introduction, methods, results, discussion... or "" when outside the sections
     values: str = ""  # the value(s) the passage gives, as read
+    page: int | None = None  # the page of the file, found by code from the quotation
 
 
 class ConsistencyFinding(BaseModel):
@@ -95,7 +113,7 @@ class ConsistencyFinding(BaseModel):
 
     kind: Literal[
         "value_mismatch", "category_mismatch", "percent_claim", "unit_mismatch", "implausible_value",
-        "foreign_compound", "problematic_cell_line",
+        "foreign_compound", "problematic_cell_line", "ranking_mismatch",
     ]
     severity: Literal["major", "minor"] = "major"
     message: str
@@ -237,12 +255,70 @@ class SectionCheck(BaseModel):
 
 
 class SectionFinding(BaseModel):
-    """A problem in one section, from the section review (services.section_review). `quote` was found in the paper."""
+    """A problem in one section, from the section review (services.section_review). `quote` was found in the paper.
+
+    From the evidence-ledger review (services.evidence_ledger) a finding also says which claim of the paper it is
+    about, which check of the rubric raised it and where that check comes from, and the ids of the sentences its
+    quote was taken from. `quote` is empty for something the paper does not report anywhere.
+    """
 
     severity: str  # "major" | "minor"
     problem: str
-    quote: str
+    quote: str = ""
     fix: str
+    impact: str | None = None  # what the problem means for the claim
+    evidence_ids: list[str] = Field(default_factory=list)  # sentence ids ("P12.3") the quote is made of
+    claim_id: str | None = None
+    claim: str | None = None  # the paper's claim the finding is about
+    check: str | None = None  # the rubric check ("cs_ml.tuning_budget"); None: raised by the reviewer
+    source: str | None = None  # where the check comes from ("NeurIPS Paper Checklist ...", "Rejecta editorial rubric")
+    origin: str | None = None  # "rubric" | "review"
+    status: str | None = None  # "problem" | "not_reported"
+    question: str | None = None  # the question the check asked
+    kind: str | None = None  # "add" (missing) | "change"
+    page: int | None = None  # the page of the file the quotation is on
+    # A finding that says something is missing was searched for in every section of the paper (services.
+    # evidence_ledger._existence_check): `searched` when nothing was found; `addressed` is what the paper does
+    # about it when it addresses it in part (the finding then says what is still missing).
+    searched: bool = False
+    addressed: str | None = None
+    addressed_ids: list[str] = Field(default_factory=list)
+    absence_checked: bool = False  # services.absence_audit has read the whole paper for it
+    cross_reference: bool = False  # the paper covers it, but in another section than this one
+
+
+class LedgerClaim(BaseModel):
+    """A claim of the paper as the evidence-ledger review recorded it, with the sentences that state it."""
+
+    id: str
+    statement: str
+    type: str
+    main: bool = False
+    quote: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    findings: int = 0  # findings about this claim that survived every check
+
+
+class EvidenceLedgerSummary(BaseModel):
+    """How the section review was made: the claims it checked, the rubric packs, and what was removed."""
+
+    status: str = "done"
+    field: str = "other"
+    paper_kind: str = "other"
+    packs: list[dict[str, str]] = Field(default_factory=list)
+    claims: list[LedgerClaim] = Field(default_factory=list)
+    questions: int = 0
+    answers: dict[str, int] = Field(default_factory=dict)  # supported / problem / not_reported / cant_tell
+    findings_kept: int = 0
+    removed: dict[str, int] = Field(default_factory=dict)  # without_evidence / found_in_paper / answered_by_paper / not_specific
+    # each removed finding with the reason and, for "found in the paper" / "answered by the paper", the sentences
+    removed_findings: list[dict[str, Any]] = Field(default_factory=list)
+    # every question asked and its answer, "supported" ones included: what was checked, with the sentences
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    ledger_entries_dropped: int = 0
+    retrieval: str = ""
+    store: str = ""
+    version: str = ""
 
 
 MAX_FOCUS_CHARS = 4000  # the editor's note a section is calibrated with: its issues and their fixes
@@ -262,11 +338,14 @@ class FixStep(BaseModel):
     in_calibrate_text: bool = True
     # "add": something the section lacks (a placeholder goes where it belongs); "change": words to rewrite
     kind: str = "change"
+    impact: str | None = None  # what the problem means for the paper's claim
+    rule: str | None = None  # the rubric source of the check that raised it
 
 
 class SectionStrength(BaseModel):
     point: str
     quote: str = ""
+    page: int | None = None
 
 
 class SectionScore(BaseModel):
@@ -296,6 +375,10 @@ class SectionScore(BaseModel):
     llm_score: int | None = None
     score_basis: list[str] = Field(default_factory=list)
     source: str | None = None  # "detected" (a heading in the file) or "derived" (found from the content)
+    # From the verified outline (services.outline): the printed number ("2", "B"), main text or appendix, first page
+    label: str | None = None
+    part: str | None = None  # "main" | "appendix"
+    page: int | None = None
     anchor: str | None = None  # exact words from the paper where a derived section begins
     # The part of the paper the section covers, cut by code from where the section starts to where the next one starts.
     content: str | None = None
@@ -339,7 +422,8 @@ class RejectionReason(BaseModel):
     tool_text: str | None = None
     tool_notes: list[str] = Field(default_factory=list)
     # Who raised it: the model, or code from the publication record or the consistency check.
-    origin: Literal["model", "publication_record", "consistency"] = "model"
+    # "evidence_ledger": a major finding of the section review on a main claim that passed every check there
+    origin: Literal["model", "publication_record", "consistency", "evidence_ledger"] = "model"
     criterion: str = ""  # the scored criterion this concern bears on (a key of AnalysisResult.criteria)
     unverified_reason: str = ""  # for an unverified concern: why it could not be tied to the paper
 
@@ -363,6 +447,7 @@ class CriterionScore(BaseModel):
     coverage: float | None = None
     raw_score: int | None = None  # the score before code applied its limits
     adjustments: list[str] = Field(default_factory=list)  # the limits code applied, in words
+    base_weight: float | None = None  # the article type's weight, before the target journal's policy
 
 
 class PreviousIssueStatus(BaseModel):
@@ -396,6 +481,22 @@ class AnalysisResult(BaseModel):
     # Inputs of the overall score kept so code can recompute it after a later check (see analysis_guard.score_report).
     score_penalty: int = 0  # points off for what the file did not show (Methods, Supporting Information)
     raw_overall: int | None = None  # the model's own overall estimate, used only when it gave no criteria
+    evidence_ledger: EvidenceLedgerSummary | None = None  # how the section review was made (services.evidence_ledger)
+    # The verified outline and what code observed about it ("The main text has no Methods section; it is in
+    # Appendix B (p. 9)"), the publication context the file states, and how the target journal decides.
+    outline: list[dict[str, Any]] = Field(default_factory=list)
+    structure_notes: list[str] = Field(default_factory=list)
+    venue_statements: list[str] = Field(default_factory=list)
+    journal_policy: dict[str, str] | None = None
+    # The editor's letter and verdict as written from verified findings only (services.editor_letter): each
+    # sentence with the findings it rests on. Empty when the letter came from the main analysis.
+    letter_points: list[dict[str, Any]] = Field(default_factory=list)
+    # Every statement that the paper lacks something, checked against the whole paper (services.absence_audit):
+    # {"checked", "present", "partly", "absent", "mode", "items": [{"where", "statement", "verdict", "evidence", ...}]}
+    absence_audit: dict[str, Any] | None = None
+    # The novelty assessment as checked data (services.novelty): contributions with the prior work the paper itself
+    # cites, what remains new and where, superlatives, and the verdict decided by code.
+    novelty: dict[str, Any] | None = None
 
     @field_validator("mood", mode="before")
     @classmethod

@@ -25,7 +25,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from config import settings
 from models import AnalysisResult, SectionCheck
+from services import evidence_ledger
 from services import paper_profile as pp
 from services.analysis_guard import (
     ANCHOR_PREFIX_CHARS,
@@ -33,17 +35,18 @@ from services.analysis_guard import (
     _stems,
     alnum,
     compute_checks,
+    score_report,
     section_full_texts,
 )
 
 logger = logging.getLogger(__name__)
 
-SECTION_REVIEW_PROMPT_VERSION = "2026-11-13.5"  # .5: fix plan per section
+SECTION_REVIEW_PROMPT_VERSION = "2026-11-13.6"  # .6: the evidence-ledger review (services.evidence_ledger)
 MAX_SECTIONS_PER_CALL = 4
 MAX_CHARS_PER_CALL = 60_000
 MIN_SECTION_CHARS = 2_000  # the least of a section's text a call sends
 REVIEW_BUDGET_SECONDS = 120
-MAX_FINDINGS = 4
+MAX_FINDINGS = 6  # the older review asks for at most 4; the evidence-ledger review keeps up to 6 checked ones
 MAX_STRENGTHS = 2
 MIN_QUOTE_CHARS = 20  # letters and digits; shorter quotes match by chance
 MAX_TEXT_CHARS = 500
@@ -125,6 +128,7 @@ class SectionReview:
     sections: dict[str, dict[str, Any]] = field(default_factory=dict)
     status: str = "not_run"  # done | partial | failed | not_run
     note: str = ""
+    ledger: dict[str, Any] | None = None  # the evidence-ledger review's account (claims, packs, what was removed)
 
 
 # --------------------------------------------------------------------------- inputs
@@ -215,9 +219,26 @@ async def _call(provider: Any, prompt: str) -> dict[str, dict[str, Any]]:
 async def review_sections(
     inputs: list[SectionInput], journal: str, provider: Any, ctx: AnalysisContext, article_type: str | None = None
 ) -> SectionReview:
-    """The model's reading of every section, in parallel batches. Never raises."""
+    """The model's reading of every section. Never raises.
+
+    With EVIDENCE_LEDGER_ENABLED: the evidence-ledger review (services.evidence_ledger): the paper's claims, the
+    rubric's questions per section, answers with sentence ids, the absence check and the author defence. If that
+    cannot be done, the older review below (parallel batches of sections) is used instead.
+    """
     if not inputs or not hasattr(provider, "generate"):
         return SectionReview()
+    if settings.EVIDENCE_LEDGER_ENABLED:
+        parts = [
+            evidence_ledger.SectionPart(i.name, i.title, i.role, [c.model_dump() for c in i.checks]) for i in inputs
+        ]
+        try:
+            outcome = await evidence_ledger.review_with_budget(parts, {i.name: i.text for i in inputs}, journal, provider, ctx)
+        except Exception:  # noqa: BLE001 - the older review still gives a section-by-section reading
+            logger.warning("Evidence-ledger review failed; using the batch section review", exc_info=True)
+        else:
+            if outcome.sections:
+                return SectionReview(sections=outcome.sections, status=outcome.status, note=outcome.note, ledger=outcome.summary)
+            logger.warning("Evidence-ledger review returned no sections (%s); using the batch section review", outcome.note)
     kind = article_type or (ctx.article_type if ctx.article_type in pp.ARTICLE_TYPES else pp.UNKNOWN)
     names = [item.name for item in inputs]
     merged: dict[str, dict[str, Any]] = {}
@@ -322,6 +343,12 @@ def _repeats_check(problem: str, quote: str, checks: list[dict[str, Any]]) -> bo
     return False
 
 
+_LEDGER_FIELDS = (
+    "impact", "evidence_ids", "claim_id", "claim", "check", "source", "origin", "status", "question", "kind", "page",
+    "searched", "addressed", "addressed_ids", "absence_checked", "cross_reference",
+)
+
+
 def _checked(entry: dict[str, Any], own: str, paper: str, checks: list[dict[str, Any]]) -> tuple[dict[str, Any], int]:
     """The section's summary, strengths and findings that survive the checks, and how many were removed."""
     removed = 0
@@ -329,18 +356,28 @@ def _checked(entry: dict[str, Any], own: str, paper: str, checks: list[dict[str,
     for item in entry.get("strengths") or []:
         if not isinstance(item, dict):
             continue
-        point, quote = _text(item.get("point")), _text(item.get("quote"), 400)
+        point, quote = _text(item.get("point")), _text(item.get("quote"), 600)
         if len(point) >= 10 and _found(quote, own, paper) and not _CAPTION_START.match(quote):  # a caption is not prose
-            strengths.append({"point": point, "quote": quote})
+            strengths.append({"point": point, "quote": quote, **({"page": item["page"]} if item.get("page") else {})})
         else:
             removed += 1
-    findings: list[dict[str, str]] = []
+    findings: list[dict[str, Any]] = []
     for item in entry.get("findings") or []:
         if not isinstance(item, dict):
             continue
-        problem, quote, fix = _text(item.get("problem")), _text(item.get("quote"), 400), _text(item.get("fix"))
         severity = str(item.get("severity") or "").strip().lower()
         severity = severity if severity in SEVERITIES else "minor"
+        if item.get("verified_by") == "ledger":
+            # The evidence-ledger review took the quote from the paper by sentence id and has already checked the
+            # finding (evidence, absence check, author defence, specificity). Only the checklist overlap is left.
+            problem, quote, fix = _text(item.get("problem")), _text(item.get("quote"), 1200), _text(item.get("fix"))
+            if not problem or not fix or _repeats_check(problem, quote, checks):
+                removed += 1
+                continue
+            extra = {k: item.get(k) for k in _LEDGER_FIELDS if item.get(k) not in (None, "", [])}
+            findings.append({"severity": severity, "problem": problem, "quote": quote, "fix": fix, **extra})
+            continue
+        problem, quote, fix = _text(item.get("problem")), _text(item.get("quote"), 400), _text(item.get("fix"))
         if (
             len(problem) < 20 or len(fix) < 15 or not _found(quote, own, paper)
             or not (_stems(fix) & _stems(f"{problem} {quote}"))
@@ -410,9 +447,14 @@ def build_fix_plan(findings: list[dict[str, str]], checks: list[dict[str, Any]])
     the review's findings (about content) come before the checklist's (about form)."""
     items: list[tuple[int, int, dict[str, Any]]] = []
     for order, f in enumerate(findings):
-        items.append((0 if f["severity"] == "major" else 2, order, {
-            "severity": f["severity"], "problem": f["problem"], "quote": f["quote"], "action": f["fix"], "source": "review",
-        }))
+        step = {"severity": f["severity"], "problem": f["problem"], "quote": f["quote"], "action": f["fix"], "source": "review"}
+        if f.get("kind") in ("add", "change"):
+            step["kind"] = f["kind"]
+        if f.get("impact"):
+            step["impact"] = f["impact"]
+        if f.get("origin") == "rubric" and f.get("source"):
+            step["rule"] = f["source"]
+        items.append((0 if f["severity"] == "major" else 2, order, step))
     for order, c in enumerate(checks):
         if c.get("status") not in ("missing", "issue") or not c.get("fix"):
             continue
@@ -427,6 +469,64 @@ def build_fix_plan(findings: list[dict[str, str]], checks: list[dict[str, Any]])
     return [{"step": number, **item[2]} for number, item in enumerate(items[:MAX_FIX_STEPS], start=1)]
 
 
+def _add_unscored_sections(payload: dict[str, Any], review: SectionReview, ctx: AnalysisContext, notes: list[str]) -> None:
+    """A detected section the main analysis left out (it scored five of seven) still gets its card when the section
+    review read it: its score is then computed from the review alone. Sections stay in the paper's order."""
+    from services.analysis_guard import _attach_checks, _attach_content, outline_fields
+
+    if ctx.structure_mode != "detected":
+        return
+    missing = [name for name in ctx.section_texts if name not in payload["sections"] and name in review.sections]
+    if not missing:
+        return
+    added = {
+        name: {"score": 70, "role": ctx.section_roles.get(name, "other"), "source": "detected", **outline_fields(ctx, name),
+               **({"title": ctx.section_titles[name]} if ctx.section_titles.get(name, "").lower() not in ("", name.lower()) else {})}
+        for name in missing
+    }
+    _attach_content(ctx, added)
+    article_type = ctx.article_type if ctx.article_type in pp.ARTICLE_TYPES else pp.UNKNOWN
+    _attach_checks(ctx, added, section_full_texts(ctx, added), article_type, notes)
+    merged = {**payload["sections"], **added}
+    payload["sections"] = {name: merged[name] for name in ctx.section_texts if name in merged} | {
+        name: s for name, s in merged.items() if name not in ctx.section_texts
+    }
+
+
+def _set_plan(section: dict[str, Any], reviewed: bool) -> None:
+    """The section's fix plan from its findings and checklist, and its one-line issue and fix from the plan."""
+    plan = build_fix_plan(section.get("findings") or [], section.get("checks") or [])
+    offered = alnum(section.get("tool_text") or "")
+    for step in plan:  # a step about words outside the text Calibrate receives cannot be applied to it
+        first_piece = alnum(re.split(r"\.{3}|…", step["quote"])[0])
+        step["in_calibrate_text"] = not (offered and len(first_piece) >= MIN_QUOTE_CHARS and first_piece[:60] not in offered)
+    section["fix_plan"] = plan
+    if reviewed or plan:
+        # the model's one-line fix ("Emphasize the unique aspects ...") is replaced by the plan's first step
+        section["fix"] = plan[0]["action"] if plan else None
+        if reviewed:
+            section["issue"] = plan[0]["problem"] if plan else None
+
+
+def refresh_after_audit(payload: dict[str, Any], ctx: AnalysisContext, changed: list[str]) -> None:
+    """After services.absence_audit removed or restated findings: the changed sections' scores and fix plans, the
+    concerns taken from findings, and the overall score, computed again from what is left."""
+    for name in changed:
+        section = payload["sections"].get(name)
+        if section is None:
+            continue
+        reviewed = bool(section.get("score_basis"))
+        if reviewed:
+            section["score"], section["score_basis"] = section_score(
+                section.get("findings") or [], section.get("strengths") or [], section.get("checks") or []
+            )
+        _set_plan(section, reviewed)
+    payload["rejection_reasons"] = [r for r in payload.get("rejection_reasons") or [] if r.get("origin") != "evidence_ledger"]
+    if payload.get("evidence_ledger"):
+        _ledger_reasons(payload)
+    score_report(payload, ctx)
+
+
 def apply_review(analysis: AnalysisResult, review: SectionReview, ctx: AnalysisContext) -> AnalysisResult:
     """The report with each section's checked summary, strengths and findings, its score computed from them, and
     a fix plan. A review that did not run still gives each section a fix plan from its checklist."""
@@ -434,6 +534,7 @@ def apply_review(analysis: AnalysisResult, review: SectionReview, ctx: AnalysisC
     notes = list(payload.get("grounding_notes") or [])
     if review.note:
         notes.append(review.note)
+    _add_unscored_sections(payload, review, ctx, notes)
     texts = section_full_texts(ctx, payload["sections"])
     removed = 0
     for name, section in payload["sections"].items():
@@ -446,21 +547,93 @@ def apply_review(analysis: AnalysisResult, review: SectionReview, ctx: AnalysisC
             section["score"], section["score_basis"] = section_score(
                 checked["findings"], checked["strengths"], section.get("checks") or []
             )
-        plan = build_fix_plan(section.get("findings") or [], section.get("checks") or [])
-        offered = alnum(section.get("tool_text") or "")
-        for step in plan:  # a step about words outside the text Calibrate receives cannot be applied to it
-            first_piece = alnum(re.split(r"\.{3}|…", step["quote"])[0])
-            step["in_calibrate_text"] = not (offered and len(first_piece) >= MIN_QUOTE_CHARS and first_piece[:60] not in offered)
-        section["fix_plan"] = plan
-        if entry is not None or plan:
-            # the model's one-line fix ("Emphasize the unique aspects ...") is replaced by the plan's first step
-            section["fix"] = plan[0]["action"] if plan else None
-            if entry is not None:
-                section["issue"] = plan[0]["problem"] if plan else None
+        _set_plan(section, reviewed=entry is not None)
     if removed:
         notes.append(
             f"{removed} point(s) of the section review were left out: their quotation is not in the paper, their fix "
             "would fit any paper, or the checklist already shows them."
         )
     payload["grounding_notes"] = notes
+    if review.ledger:
+        payload["evidence_ledger"] = review.ledger
+        if _ledger_reasons(payload):
+            score_report(payload, ctx)  # the overall score agrees with the verified findings (criterion caps)
     return AnalysisResult.model_validate(payload)
+
+
+MAX_LEDGER_REASONS = 4
+SAME_CONCERN_OVERLAP = 0.3  # share of content words above which a finding repeats a concern already in the report
+
+# The scored criterion a rubric check bears on. A check not listed bears on rigor.
+_CHECK_CRITERION = {
+    "universal.claim_support": "evidence_support", "universal.quantitative_match": "evidence_support",
+    "universal.causal_evidence": "evidence_support", "universal.generalization_scope": "evidence_support",
+    "universal.practical_evidence": "evidence_support", "universal.novelty_comparison": "novelty",
+    "nature.significance": "journal_fit",
+}
+
+
+def _section_place(name: str, section: dict[str, Any], page: int | None = None) -> str:
+    """Where a finding is, as the reader finds it: "Appendix B: Experimental Setups, p. 9"."""
+    title = section.get("title") or name.capitalize()
+    label = section.get("label") or ""
+    if section.get("part") == "appendix":
+        where = f"Appendix {label}: {title}" if label.isalpha() else f"Appendix: {title}"
+    else:
+        where = f"Section {label}: {title}" if label else title
+    page = page or section.get("page")
+    return f"{where}, p. {page}" if page else where
+
+
+def _repeats_reason(finding: dict[str, Any], reasons: list[dict[str, Any]]) -> bool:
+    """Whether a concern already in the report says this: most of the same words, or the same quotation."""
+    mine = _stems(finding["problem"])
+    evidence = alnum(finding.get("quote") or "")
+    for reason in reasons:
+        theirs = _stems(f"{reason.get('problem') or ''} {reason.get('reason') or ''}")
+        if mine and theirs and len(mine & theirs) / len(mine | theirs) >= SAME_CONCERN_OVERLAP:
+            return True
+        other = alnum(reason.get("evidence") or "")
+        if evidence and other and (other in evidence or evidence[:80] in other):
+            return True
+    return False
+
+
+def _ledger_reasons(payload: dict[str, Any]) -> int:
+    """The review's major findings become concerns of the report when the main analysis did not already raise
+    them, so the report and its score say what the sections show.
+
+    Only findings that passed every check of the evidence-ledger review count (a valid quotation, the absence
+    check, the author defence, the specificity gate); they are "major" only when they bear on a main claim or
+    come from a major rubric check. Findings on a main claim go first, then the paper-level checks, each in
+    reading order. Returns how many were added.
+    """
+    existing = list(payload.get("rejection_reasons") or [])
+    criteria = payload.get("criteria") or {}
+    main_claims = {c.get("id") for c in (payload.get("evidence_ledger") or {}).get("claims", []) if c.get("main")}
+    candidates: list[tuple[int, int, int, str, dict[str, Any], dict[str, Any]]] = []
+    for section_rank, (name, section) in enumerate(payload["sections"].items()):
+        for finding_rank, finding in enumerate(section.get("findings") or []):
+            if finding.get("severity") == "major" and finding.get("origin"):
+                on_main = 0 if finding.get("claim_id") in main_claims else 1
+                candidates.append((on_main, section_rank, finding_rank, name, section, finding))
+    candidates.sort(key=lambda item: item[:3])
+    added = 0
+    for _, _, _, name, section, finding in candidates:
+        if added >= MAX_LEDGER_REASONS:
+            break
+        if _repeats_reason(finding, existing):
+            continue
+        default = "evidence_support" if finding.get("origin") == "review" else "rigor"
+        criterion = _CHECK_CRITERION.get(str(finding.get("check") or ""), default)
+        existing.append({
+            "reason": finding["problem"], "problem": finding["problem"], "severity": "major",
+            "evidence": (finding.get("quote") or "")[:600], "impact": finding.get("impact") or "",
+            "impact_area": "scientific_validity", "solution": finding["fix"], "fix": finding["fix"],
+            "section": name, "location": _section_place(name, section, finding.get("page")), "origin": "evidence_ledger",
+            "criterion": criterion if criterion in criteria else "",
+        })
+        added += 1
+    if added:
+        payload["rejection_reasons"] = existing
+    return added

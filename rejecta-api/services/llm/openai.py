@@ -9,11 +9,13 @@ from openai import AsyncOpenAI
 
 from models import AnalysisResult
 from services.llm.base import COMPACT_RETRY_NOTE, AbstractAnalysisProvider, MODE_A
+from services.llm.response_cache import cached, usable_text
 
 OPENAI_DEFAULT_MODEL = "gpt-4o"
 MAX_TOKENS = 4000  # the general-purpose tools (Calibrator, Forge, ...)
 ANALYSIS_MAX_TOKENS = 8000  # the full report; at 4000 long reports were cut off mid-JSON
 ANALYSIS_SEED = 20261110  # with temperature 0, makes repeated runs of the same input far more alike
+EMBED_BATCH = 96  # texts per embeddings request
 JSON_OBJECT_TYPE = "json_object"
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"
@@ -39,33 +41,62 @@ class OpenAIProvider(AbstractAnalysisProvider):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
+        max_tokens: int | None = None,
     ) -> str:
-        """General-purpose structured JSON generation."""
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=MAX_TOKENS,
-            temperature=temperature,
-            seed=ANALYSIS_SEED,  # the consistency and evidence checks use this too: same input, same answer
-            response_format={"type": JSON_OBJECT_TYPE},
-            messages=[
-                {"role": ROLE_SYSTEM, "content": system_prompt},
-                {"role": ROLE_USER, "content": user_prompt},
-            ],
-        )
-        return response.choices[0].message.content or "{}"
+        """General-purpose structured JSON generation. At temperature 0 the same request gets the stored answer
+        (services.llm.response_cache): the analysis checks give the same result for the same paper every run."""
+        messages = [
+            {"role": ROLE_SYSTEM, "content": system_prompt},
+            {"role": ROLE_USER, "content": user_prompt},
+        ]
+
+        async def call() -> str:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=max_tokens or MAX_TOKENS,
+                temperature=temperature,
+                seed=ANALYSIS_SEED,  # the consistency and evidence checks use this too: same input, same answer
+                response_format={"type": JSON_OBJECT_TYPE},
+                messages=messages,
+            )
+            return response.choices[0].message.content or "{}"
+
+        if temperature != 0:
+            return await call()
+        request = {"kind": "generate", "model": self.model, "max_tokens": max_tokens or MAX_TOKENS, "seed": ANALYSIS_SEED, "messages": messages}
+        return await cached(request, call, usable_text)
+
+    async def embed(self, texts: list[str], model: str) -> list[list[float]]:
+        """Embedding vectors for `texts`, in order (services.retrieval caches them by text)."""
+        out: list[list[float]] = []
+        for start in range(0, len(texts), EMBED_BATCH):
+            batch = texts[start : start + EMBED_BATCH]
+            response = await self.client.embeddings.create(model=model, input=batch)
+            out.extend(item.embedding for item in sorted(response.data, key=lambda d: d.index))
+        return out
 
     async def _complete(self, messages: list[dict[str, str]]) -> tuple[str, bool, str]:
-        """(content, whether it was cut off at the token limit, the exact model version that answered)."""
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=ANALYSIS_MAX_TOKENS,
-            temperature=0,
-            seed=ANALYSIS_SEED,
-            response_format={"type": JSON_OBJECT_TYPE},
-            messages=messages,
-        )
-        choice = response.choices[0]
-        return choice.message.content or "{}", choice.finish_reason == "length", response.model or self.model
+        """(content, whether it was cut off at the token limit, the exact model version that answered).
+        A complete answer is stored, so the same paper gets the same main report every run."""
+
+        async def call() -> list[Any]:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=ANALYSIS_MAX_TOKENS,
+                temperature=0,
+                seed=ANALYSIS_SEED,
+                response_format={"type": JSON_OBJECT_TYPE},
+                messages=messages,
+            )
+            choice = response.choices[0]
+            return [choice.message.content or "{}", choice.finish_reason == "length", response.model or self.model]
+
+        def usable(value: Any) -> bool:
+            return isinstance(value, list) and len(value) == 3 and not value[1] and usable_text(value[0])
+
+        request = {"kind": "analyse", "model": self.model, "max_tokens": ANALYSIS_MAX_TOKENS, "seed": ANALYSIS_SEED, "messages": messages}
+        content, cut_off, version = await cached(request, call, usable)
+        return content, bool(cut_off), version
 
     def _result(self, content: str, model_version: str) -> AnalysisResult:
         parsed = self.parse_json_response(content)
